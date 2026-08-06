@@ -11,7 +11,7 @@ Phase 0 establishes the reproducible workspace, protocol generation, compatibili
 - `tools/openfga-proto-codegen`: deterministic OpenFGA protocol generator.
 - `vendors/openfga`: pinned Go compatibility oracle.
 - `vendors/openfga-api`: pinned OpenFGA protocol source.
-- `specs/` and `docs/research/`: design contracts and implementation evidence.
+- `specs/` and [`docs/`](docs/index.md): design contracts, operator runbooks, and implementation evidence.
 
 ## Development
 

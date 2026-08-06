@@ -1,5 +1,15 @@
 # Documentation Index
 
+## Operations
+
+| Runbook | Purpose |
+| --- | --- |
+| [Server configuration](./operations/configuration-runbook.md) | Secure YAML/secret setup, validation, deployment, health, restart, and rollback |
+| [PostgreSQL migrations](./operations/migration-runbook.md) | Schema states, planned upgrades, failure handling, and forward-only rollback |
+| [PostgreSQL backup and restore](./operations/backup-restore-runbook.md) | Logical backup, PITR expectations, restore verification, and promotion |
+| [Authentication and authorization](./operations/authentication-runbook.md) | Disabled/preshared/OIDC operation, rotation, JWKS outages, and store/action policy |
+| [Failure response](./operations/failure-response-runbook.md) | Triage, fail-safe behavior, diagnosis, graceful restart, and escalation evidence |
+
 ## Research
 
 | Memo | Purpose | Status |
