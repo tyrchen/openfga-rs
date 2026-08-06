@@ -1,0 +1,271 @@
+//! Project-owned authorization-model source values.
+
+use std::{fmt, mem};
+
+use openfga_condition::ConditionDefinition;
+use openfga_domain::{AuthorizationModelId, ConditionName, RelationName, StoreId, TypeName};
+
+/// One authorization model after bounded wire conversion and before semantic compilation.
+#[non_exhaustive]
+pub struct AuthorizationModelSource {
+    pub(crate) store_id: StoreId,
+    pub(crate) model_id: AuthorizationModelId,
+    pub(crate) schema_version: String,
+    pub(crate) type_definitions: Vec<TypeDefinitionSource>,
+    pub(crate) conditions: Vec<ConditionSource>,
+}
+
+impl AuthorizationModelSource {
+    /// Creates project-owned model source. Semantic validation occurs during compilation.
+    #[must_use]
+    pub fn new(
+        store_id: StoreId,
+        model_id: AuthorizationModelId,
+        schema_version: String,
+        type_definitions: Vec<TypeDefinitionSource>,
+        conditions: Vec<ConditionSource>,
+    ) -> Self {
+        Self {
+            store_id,
+            model_id,
+            schema_version,
+            type_definitions,
+            conditions,
+        }
+    }
+
+    /// Returns the store owning the immutable model.
+    #[must_use]
+    pub const fn store_id(&self) -> &StoreId {
+        &self.store_id
+    }
+
+    /// Returns the immutable authorization-model identifier.
+    #[must_use]
+    pub const fn model_id(&self) -> &AuthorizationModelId {
+        &self.model_id
+    }
+}
+
+impl fmt::Debug for AuthorizationModelSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuthorizationModelSource")
+            .field("store_id", &self.store_id)
+            .field("model_id", &self.model_id)
+            .field("schema_version_bytes", &self.schema_version.len())
+            .field("type_definitions", &self.type_definitions.len())
+            .field("conditions", &self.conditions.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// One ordered object-type declaration.
+#[non_exhaustive]
+pub struct TypeDefinitionSource {
+    pub(crate) name: TypeName,
+    pub(crate) relations: Vec<RelationSource>,
+}
+
+impl TypeDefinitionSource {
+    /// Creates a type declaration with ordered relations.
+    #[must_use]
+    pub const fn new(name: TypeName, relations: Vec<RelationSource>) -> Self {
+        Self { name, relations }
+    }
+
+    /// Returns the declared type name.
+    #[must_use]
+    pub const fn name(&self) -> &TypeName {
+        &self.name
+    }
+}
+
+impl fmt::Debug for TypeDefinitionSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TypeDefinitionSource")
+            .field("name", &self.name)
+            .field("relations", &self.relations.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// One ordered relation declaration and its direct type restrictions.
+#[non_exhaustive]
+pub struct RelationSource {
+    pub(crate) name: RelationName,
+    pub(crate) rewrite: RewriteSource,
+    pub(crate) restrictions: Vec<DirectRestrictionSource>,
+}
+
+impl RelationSource {
+    /// Creates a relation declaration.
+    #[must_use]
+    pub const fn new(
+        name: RelationName,
+        rewrite: RewriteSource,
+        restrictions: Vec<DirectRestrictionSource>,
+    ) -> Self {
+        Self {
+            name,
+            rewrite,
+            restrictions,
+        }
+    }
+
+    /// Returns the declared relation name.
+    #[must_use]
+    pub const fn name(&self) -> &RelationName {
+        &self.name
+    }
+}
+
+impl fmt::Debug for RelationSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RelationSource")
+            .field("name", &self.name)
+            .field("rewrite", &self.rewrite)
+            .field("restrictions", &self.restrictions.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Unresolved rewrite syntax. Compilation lowers this tree iteratively into dense IR.
+#[non_exhaustive]
+pub enum RewriteSource {
+    /// Direct tuple membership (`this`).
+    Direct,
+    /// Same-object computed relation.
+    Computed(RelationName),
+    /// Tuple-to-userset (`computed from tupleset`).
+    TupleToUserset {
+        /// Direct tupleset relation on the enclosing type.
+        tupleset: RelationName,
+        /// Computed relation name on permitted tupleset target types.
+        computed: RelationName,
+    },
+    /// Set union.
+    Union(Vec<Self>),
+    /// Set intersection.
+    Intersection(Vec<Self>),
+    /// Set difference.
+    Difference {
+        /// Positive operand.
+        base: Box<Self>,
+        /// Subtracted operand.
+        subtract: Box<Self>,
+    },
+}
+
+impl Drop for RewriteSource {
+    fn drop(&mut self) {
+        let mut pending = Vec::new();
+        take_children(self, &mut pending);
+        while let Some(mut child) = pending.pop() {
+            take_children(&mut child, &mut pending);
+        }
+    }
+}
+
+fn take_children(rewrite: &mut RewriteSource, pending: &mut Vec<RewriteSource>) {
+    match rewrite {
+        RewriteSource::Union(children) | RewriteSource::Intersection(children) => {
+            pending.extend(mem::take(children));
+        }
+        RewriteSource::Difference { base, subtract } => {
+            pending.push(mem::replace(base.as_mut(), RewriteSource::Direct));
+            pending.push(mem::replace(subtract.as_mut(), RewriteSource::Direct));
+        }
+        RewriteSource::Direct
+        | RewriteSource::Computed(_)
+        | RewriteSource::TupleToUserset { .. } => {}
+    }
+}
+
+impl fmt::Debug for RewriteSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Direct => formatter.write_str("Direct"),
+            Self::Computed(relation) => formatter.debug_tuple("Computed").field(relation).finish(),
+            Self::TupleToUserset { tupleset, computed } => formatter
+                .debug_struct("TupleToUserset")
+                .field("tupleset", tupleset)
+                .field("computed", computed)
+                .finish(),
+            Self::Union(children) => formatter
+                .debug_struct("Union")
+                .field("children", &children.len())
+                .finish(),
+            Self::Intersection(children) => formatter
+                .debug_struct("Intersection")
+                .field("children", &children.len())
+                .finish(),
+            Self::Difference { .. } => formatter.write_str("Difference { .. }"),
+        }
+    }
+}
+
+/// One unresolved directly-related subject restriction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct DirectRestrictionSource {
+    pub(crate) subject_type: TypeName,
+    pub(crate) kind: RestrictionKindSource,
+    pub(crate) condition: Option<ConditionName>,
+}
+
+impl DirectRestrictionSource {
+    /// Creates a direct restriction.
+    #[must_use]
+    pub const fn new(
+        subject_type: TypeName,
+        kind: RestrictionKindSource,
+        condition: Option<ConditionName>,
+    ) -> Self {
+        Self {
+            subject_type,
+            kind,
+            condition,
+        }
+    }
+}
+
+/// Unresolved direct restriction shape.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum RestrictionKindSource {
+    /// Concrete object of the declared subject type.
+    Object,
+    /// Userset of the declared subject type and relation.
+    Userset(RelationName),
+    /// Typed wildcard of the declared subject type.
+    Wildcard,
+}
+
+/// One condition map entry, retaining both key and declared name for validation.
+#[derive(Clone, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct ConditionSource {
+    pub(crate) key: ConditionName,
+    pub(crate) definition: ConditionDefinition,
+}
+
+impl ConditionSource {
+    /// Creates a condition source entry.
+    #[must_use]
+    pub const fn new(key: ConditionName, definition: ConditionDefinition) -> Self {
+        Self { key, definition }
+    }
+}
+
+impl fmt::Debug for ConditionSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConditionSource")
+            .field("key", &self.key)
+            .field("definition", &self.definition)
+            .finish_non_exhaustive()
+    }
+}

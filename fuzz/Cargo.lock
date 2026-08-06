@@ -403,7 +403,18 @@ dependencies = [
  "libfuzzer-sys",
  "openfga-condition",
  "openfga-domain",
+ "openfga-model",
  "serde_json",
+]
+
+[[package]]
+name = "openfga-model"
+version = "0.1.0"
+dependencies = [
+ "openfga-condition",
+ "openfga-domain",
+ "thiserror",
+ "typed-builder",
 ]
 
 [[package]]

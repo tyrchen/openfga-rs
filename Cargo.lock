@@ -1139,6 +1139,13 @@ version = "0.1.0"
 [[package]]
 name = "openfga-model"
 version = "0.1.0"
+dependencies = [
+ "openfga-condition",
+ "openfga-domain",
+ "proptest",
+ "thiserror",
+ "typed-builder",
+]
 
 [[package]]
 name = "openfga-proto"

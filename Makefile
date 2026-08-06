@@ -127,13 +127,20 @@ cel-baseline: verify-go-tool verify-go-pin
 cel-spike: cel-baseline
 	@$(CARGO) test -p openfga-condition --test conformance
 
+model-baseline: verify-go-tool verify-go-pin
+	@cd vendors/openfga && \
+		GOTOOLCHAIN=local GOFLAGS=-mod=readonly ../../$(GO_TOOL) test ./pkg/typesystem
+
+model-spike: model-baseline
+	@$(CARGO) test -p openfga-model --test compiler
+
 listobjects-spike: verify-go-tool verify-go-pin
 	@cd vendors/openfga && \
 		GOTOOLCHAIN=local GOFLAGS=-mod=readonly ../../$(GO_TOOL) test \
 		./pkg/server/commands -run '^$$' -bench '^BenchmarkListObjects$$' \
 		-benchtime=1x -count=1
 
-conformance: cel-spike listobjects-spike
+conformance: cel-spike listobjects-spike model-spike
 
 fuzz-domain:
 	@phase1_tmp=$$(mktemp -d); \
@@ -147,6 +154,13 @@ fuzz-condition:
 	trap 'rm -rf "$$phase1_tmp"' EXIT; \
 	cp -R fuzz/corpus/condition_inputs "$$phase1_tmp/corpus"; \
 	$(CARGO) +$(RUSTFMT_TOOLCHAIN) fuzz run condition_inputs "$$phase1_tmp/corpus" -- \
+		-max_total_time=$(FUZZ_TIME) -max_len=8192
+
+fuzz-model:
+	@phase1_tmp=$$(mktemp -d); \
+	trap 'rm -rf "$$phase1_tmp"' EXIT; \
+	cp -R fuzz/corpus/model_inputs "$$phase1_tmp/corpus"; \
+	$(CARGO) +$(RUSTFMT_TOOLCHAIN) fuzz run model_inputs "$$phase1_tmp/corpus" -- \
 		-max_total_time=$(FUZZ_TIME) -max_len=8192
 
 audit:
@@ -184,5 +198,5 @@ update-submodule:
 
 .PHONY: audit build cel-baseline cel-spike check check-agent-sync check-docs check-proto \
 	clippy clippy-strict \
-	conformance deny differential-smoke doc fmt fuzz-condition fuzz-domain go-baseline listobjects-spike proto release test \
-	update-submodule verify-go-pin verify-go-tool
+	conformance deny differential-smoke doc fmt fuzz-condition fuzz-domain fuzz-model go-baseline listobjects-spike model-baseline \
+	model-spike proto release test update-submodule verify-go-pin verify-go-tool
