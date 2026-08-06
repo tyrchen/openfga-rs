@@ -42,15 +42,39 @@ const EXPECTED_IMPORT_PROVENANCE: &[(&str, &str, &str, &str)] = &[
         "licenses/grpc-gateway.LICENSE",
     ),
 ];
-const EXPECTED_PROTOC_PLATFORMS: &[&str] = &[
-    "linux-aarch64",
-    "linux-ppc64le",
-    "linux-s390x",
-    "linux-x86",
-    "linux-x86_64",
-    "macos-aarch64",
-    "macos-x86_64",
-    "windows-x86_64",
+const EXPECTED_PROTOC_BINARY_SHA256: &[(&str, &str)] = &[
+    (
+        "linux-aarch64",
+        "5ea6b5ee26c6169925d6c99c8141b855db02c4d382c60b48f535971791b6e8b8",
+    ),
+    (
+        "linux-ppc64le",
+        "4e33404682b4c09e8126ade198284f0de2fecee586b5f6569832f998a25e1eed",
+    ),
+    (
+        "linux-s390x",
+        "6867b2e740c858564873d14896c29be2f6ff19bfde4b58b166296caeb8918b0b",
+    ),
+    (
+        "linux-x86",
+        "4ead2930a0d1c57ef4cf573b30d804186c6f76480c4bef3eb6f129a95f7b4a1f",
+    ),
+    (
+        "linux-x86_64",
+        "caaf8517e57c57d34a7d6f0544172d9051abf58556aa35c70d3fb0d824b8cfbb",
+    ),
+    (
+        "macos-aarch64",
+        "a54e72a5c3b06f8eecd235a0ea22ca8494cec738a655cabbd0b9a9864f82f4f1",
+    ),
+    (
+        "macos-x86_64",
+        "773c020a052293bafe187e7c3cd0a0116e2d25798373c6fa1f47648e2a4d5303",
+    ),
+    (
+        "windows-x86_64",
+        "cbd1ca1fd6afd1bb6ddd1c09c118ecd4c50f928980857f16fe6fc23704ea17e2",
+    ),
 ];
 const GENERATED_FILES: &[&str] = &[
     "openfga.v1.rs",
@@ -112,6 +136,12 @@ struct GeneratedLock {
     tonic: String,
     prost: String,
     aggregate_sha256: String,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct BufDependency {
+    commit: String,
+    digest: String,
 }
 
 #[derive(Debug, Parser)]
@@ -211,10 +241,7 @@ fn verify_lock_metadata(protocol_lock: &ProtocolLock) -> Result<()> {
         bail!("protocol lock contains a malformed source or artifact digest");
     }
     if protocol_lock.imports.len() != EXPECTED_IMPORT_PROVENANCE.len()
-        || protocol_lock.protoc.binary_sha256.len() != EXPECTED_PROTOC_PLATFORMS.len()
-        || EXPECTED_PROTOC_PLATFORMS
-            .iter()
-            .any(|platform| !protocol_lock.protoc.binary_sha256.contains_key(*platform))
+        || !protoc_platform_map_matches(&protocol_lock.protoc.binary_sha256)
         || EXPECTED_IMPORT_PROVENANCE.iter().any(
             |(module, source_repository, license_source_commit, license_file)| {
                 !protocol_lock.imports.iter().any(|import| {
@@ -229,6 +256,17 @@ fn verify_lock_metadata(protocol_lock: &ProtocolLock) -> Result<()> {
         bail!("protocol lock does not contain the complete reviewed platform/import set");
     }
     Ok(())
+}
+
+fn protoc_platform_map_matches(binary_sha256: &BTreeMap<String, String>) -> bool {
+    binary_sha256.len() == EXPECTED_PROTOC_BINARY_SHA256.len()
+        && EXPECTED_PROTOC_BINARY_SHA256
+            .iter()
+            .all(|(platform, digest)| {
+                binary_sha256
+                    .get(*platform)
+                    .is_some_and(|actual| actual == digest)
+            })
 }
 
 fn is_lower_hex(value: &str, length: usize) -> bool {
@@ -349,8 +387,12 @@ async fn verify_api_pin(api_root: &Path, api: &ApiLock, imports: &[ImportLock]) 
         bail!("OpenFGA API buf.lock checksum does not match the reviewed source pin");
     }
     let buf_lock_text = String::from_utf8(buf_lock).context("OpenFGA buf.lock is not UTF-8")?;
+    let buf_dependencies = parse_buf_dependencies(&buf_lock_text)?;
+    if buf_dependencies.len() != imports.len() {
+        bail!("OpenFGA buf.lock dependency set does not match the protocol lock");
+    }
     for import in imports {
-        verify_import_metadata(import, &buf_lock_text)?;
+        verify_import_metadata(import, &buf_dependencies)?;
     }
 
     let expected_input_count = OPENFGA_PROTO_FILES.len().saturating_add(1);
@@ -380,7 +422,67 @@ async fn verify_api_pin(api_root: &Path, api: &ApiLock, imports: &[ImportLock]) 
     Ok(())
 }
 
-fn verify_import_metadata(import: &ImportLock, buf_lock: &str) -> Result<()> {
+fn parse_buf_dependencies(buf_lock: &str) -> Result<BTreeMap<String, BufDependency>> {
+    let mut blocks = buf_lock.split("\n  - remote: ");
+    let header = blocks
+        .next()
+        .context("OpenFGA buf.lock has no document header")?;
+    if !header.ends_with("version: v1\ndeps:") {
+        bail!("OpenFGA buf.lock has an unsupported document structure");
+    }
+
+    let mut dependencies = BTreeMap::new();
+    for block in blocks {
+        let mut lines = block.lines();
+        if lines.next() != Some("buf.build") {
+            bail!("OpenFGA buf.lock contains a non-BSR dependency");
+        }
+        let mut fields = BTreeMap::new();
+        for line in lines {
+            let (key, value) = line
+                .trim()
+                .split_once(": ")
+                .context("OpenFGA buf.lock contains a malformed dependency field")?;
+            if fields.insert(key, value).is_some() {
+                bail!("OpenFGA buf.lock contains a duplicate dependency field");
+            }
+        }
+        if fields.len() != 4 {
+            bail!("OpenFGA buf.lock dependency does not contain the exact reviewed fields");
+        }
+        let owner = fields
+            .remove("owner")
+            .context("OpenFGA buf.lock dependency has no owner")?;
+        let repository = fields
+            .remove("repository")
+            .context("OpenFGA buf.lock dependency has no repository")?;
+        let commit = fields
+            .remove("commit")
+            .context("OpenFGA buf.lock dependency has no commit")?;
+        let digest = fields
+            .remove("digest")
+            .context("OpenFGA buf.lock dependency has no digest")?;
+        let module = format!("buf.build/{owner}/{repository}");
+        if dependencies
+            .insert(
+                module,
+                BufDependency {
+                    commit: commit.to_owned(),
+                    digest: digest.to_owned(),
+                },
+            )
+            .is_some()
+        {
+            bail!("OpenFGA buf.lock contains a duplicate module");
+        }
+    }
+    Ok(dependencies)
+}
+
+fn verify_import_metadata(
+    import: &ImportLock,
+    dependencies: &BTreeMap<String, BufDependency>,
+) -> Result<()> {
     let module = import
         .module
         .strip_prefix("buf.build/")
@@ -388,6 +490,9 @@ fn verify_import_metadata(import: &ImportLock, buf_lock: &str) -> Result<()> {
     let (owner, repository) = module
         .split_once('/')
         .context("protocol import has an invalid BSR module name")?;
+    let dependency = dependencies
+        .get(&import.module)
+        .context("protocol import is absent from the pinned API buf.lock")?;
     if owner.is_empty()
         || repository.is_empty()
         || !is_lower_hex(&import.commit, 32)
@@ -395,10 +500,8 @@ fn verify_import_metadata(import: &ImportLock, buf_lock: &str) -> Result<()> {
             .digest
             .strip_prefix("shake256:")
             .is_some_and(|digest| is_lower_hex(digest, 128))
-        || !buf_lock.contains(&format!("owner: {owner}"))
-        || !buf_lock.contains(&format!("repository: {repository}"))
-        || !buf_lock.contains(&format!("commit: {}", import.commit))
-        || !buf_lock.contains(&format!("digest: {}", import.digest))
+        || dependency.commit != import.commit
+        || dependency.digest != import.digest
     {
         bail!("protocol import metadata does not match the pinned API buf.lock");
     }
@@ -441,18 +544,27 @@ async fn verify_protoc(protoc: &Path, lock: &ProtocLock) -> Result<()> {
         .await
         .context("failed to checksum the vendored protoc binary")?;
     let digest = sha256_hex(&binary)?;
-    if lock
-        .binary_sha256
-        .values()
-        .any(|expected| !is_lower_hex(expected, 64))
-        || !lock
-            .binary_sha256
-            .values()
-            .any(|expected| expected == &digest)
-    {
-        bail!("vendored protoc binary checksum is not in the reviewed platform set");
+    let platform = current_protoc_platform()?;
+    if lock.binary_sha256.get(platform) != Some(&digest) {
+        bail!("vendored protoc binary checksum does not match platform {platform}");
     }
     Ok(())
+}
+
+fn current_protoc_platform() -> Result<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "aarch64") => Ok("linux-aarch64"),
+        ("linux", "powerpc64") if cfg!(target_endian = "little") => Ok("linux-ppc64le"),
+        ("linux", "s390x") => Ok("linux-s390x"),
+        ("linux", "x86") => Ok("linux-x86"),
+        ("linux", "x86_64") => Ok("linux-x86_64"),
+        ("macos", "aarch64") => Ok("macos-aarch64"),
+        ("macos", "x86_64") => Ok("macos-x86_64"),
+        ("windows", "x86_64") => Ok("windows-x86_64"),
+        (operating_system, architecture) => {
+            bail!("unsupported protoc platform {operating_system}-{architecture}")
+        }
+    }
 }
 
 async fn verify_vendored_proto_inputs(vendor_root: &Path, api: &ApiLock) -> Result<()> {
@@ -618,7 +730,9 @@ async fn generate_route_metadata(swagger_path: &Path, output_path: &Path) -> Res
 
 #[cfg(test)]
 mod tests {
-    use super::{ProtocolLock, verify_lock_metadata};
+    use super::{
+        ProtocolLock, parse_buf_dependencies, verify_import_metadata, verify_lock_metadata,
+    };
 
     #[test]
     fn test_should_reject_protocol_lock_dependency_drift() {
@@ -632,6 +746,83 @@ mod tests {
         };
         assert!(verify_lock_metadata(&protocol_lock).is_ok());
         protocol_lock.generated.tonic = "0.0.0-drift".to_owned();
+        assert!(verify_lock_metadata(&protocol_lock).is_err());
+    }
+
+    #[test]
+    fn test_should_reject_protocol_import_tuple_drift() {
+        let protocol_lock = serde_json::from_str::<ProtocolLock>(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../crates/openfga-proto/proto.lock.json"
+        )));
+        let dependencies = parse_buf_dependencies(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../vendors/openfga-api/buf.lock"
+        )));
+        assert!(protocol_lock.is_ok() && dependencies.is_ok());
+        let (Some(mut protocol_lock), Some(dependencies)) = (protocol_lock.ok(), dependencies.ok())
+        else {
+            return;
+        };
+        assert!(
+            protocol_lock
+                .imports
+                .iter()
+                .all(|import| verify_import_metadata(import, &dependencies).is_ok())
+        );
+        let replacement_commit = protocol_lock
+            .imports
+            .iter()
+            .find(|import| import.module == "buf.build/googleapis/googleapis")
+            .map(|import| import.commit.clone());
+        assert!(replacement_commit.is_some());
+        let Some(replacement_commit) = replacement_commit else {
+            return;
+        };
+        let target = protocol_lock
+            .imports
+            .iter_mut()
+            .find(|import| import.module == "buf.build/envoyproxy/protoc-gen-validate");
+        assert!(target.is_some());
+        let Some(target) = target else {
+            return;
+        };
+        target.commit = replacement_commit;
+        assert!(verify_import_metadata(target, &dependencies).is_err());
+    }
+
+    #[test]
+    fn test_should_reject_protocol_platform_digest_drift() {
+        let protocol_lock = serde_json::from_str::<ProtocolLock>(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../crates/openfga-proto/proto.lock.json"
+        )));
+        assert!(protocol_lock.is_ok());
+        let Some(mut protocol_lock) = protocol_lock.ok() else {
+            return;
+        };
+        let linux_digest = protocol_lock
+            .protoc
+            .binary_sha256
+            .get("linux-x86_64")
+            .cloned();
+        let macos_digest = protocol_lock
+            .protoc
+            .binary_sha256
+            .get("macos-x86_64")
+            .cloned();
+        assert!(linux_digest.is_some() && macos_digest.is_some());
+        let (Some(linux_digest), Some(macos_digest)) = (linux_digest, macos_digest) else {
+            return;
+        };
+        protocol_lock
+            .protoc
+            .binary_sha256
+            .insert("linux-x86_64".to_owned(), macos_digest);
+        protocol_lock
+            .protoc
+            .binary_sha256
+            .insert("macos-x86_64".to_owned(), linux_digest);
         assert!(verify_lock_metadata(&protocol_lock).is_err());
     }
 }
