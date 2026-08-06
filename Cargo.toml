@@ -36,6 +36,7 @@ tonic-prost = { version = "~0.14.6", default-features = false }
 tonic-prost-build = { version = "~0.14.6", default-features = false, features = ["cleanup-markdown", "transport"] }
 tower = { version = "~0.5.3", default-features = false, features = ["limit"] }
 tower-http = { version = "~0.6.11", default-features = false, features = ["limit", "timeout"] }
+tracing = { version = "~0.1.44", default-features = false, features = ["attributes", "std"] }
 typed-builder = { version = "~0.23.2", default-features = false }
 ulid = { version = "~3.0.0", default-features = false }
 winnow = { version = "~1.0.4", default-features = false, features = ["ascii", "std"] }

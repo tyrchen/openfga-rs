@@ -137,13 +137,23 @@ model-spike: model-baseline
 storage-contract:
 	@$(CARGO) test -p openfga-storage-memory --test contracts
 
+check-baseline: verify-go-tool verify-go-pin
+	@cd vendors/openfga && \
+		GOTOOLCHAIN=local GOFLAGS=-mod=readonly ../../$(GO_TOOL) test ./tests/check \
+		-run '^(TestCheckMemory|TestMatrixMemory|TestContextualTuplesMemory)$$' -count=1
+
+check-oracle:
+	@$(CARGO) test -p openfga-check --all-targets
+
+check-spike: check-baseline check-oracle
+
 listobjects-spike: verify-go-tool verify-go-pin
 	@cd vendors/openfga && \
 		GOTOOLCHAIN=local GOFLAGS=-mod=readonly ../../$(GO_TOOL) test \
 		./pkg/server/commands -run '^$$' -bench '^BenchmarkListObjects$$' \
 		-benchtime=1x -count=1
 
-conformance: cel-spike listobjects-spike model-spike storage-contract
+conformance: cel-spike check-spike listobjects-spike model-spike storage-contract
 
 fuzz-domain:
 	@phase1_tmp=$$(mktemp -d); \
@@ -199,7 +209,8 @@ release:
 update-submodule:
 	@git submodule update --init --recursive --remote
 
-.PHONY: audit build cel-baseline cel-spike check check-agent-sync check-docs check-proto \
+.PHONY: audit build cel-baseline cel-spike check check-agent-sync check-baseline check-docs \
+	check-oracle check-proto check-spike \
 	clippy clippy-strict \
 	conformance deny differential-smoke doc fmt fuzz-condition fuzz-domain fuzz-model go-baseline listobjects-spike model-baseline \
 	model-spike proto release storage-contract test update-submodule verify-go-pin verify-go-tool

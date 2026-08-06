@@ -1094,6 +1094,19 @@ version = "0.1.0"
 [[package]]
 name = "openfga-check"
 version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "openfga-condition",
+ "openfga-domain",
+ "openfga-model",
+ "openfga-storage",
+ "openfga-storage-memory",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "typed-builder",
+]
 
 [[package]]
 name = "openfga-condition"
