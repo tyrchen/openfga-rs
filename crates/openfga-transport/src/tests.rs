@@ -19,6 +19,7 @@ use openfga_domain::{
     AuthorizationModelId, FingerprintBuilder, InputLimits, Principal, PrincipalId, PrincipalKind,
     RequestTimeout, StoreId, TokenCodec, TokenKey, TokenKeyId, TokenOperation,
 };
+use openfga_list::ListObjectsBudget;
 use openfga_model::ModelCompiler;
 use openfga_proto::openfga::{
     v1 as pb,
@@ -26,7 +27,8 @@ use openfga_proto::openfga::{
 };
 use openfga_service::{
     AssertionService, ChangeService, CheckService, IdentifierSource, IdentifierSourceError,
-    ModelPublication, ModelService, ServiceClock, ServiceError, StoreService, TupleService,
+    ListObjectsService, ModelPublication, ModelService, ServiceClock, ServiceError, StoreService,
+    TupleService,
 };
 use openfga_storage::{
     AssertionReader, AssertionWriter, ChangeReader, ModelReader, ModelWriter, OperationContext,
@@ -37,7 +39,7 @@ use openfga_storage_memory::{MemoryStorage, MemoryStorageConfig};
 use prost::Message;
 use secrecy::SecretString;
 use tokio::sync::oneshot;
-use tokio_stream::wrappers::TcpListenerStream;
+use tokio_stream::{StreamExt, wrappers::TcpListenerStream};
 use tonic::transport::Server;
 use tower::ServiceExt;
 
@@ -133,7 +135,17 @@ fn test_runtime(maximum_message_bytes: usize) -> Result<TestRuntime, Box<dyn Err
                 limits.clone(),
             ))
             .changes(ChangeService::new(stores, changes))
-            .checks(CheckService::direct(models, tuples, CheckBudget::default()))
+            .checks(CheckService::direct(
+                Arc::clone(&models),
+                Arc::clone(&tuples),
+                CheckBudget::default(),
+            ))
+            .list_objects(ListObjectsService::direct(
+                models,
+                tuples,
+                ListObjectsBudget::default(),
+                limits.clone(),
+            ))
             .build(),
         TransportConfig::builder()
             .limits(limits)
@@ -1200,7 +1212,7 @@ async fn assert_assertion_size_limit(
     reason = "the end-to-end protocol flow intentionally keeps ordered cross-endpoint state \
               visible"
 )]
-async fn test_should_execute_every_m2_use_case_through_shared_wire_adapter()
+async fn test_should_execute_implemented_use_cases_through_shared_wire_adapter()
 -> Result<(), Box<dyn Error>> {
     let TestRuntime {
         storage,
@@ -1716,6 +1728,59 @@ async fn test_should_execute_every_m2_use_case_through_shared_wire_adapter()
         .await;
     assert!(matches!(duplicate, Err(error) if error.code() == "validation_error"));
 
+    let listed = api.list_objects(&principal, list_objects_request()).await?;
+    assert_eq!(listed.objects, vec!["document:roadmap"]);
+    let mut listed_stream = api
+        .streamed_list_objects(&principal, streamed_list_objects_request())
+        .await?;
+    assert_eq!(
+        listed_stream
+            .next()
+            .await
+            .ok_or("direct ListObjects stream ended before its result")??
+            .to_string(),
+        "document:roadmap",
+    );
+    assert!(listed_stream.next().await.is_none());
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::post(format!("/stores/{STORE_ID}/list-objects"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&list_objects_request())?))?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        serde_json::from_slice::<pb::ListObjectsResponse>(
+            &to_bytes(response.into_body(), 1_024).await?,
+        )?
+        .objects,
+        vec!["document:roadmap"],
+    );
+    let response = router
+        .clone()
+        .oneshot(
+            Request::post(format!("/stores/{STORE_ID}/streamed-list-objects"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(
+                    &streamed_list_objects_request(),
+                )?))?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let streamed_body = to_bytes(response.into_body(), 1_024).await?;
+    assert_eq!(
+        serde_json::from_slice::<pb::StreamedListObjectsResponse>(
+            streamed_body
+                .strip_suffix(b"\n")
+                .ok_or("stream item lacked delimiter")?,
+        )?
+        .object,
+        "document:roadmap",
+    );
+
     let assertion = pb::Assertion {
         tuple_key: Some(pb::AssertionTupleKey {
             object: "document:roadmap".to_owned(),
@@ -1826,13 +1891,14 @@ async fn assert_grpc_endpoint_admission(
     authentication: AuthenticationService,
 ) -> Result<(), Box<dyn Error>> {
     let one = NonZeroU32::MIN;
+    let two = NonZeroU32::new(2).ok_or("enumeration admission limit was zero")?;
     api.admission = crate::admission::AdmissionControl::new(
         AdmissionPolicy::builder()
             .administration(one)
             .reads(one)
             .writes(one)
             .checks(one)
-            .enumeration(one)
+            .enumeration(two)
             .build(),
     )?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -1902,24 +1968,26 @@ async fn assert_grpc_endpoint_admission(
             .ok_or("check class was not limited")?;
         assert_eq!(error.code(), tonic::Code::ResourceExhausted);
 
-        let expand = pb::ExpandRequest {
-            store_id: STORE_ID.to_owned(),
-            tuple_key: Some(pb::ExpandRequestTupleKey {
-                relation: String::new(),
-                object: "document:roadmap".to_owned(),
-            }),
-            authorization_model_id: MODEL_ID.to_owned(),
-            consistency: 0,
-            contextual_tuples: None,
-        };
+        let listed = client
+            .list_objects(list_objects_request())
+            .await?
+            .into_inner();
+        assert_eq!(listed.objects, vec!["document:roadmap"]);
+        let mut listed_stream = client
+            .streamed_list_objects(streamed_list_objects_request())
+            .await?
+            .into_inner();
+        assert_eq!(
+            listed_stream
+                .message()
+                .await?
+                .ok_or("gRPC ListObjects stream ended before its result")?
+                .object,
+            "document:roadmap",
+        );
+        assert!(listed_stream.message().await?.is_none());
         let error = client
-            .expand(expand.clone())
-            .await
-            .err()
-            .ok_or("enumeration placeholder unexpectedly succeeded")?;
-        assert_eq!(error.code(), tonic::Code::Unimplemented);
-        let error = client
-            .expand(expand)
+            .list_objects(list_objects_request())
             .await
             .err()
             .ok_or("enumeration class was not limited")?;
@@ -2251,6 +2319,33 @@ fn check_request() -> pb::CheckRequest {
         trace: false,
         context: None,
         consistency: 0,
+    }
+}
+
+fn list_objects_request() -> pb::ListObjectsRequest {
+    pb::ListObjectsRequest {
+        store_id: STORE_ID.to_owned(),
+        authorization_model_id: MODEL_ID.to_owned(),
+        r#type: "document".to_owned(),
+        relation: "viewer".to_owned(),
+        user: "user:anne".to_owned(),
+        contextual_tuples: None,
+        context: None,
+        consistency: 0,
+    }
+}
+
+fn streamed_list_objects_request() -> pb::StreamedListObjectsRequest {
+    let request = list_objects_request();
+    pb::StreamedListObjectsRequest {
+        store_id: request.store_id,
+        authorization_model_id: request.authorization_model_id,
+        r#type: request.r#type,
+        relation: request.relation,
+        user: request.user,
+        contextual_tuples: request.contextual_tuples,
+        context: request.context,
+        consistency: request.consistency,
     }
 }
 

@@ -5,7 +5,8 @@ use std::{fmt, num::NonZeroU32, sync::Arc, time::Duration};
 use openfga_auth::AuthorizationPolicy;
 use openfga_domain::{InputLimits, RequestTimeout, TokenCodec};
 use openfga_service::{
-    AssertionService, ChangeService, CheckService, ModelService, StoreService, TupleService,
+    AssertionService, ChangeService, CheckService, ListObjectsService, ModelService, StoreService,
+    TupleService,
 };
 use typed_builder::TypedBuilder;
 
@@ -31,6 +32,8 @@ pub struct OpenFgaServices {
     pub(crate) changes: ChangeService,
     /// Check and `BatchCheck` use cases.
     pub(crate) checks: CheckService,
+    /// Unary and streaming `ListObjects` use cases.
+    pub(crate) list_objects: ListObjectsService,
 }
 
 /// Validated finite policy shared by HTTP and gRPC adapters.

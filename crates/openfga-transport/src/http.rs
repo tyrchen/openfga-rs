@@ -2,17 +2,20 @@
 
 use std::{
     collections::HashSet,
+    convert::Infallible,
     fmt,
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    pin::Pin,
     sync::{
         Arc, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
+    task::{Context, Poll},
 };
 
 use axum::{
     Json, Router,
-    body::{Body, to_bytes},
+    body::{Body, BodyDataStream, Bytes, to_bytes},
     extract::{
         ConnectInfo, DefaultBodyLimit, Extension, Path, Query, State,
         rejection::{JsonRejection, QueryRejection},
@@ -23,14 +26,18 @@ use axum::{
     routing::{delete, get, post},
 };
 use openfga_auth::{Action, AuthenticationService};
-use openfga_domain::Principal;
+use openfga_domain::{ObjectRef, Principal};
+use openfga_list::ListError;
 use openfga_proto::openfga::v1 as pb;
+use openfga_service::ServiceError;
 use prost_reflect::{DescriptorPool, Kind, MessageDescriptor};
 use serde::{
     Deserialize, Deserializer, Serialize,
     de::{DeserializeSeed, Error as _, IgnoredAny, MapAccess, SeqAccess, Visitor},
 };
 use serde_json::{Map, Number, Value};
+use tokio::sync::OwnedSemaphorePermit;
+use tokio_stream::{Stream, StreamExt};
 use tonic::Status;
 use tower_http::{
     catch_panic::CatchPanicLayer,
@@ -44,7 +51,7 @@ use crate::{ApiError, EndpointClass, OpenFgaApi, admission::AdmissionControl};
 
 const REQUEST_ID_HEADER: HeaderName = HeaderName::from_static("x-request-id");
 
-/// Builds the bounded HTTP/JSON router for all pinned M2 routes.
+/// Builds the bounded HTTP/JSON router for the pinned API surface.
 pub fn http_router(api: OpenFgaApi, authentication: AuthenticationService) -> Router {
     let body_limit = api.config.maximum_message_bytes;
     let timeout = api.config.request_timeout.duration();
@@ -121,10 +128,48 @@ async fn limit_endpoint_concurrency(
     match api.acquire_endpoint_permit() {
         Ok(permit) => {
             let response = next.run(request).await;
-            drop(permit);
-            response
+            if is_streamed_list_objects(response.extensions()) {
+                retain_permit_for_body(response, permit)
+            } else {
+                drop(permit);
+                response
+            }
         }
         Err(error) => error.into_response(),
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct StreamedListObjectsResponseMarker;
+
+fn is_streamed_list_objects(extensions: &axum::http::Extensions) -> bool {
+    extensions
+        .get::<StreamedListObjectsResponseMarker>()
+        .is_some()
+}
+
+fn retain_permit_for_body(response: Response, permit: OwnedSemaphorePermit) -> Response {
+    let (parts, body) = response.into_parts();
+    Response::from_parts(
+        parts,
+        Body::from_stream(PermittedBodyStream {
+            inner: body.into_data_stream(),
+            _permit: permit,
+        }),
+    )
+}
+
+#[derive(Debug)]
+struct PermittedBodyStream {
+    inner: BodyDataStream,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl Stream for PermittedBodyStream {
+    type Item = Result<Bytes, axum::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner).poll_next(context)
     }
 }
 
@@ -630,6 +675,9 @@ async fn response_limit(
     next: Next,
 ) -> Response {
     let response = next.run(request).await;
+    if is_streamed_list_objects(response.extensions()) {
+        return response;
+    }
     let (parts, body) = response.into_parts();
     match to_bytes(body, maximum_bytes).await {
         Ok(bytes) => Response::from_parts(parts, Body::from(bytes)),
@@ -901,11 +949,10 @@ async fn list_objects(
     Extension(principal): Extension<Principal>,
     Path(store_id): Path<String>,
     body: Result<Json<pb::ListObjectsRequest>, JsonRejection>,
-) -> Result<(), ApiError> {
+) -> Result<Json<pb::ListObjectsResponse>, ApiError> {
     let mut request = json(body)?;
     request.store_id.clone_from(&store_id);
-    ApiError::validate_list_objects(&request)?;
-    authorize_unimplemented(&api, &principal, Action::ListObjects, &store_id)
+    api.list_objects(&principal, request).await.map(Json)
 }
 
 async fn streamed_list_objects(
@@ -919,13 +966,51 @@ async fn streamed_list_objects(
         Err(error) => return streamed_error_response(error),
     };
     request.store_id.clone_from(&store_id);
-    if let Err(error) = ApiError::validate_streamed_list_objects(&request) {
-        return streamed_error_response(error);
-    }
-    match authorize_unimplemented(&api, &principal, Action::StreamedListObjects, &store_id) {
-        Ok(()) => StatusCode::OK.into_response(),
+    match api.streamed_list_objects(&principal, request).await {
+        Ok(stream) => {
+            let body = Body::from_stream(
+                stream.map(|item| Ok::<_, Infallible>(streamed_item_bytes(item))),
+            );
+            let mut response = (
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                body,
+            )
+                .into_response();
+            response
+                .extensions_mut()
+                .insert(StreamedListObjectsResponseMarker);
+            response
+        }
         Err(error) => streamed_error_response(error),
     }
+}
+
+fn streamed_item_bytes(item: Result<ObjectRef, ListError>) -> Bytes {
+    let encoded = match item {
+        Ok(object) => serde_json::to_vec(&pb::StreamedListObjectsResponse {
+            object: object.to_string(),
+        }),
+        Err(error) => {
+            let error = ApiError::from(ServiceError::from(error));
+            let status = Status::from(error);
+            serde_json::to_vec(&StreamErrorResponse {
+                error: StreamError {
+                    code: status.code() as i32,
+                    message: status.message().to_owned(),
+                    details: Vec::new(),
+                },
+            })
+        }
+    };
+    let mut encoded = match encoded {
+        Ok(encoded) => encoded,
+        Err(_) => {
+            b"{\"error\":{\"code\":13,\"message\":\"internal error\",\"details\":[]}}".to_vec()
+        }
+    };
+    encoded.push(b'\n');
+    Bytes::from(encoded)
 }
 
 #[derive(Debug, Serialize)]

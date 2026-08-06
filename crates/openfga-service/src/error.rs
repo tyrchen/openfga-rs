@@ -6,6 +6,7 @@ use openfga_check::{CheckError, CheckErrorKind};
 use openfga_domain::{
     AuthorizationModelId, ConditionName, RelationName, RelationshipTuple, TupleKey, TypeName,
 };
+use openfga_list::{ListError, ListErrorKind};
 use openfga_model::{ModelErrors, TupleValidationError, TupleValidationErrorKind};
 use openfga_storage::{StorageError, StorageErrorKind};
 use thiserror::Error;
@@ -130,6 +131,8 @@ pub enum ModelRelationType {
 enum ServiceErrorSource {
     #[error(transparent)]
     Check(CheckError),
+    #[error(transparent)]
+    List(ListError),
     #[error(transparent)]
     Storage(StorageError),
     #[error(transparent)]
@@ -444,6 +447,38 @@ impl From<CheckError> for ServiceError {
             kind,
             code,
             source: Some(Box::new(ServiceErrorSource::Check(source))),
+            tuple: None,
+            condition: None,
+            condition_parameter_count: None,
+            model_id: None,
+            model_context: None,
+            actual: None,
+            limit: None,
+        }
+    }
+}
+
+impl From<ListError> for ServiceError {
+    fn from(source: ListError) -> Self {
+        let kind = match source.kind() {
+            ListErrorKind::InvalidModel | ListErrorKind::InvalidTuple => {
+                ServiceErrorKind::InvalidRequest
+            }
+            ListErrorKind::DepthExceeded
+            | ListErrorKind::DispatchExceeded
+            | ListErrorKind::DatastoreQueryExceeded
+            | ListErrorKind::TupleItemExceeded
+            | ListErrorKind::CandidateExceeded => ServiceErrorKind::ResourceExhausted,
+            ListErrorKind::StorageUnavailable => ServiceErrorKind::Unavailable,
+            ListErrorKind::Timeout => ServiceErrorKind::Timeout,
+            ListErrorKind::Cancelled => ServiceErrorKind::Cancelled,
+            ListErrorKind::Internal => ServiceErrorKind::Internal,
+        };
+        let code = source.code();
+        Self {
+            kind,
+            code,
+            source: Some(Box::new(ServiceErrorSource::List(source))),
             tuple: None,
             condition: None,
             condition_parameter_count: None,

@@ -12,10 +12,14 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+async-trait.workspace = true
+openfga-check.workspace = true
 openfga-domain.workspace = true
 openfga-model.workspace = true
 openfga-storage.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
 typed-builder.workspace = true
 
 [dev-dependencies]

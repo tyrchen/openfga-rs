@@ -20,11 +20,12 @@ use openfga_check::CheckBudget;
 use openfga_domain::{
     ConsistencyPreference, Deadline, InputLimits, Limit, RequestTimeout, TokenCodec, TokenKey,
 };
+use openfga_list::{CandidateBudget, ListObjectsBudget};
 use openfga_model::ModelCompiler;
 use openfga_service::{
-    AssertionService, ChangeService, CheckService, IdentifierSource, ModelPublication,
-    ModelService, StoreService, SystemIdentifierSource, SystemIdentifierSourceConfig,
-    SystemServiceClock, TupleService,
+    AssertionService, ChangeService, CheckService, IdentifierSource, ListObjectsService,
+    ModelPublication, ModelService, StoreService, SystemIdentifierSource,
+    SystemIdentifierSourceConfig, SystemServiceClock, TupleService,
 };
 use openfga_storage::{
     AssertionReader, AssertionWriter, ChangeReader, HealthCheck, ModelReader, ModelWriter,
@@ -298,6 +299,7 @@ async fn assemble(config: &ServerConfig) -> Result<RuntimeAssembly> {
     );
     let identifier_service: Arc<dyn IdentifierSource> = identifiers.clone();
     let budget = check_budget(config)?;
+    let list_objects_budget = list_objects_budget(config, budget)?;
     let (services, storage, health) = match config.storage.backend {
         StorageBackend::Memory => {
             let capacity = NonZeroUsize::new(config.storage.memory.actor_capacity)
@@ -311,7 +313,13 @@ async fn assemble(config: &ServerConfig) -> Result<RuntimeAssembly> {
                 .context("failed to start memory storage actor")?,
             );
             let health: Arc<dyn HealthCheck> = storage.clone();
-            let services = services(storage.clone(), identifier_service, limits.clone(), budget);
+            let services = services(
+                storage.clone(),
+                identifier_service,
+                limits.clone(),
+                budget,
+                list_objects_budget,
+            );
             (services, StorageOwner::Memory(storage), health)
         }
         StorageBackend::Postgres => {
@@ -322,7 +330,13 @@ async fn assemble(config: &ServerConfig) -> Result<RuntimeAssembly> {
                     .context("failed to connect PostgreSQL storage")?,
             );
             let health: Arc<dyn HealthCheck> = storage.clone();
-            let services = services(storage.clone(), identifier_service, limits.clone(), budget);
+            let services = services(
+                storage.clone(),
+                identifier_service,
+                limits.clone(),
+                budget,
+                list_objects_budget,
+            );
             (services, StorageOwner::Postgres(storage), health)
         }
     };
@@ -403,6 +417,7 @@ fn services<B>(
     identifiers: Arc<dyn IdentifierSource>,
     limits: InputLimits,
     budget: CheckBudget,
+    list_objects_budget: ListObjectsBudget,
 ) -> OpenFgaServices
 where
     B: AssertionReader
@@ -455,10 +470,20 @@ where
             models.clone(),
             tuples.clone(),
             tuple_writes,
-            limits,
+            limits.clone(),
         ))
         .changes(ChangeService::new(stores, changes))
-        .checks(CheckService::direct(models, tuples, budget))
+        .checks(CheckService::direct(
+            Arc::clone(&models),
+            Arc::clone(&tuples),
+            budget,
+        ))
+        .list_objects(ListObjectsService::direct(
+            models,
+            tuples,
+            list_objects_budget,
+            limits,
+        ))
         .build()
 }
 
@@ -471,6 +496,30 @@ fn check_budget(config: &ServerConfig) -> Result<CheckBudget> {
         .condition_cost(Limit::<1_000_000>::new(config.evaluator.condition_cost)?)
         .concurrent_reads(Limit::<1_024>::new(config.evaluator.concurrent_reads)?)
         .batch_concurrency(Limit::<1_000>::new(config.evaluator.batch_concurrency)?)
+        .build())
+}
+
+fn list_objects_budget(config: &ServerConfig, check: CheckBudget) -> Result<ListObjectsBudget> {
+    let candidate = CandidateBudget::builder()
+        .depth(Limit::<1_000>::new(config.list_objects.candidate_depth)?)
+        .dispatches(Limit::<1_000_000>::new(
+            config.list_objects.candidate_dispatches,
+        )?)
+        .datastore_queries(Limit::<100_000>::new(
+            config.list_objects.candidate_datastore_queries,
+        )?)
+        .tuple_items(Limit::<1_000_000>::new(
+            config.list_objects.candidate_tuple_items,
+        )?)
+        .candidates(Limit::<100_000>::new(config.list_objects.candidates)?)
+        .build();
+    Ok(ListObjectsBudget::builder()
+        .candidate(candidate)
+        .check(check)
+        .residual_concurrency(Limit::<1_024>::new(
+            config.list_objects.residual_concurrency,
+        )?)
+        .stream_buffer(Limit::<1_024>::new(config.list_objects.stream_buffer)?)
         .build())
 }
 
@@ -992,11 +1041,13 @@ mod tests {
         AuthorizationModelId, InputLimits, PrincipalId, RequestTimeout, StoreId, TokenCodec,
         TokenKey, TokenKeyId,
     };
+    use openfga_list::ListObjectsBudget;
     use openfga_model::ModelCompiler;
     use openfga_proto::openfga::v1::{self as pb, open_fga_service_client::OpenFgaServiceClient};
     use openfga_service::{
         AssertionService, ChangeService, CheckService, IdentifierSource, IdentifierSourceError,
-        ModelPublication, ModelService, ServiceClock, StoreService, TupleService,
+        ListObjectsService, ModelPublication, ModelService, ServiceClock, StoreService,
+        TupleService,
     };
     use openfga_storage::{
         AssertionReader, AssertionWriter, ChangeReader, ModelReader, ModelWriter, OperationContext,
@@ -1173,9 +1224,15 @@ mod tests {
             ))
             .changes(ChangeService::new(stores, changes))
             .checks(CheckService::direct(
+                Arc::clone(&blocking_models),
+                Arc::clone(&tuples),
+                CheckBudget::default(),
+            ))
+            .list_objects(ListObjectsService::direct(
                 blocking_models,
                 tuples,
-                CheckBudget::default(),
+                ListObjectsBudget::default(),
+                limits.clone(),
             ))
             .build();
         let api = OpenFgaApi::new(

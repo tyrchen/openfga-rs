@@ -1,8 +1,8 @@
 //! Transport-neutral use cases and orchestration across semantic capabilities.
 //!
 //! The service layer resolves the immutable model selected by a validated
-//! command, then delegates authorization semantics to [`openfga_check`]. Wire
-//! conversion, authentication, and protocol error mapping remain transport
+//! command, then delegates authorization semantics to bounded semantic engines.
+//! Wire conversion, authentication, and protocol error mapping remain transport
 //! responsibilities.
 
 #![forbid(unsafe_code)]
@@ -14,6 +14,7 @@ mod clock;
 mod common;
 mod error;
 mod identifier;
+mod list_objects;
 mod model;
 mod store;
 mod tuple;
@@ -29,6 +30,7 @@ pub use identifier::{
     IdentifierSource, IdentifierSourceError, IdentifierSourceErrorKind, SystemIdentifierSource,
     SystemIdentifierSourceConfig,
 };
+pub use list_objects::{ListObjectsService, ResolvedListObjectsModel};
 pub use model::{ModelPublication, ModelService};
 pub use store::StoreService;
 pub use tuple::{ResolvedTupleWriteModel, TupleContextSizePolicy, TupleService};

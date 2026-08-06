@@ -4,6 +4,7 @@ use std::{
     collections::{BTreeSet, HashMap},
     fmt,
     future::Future,
+    num::NonZeroU32,
     ops::Deref,
     sync::Arc,
     time::Instant,
@@ -13,8 +14,10 @@ use openfga_auth::Action;
 use openfga_check::{CheckError, CheckErrorKind, CheckResolution};
 use openfga_domain::{
     BatchCheckCommand, BatchCheckItem, BatchCheckItems, CheckCommand, ConsistencyPreference,
-    CorrelationId, Deadline, Principal, QueryContext, StoreId, TokenOperation, TypeName,
+    CorrelationId, Deadline, ListControl, ListObjectsCommand, ModelSelection, Principal,
+    QueryContext, StoreId, TokenOperation, TypeName,
 };
+use openfga_list::ListObjectsStream;
 use openfga_proto::openfga::v1 as pb;
 use openfga_service::TupleContextSizePolicy;
 use openfga_storage::{
@@ -728,6 +731,150 @@ impl OpenFgaApi {
             .collect::<HashMap<_, _>>();
         result.extend(local_errors);
         Ok(pb::BatchCheckResponse { result })
+    }
+
+    #[tracing::instrument(skip_all, fields(operation = "list_objects"))]
+    pub(crate) async fn list_objects(
+        &self,
+        principal: &Principal,
+        request: pb::ListObjectsRequest,
+    ) -> Result<pb::ListObjectsResponse, ApiError> {
+        self.preauthorize(principal, Action::ListObjects, Some(&request.store_id))?;
+        ApiError::validate_list_objects(&request)?;
+        self.authorize_store(principal, Action::ListObjects, &request.store_id)?;
+        let store_id = convert::store_id(&request.store_id)?;
+        let model_selection = convert::model_selection(&request.authorization_model_id)?;
+        let consistency = consistency(request.consistency)?;
+        let deadline = self.deadline()?;
+        let cancellation = RequestCancellation::new();
+        let model = self
+            .services
+            .list_objects
+            .resolve_transport_model(
+                store_id,
+                model_selection,
+                consistency,
+                deadline,
+                cancellation.token(),
+            )
+            .await
+            .map_err(ApiError::from)?;
+        let command = self.list_objects_command(
+            principal,
+            store_id,
+            model_selection,
+            consistency,
+            deadline,
+            &request.r#type,
+            &request.relation,
+            &request.user,
+            request.contextual_tuples,
+            request.context,
+        )?;
+        let outcome = self
+            .services
+            .list_objects
+            .list_objects_resolved(&command, model, cancellation.token())
+            .await
+            .map_err(ApiError::from)?;
+        Ok(pb::ListObjectsResponse {
+            objects: outcome.objects().iter().map(ToString::to_string).collect(),
+        })
+    }
+
+    #[tracing::instrument(skip_all, fields(operation = "streamed_list_objects"))]
+    pub(crate) async fn streamed_list_objects(
+        &self,
+        principal: &Principal,
+        request: pb::StreamedListObjectsRequest,
+    ) -> Result<ListObjectsStream, ApiError> {
+        self.preauthorize(
+            principal,
+            Action::StreamedListObjects,
+            Some(&request.store_id),
+        )?;
+        ApiError::validate_streamed_list_objects(&request)?;
+        self.authorize_store(principal, Action::StreamedListObjects, &request.store_id)?;
+        let store_id = convert::store_id(&request.store_id)?;
+        let model_selection = convert::model_selection(&request.authorization_model_id)?;
+        let consistency = consistency(request.consistency)?;
+        let deadline = self.deadline()?;
+        let cancellation = StorageCancellationToken::new();
+        let model = self
+            .services
+            .list_objects
+            .resolve_transport_model(
+                store_id,
+                model_selection,
+                consistency,
+                deadline,
+                cancellation.clone(),
+            )
+            .await
+            .map_err(ApiError::from)?;
+        let command = self.list_objects_command(
+            principal,
+            store_id,
+            model_selection,
+            consistency,
+            deadline,
+            &request.r#type,
+            &request.relation,
+            &request.user,
+            request.contextual_tuples,
+            request.context,
+        )?;
+        self.services
+            .list_objects
+            .streamed_list_objects_resolved(&command, model, cancellation)
+            .await
+            .map_err(ApiError::from)
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "shared generated request fields remain explicit"
+    )]
+    fn list_objects_command(
+        &self,
+        principal: &Principal,
+        store_id: StoreId,
+        model_selection: ModelSelection,
+        consistency: ConsistencyPreference,
+        deadline: Deadline,
+        object_type: &str,
+        relation: &str,
+        user: &str,
+        contextual_tuples: Option<pb::ContextualTupleKeys>,
+        context: Option<pbjson_types::Struct>,
+    ) -> Result<ListObjectsCommand, ApiError> {
+        let query = QueryContext::builder()
+            .store_id(store_id)
+            .model_selection(model_selection)
+            .consistency(consistency)
+            .contextual_tuples(convert::contextual_tuples_for_wire_semantics(
+                contextual_tuples,
+                &self.config.limits,
+                self.config.maximum_message_bytes,
+            )?)
+            .condition_context(convert::condition_context_for_wire_semantics(
+                context,
+                &self.config.limits,
+                self.config.maximum_message_bytes,
+            )?)
+            .deadline(deadline)
+            .principal(principal.clone())
+            .build();
+        let maximum_results =
+            NonZeroU32::new(self.config.limits.results()).ok_or_else(ApiError::invalid_request)?;
+        Ok(ListObjectsCommand::new(
+            query,
+            convert::type_name(object_type, &self.config.limits)?,
+            convert::relation_name(relation, &self.config.limits)?,
+            convert::subject_ref(user, &self.config.limits)?,
+            ListControl::new(maximum_results, None, &self.config.limits)
+                .map_err(|_| ApiError::invalid_request())?,
+        ))
     }
 
     pub(crate) fn authorize_store(

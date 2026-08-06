@@ -1,23 +1,61 @@
 //! Tonic adapter for every pinned `OpenFGA` service method.
 
 use std::{
+    fmt,
     net::{IpAddr, Ipv4Addr},
+    pin::Pin,
+    task::{Context, Poll},
     time::{Duration, Instant},
 };
 
 use openfga_auth::{Action, AuthenticationService};
 use openfga_domain::{Deadline, Principal, RequestTimeout};
+use openfga_list::ListObjectsStream;
 use openfga_proto::openfga::v1::{
     self as pb,
     open_fga_service_server::{OpenFgaService, OpenFgaServiceServer},
 };
+use openfga_service::ServiceError;
 use prost_reflect::ReflectMessage;
 use tokio::sync::OwnedSemaphorePermit;
+use tokio_stream::Stream;
 use tonic::{Request, Response, Status, codegen::InterceptedService, service::Interceptor};
 
 use crate::{
     ApiError, EndpointClass, OpenFgaApi, admission::AdmissionControl, api::with_request_deadline,
 };
+
+/// gRPC object stream retaining its endpoint concurrency permit until termination.
+#[non_exhaustive]
+pub struct GrpcListObjectsStream {
+    inner: ListObjectsStream,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl Stream for GrpcListObjectsStream {
+    type Item = Result<pb::StreamedListObjectsResponse, Status>;
+
+    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner).poll_next(context).map(|item| {
+            item.map(|result| {
+                result
+                    .map(|object| pb::StreamedListObjectsResponse {
+                        object: object.to_string(),
+                    })
+                    .map_err(|error| Status::from(ApiError::from(ServiceError::from(error))))
+            })
+        })
+    }
+}
+
+impl fmt::Debug for GrpcListObjectsStream {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GrpcListObjectsStream")
+            .field("inner", &self.inner)
+            .finish_non_exhaustive()
+    }
+}
 
 /// An authenticated bounded Tonic service adapter.
 pub type AuthenticatedGrpcService =
@@ -388,37 +426,43 @@ impl OpenFgaService for OpenFgaApi {
         )
     }
 
-    type StreamedListObjectsStream =
-        tonic::codegen::tokio_stream::Empty<Result<pb::StreamedListObjectsResponse, Status>>;
+    type StreamedListObjectsStream = GrpcListObjectsStream;
 
     async fn streamed_list_objects(
         &self,
         request: Request<pb::StreamedListObjectsRequest>,
     ) -> Result<Response<Self::StreamedListObjectsStream>, Status> {
-        let _permit = validate_unimplemented(
+        let (principal, deadline, permit) = validate_streaming(
             self,
             &request,
             Action::StreamedListObjects,
             &request.get_ref().store_id,
             EndpointClass::Enumeration,
         )?;
-        Err(Status::unimplemented(
-            "method StreamedListObjects not implemented",
-        ))
+        let inner = with_request_deadline(
+            deadline,
+            self.streamed_list_objects(&principal, request.into_inner()),
+        )
+        .await
+        .map_err(Status::from)?;
+        Ok(Response::new(GrpcListObjectsStream {
+            inner,
+            _permit: permit,
+        }))
     }
 
     async fn list_objects(
         &self,
         request: Request<pb::ListObjectsRequest>,
     ) -> Result<Response<pb::ListObjectsResponse>, Status> {
-        let _permit = validate_unimplemented(
+        unary!(
             self,
-            &request,
-            Action::ListObjects,
-            &request.get_ref().store_id,
+            request,
+            list_objects,
             EndpointClass::Enumeration,
-        )?;
-        Err(Status::unimplemented("method ListObjects not implemented"))
+            Action::ListObjects,
+            Some(request.get_ref().store_id.as_str())
+        )
     }
 
     async fn list_users(
@@ -465,6 +509,38 @@ fn validate_unimplemented<T: ReflectMessage>(
     }
     ApiError::validate_grpc(request.get_ref()).map_err(Status::from)?;
     Ok(permit)
+}
+
+fn validate_streaming<T: ReflectMessage>(
+    api: &OpenFgaApi,
+    request: &Request<T>,
+    action: Action,
+    store_id: &str,
+    class: EndpointClass,
+) -> Result<(Principal, Deadline, OwnedSemaphorePermit), Status> {
+    let principal = request
+        .extensions()
+        .get::<Principal>()
+        .cloned()
+        .ok_or_else(|| Status::unauthenticated("authentication context is missing"))?;
+    api.preauthorize(&principal, action, Some(store_id))
+        .map_err(Status::from)?;
+    let deadline = grpc_deadline(api, request)?;
+    api.admission
+        .admit_principal(&principal, class)
+        .map_err(Status::from)?;
+    let permit = api.acquire_endpoint_permit().map_err(Status::from)?;
+    let deadline = match deadline {
+        GrpcDeadline::Elapsed => {
+            return Err(Status::deadline_exceeded("Request Deadline Exceeded"));
+        }
+        GrpcDeadline::At(deadline) => deadline,
+    };
+    if deadline.is_elapsed(Instant::now()) {
+        return Err(Status::deadline_exceeded("Request Deadline Exceeded"));
+    }
+    ApiError::validate_grpc(request.get_ref()).map_err(Status::from)?;
+    Ok((principal, deadline, permit))
 }
 
 #[cfg(test)]

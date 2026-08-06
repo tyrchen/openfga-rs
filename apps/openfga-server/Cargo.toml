@@ -20,6 +20,7 @@ openfga-auth.workspace = true
 openfga-check.workspace = true
 openfga-condition.workspace = true
 openfga-domain.workspace = true
+openfga-list.workspace = true
 openfga-model.workspace = true
 openfga-proto.workspace = true
 openfga-service.workspace = true

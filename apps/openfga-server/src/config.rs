@@ -41,6 +41,7 @@ pub(crate) struct ServerConfig {
     pub(crate) auth: AuthConfig,
     pub(crate) transport: TransportPolicy,
     pub(crate) evaluator: EvaluatorPolicy,
+    pub(crate) list_objects: ListObjectsPolicy,
     pub(crate) telemetry: TelemetryConfig,
     pub(crate) shutdown: ShutdownConfig,
 }
@@ -345,6 +346,39 @@ pub(crate) struct EvaluatorPolicy {
     pub(crate) batch_concurrency: u32,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ListObjectsPolicy {
+    #[serde(default = "default_depth")]
+    pub(crate) candidate_depth: u32,
+    #[serde(default = "default_dispatches")]
+    pub(crate) candidate_dispatches: u32,
+    #[serde(default = "default_candidate_datastore_queries")]
+    pub(crate) candidate_datastore_queries: u32,
+    #[serde(default = "default_tuple_items")]
+    pub(crate) candidate_tuple_items: u32,
+    #[serde(default = "default_candidates")]
+    pub(crate) candidates: u32,
+    #[serde(default = "default_residual_concurrency")]
+    pub(crate) residual_concurrency: u32,
+    #[serde(default = "default_stream_buffer")]
+    pub(crate) stream_buffer: u32,
+}
+
+impl Default for ListObjectsPolicy {
+    fn default() -> Self {
+        Self {
+            candidate_depth: default_depth(),
+            candidate_dispatches: default_dispatches(),
+            candidate_datastore_queries: default_candidate_datastore_queries(),
+            candidate_tuple_items: default_tuple_items(),
+            candidates: default_candidates(),
+            residual_concurrency: default_residual_concurrency(),
+            stream_buffer: default_stream_buffer(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) enum LogFormat {
@@ -407,6 +441,8 @@ struct RawServerConfig {
     transport: TransportPolicy,
     evaluator: EvaluatorPolicy,
     #[serde(default)]
+    list_objects: ListObjectsPolicy,
+    #[serde(default)]
     telemetry: TelemetryConfig,
     #[serde(default)]
     shutdown: ShutdownConfig,
@@ -422,6 +458,7 @@ impl From<RawServerConfig> for ServerConfig {
             auth: raw.auth,
             transport: raw.transport,
             evaluator: raw.evaluator,
+            list_objects: raw.list_objects,
             telemetry: raw.telemetry,
             shutdown: raw.shutdown,
         }
@@ -462,6 +499,7 @@ impl ServerConfig {
         self.validate_storage()?;
         self.validate_transport()?;
         self.validate_evaluator()?;
+        self.validate_list_objects()?;
         self.validate_database_concurrency()?;
         self.validate_telemetry()?;
         bounded_duration(
@@ -801,15 +839,31 @@ impl ServerConfig {
         Ok(())
     }
 
+    fn validate_list_objects(&self) -> Result<()> {
+        Limit::<1_000>::new(self.list_objects.candidate_depth)
+            .context("ListObjects candidate depth is invalid")?;
+        Limit::<1_000_000>::new(self.list_objects.candidate_dispatches)
+            .context("ListObjects candidate dispatch limit is invalid")?;
+        Limit::<100_000>::new(self.list_objects.candidate_datastore_queries)
+            .context("ListObjects candidate datastore query limit is invalid")?;
+        Limit::<1_000_000>::new(self.list_objects.candidate_tuple_items)
+            .context("ListObjects candidate tuple item limit is invalid")?;
+        Limit::<100_000>::new(self.list_objects.candidates)
+            .context("ListObjects candidate limit is invalid")?;
+        Limit::<1_024>::new(self.list_objects.residual_concurrency)
+            .context("ListObjects residual concurrency is invalid")?;
+        Limit::<1_024>::new(self.list_objects.stream_buffer)
+            .context("ListObjects stream buffer is invalid")?;
+        Ok(())
+    }
+
     fn validate_database_concurrency(&self) -> Result<()> {
         if self.storage.backend == StorageBackend::Postgres
             && (self.evaluator.concurrent_reads > self.storage.postgres.max_connections
-                || self.evaluator.batch_concurrency > self.storage.postgres.max_connections)
+                || self.evaluator.batch_concurrency > self.storage.postgres.max_connections
+                || self.list_objects.residual_concurrency > self.storage.postgres.max_connections)
         {
-            bail!(
-                "evaluator concurrent reads and batch concurrency cannot exceed the PostgreSQL \
-                 work limit"
-            );
+            bail!("evaluator and ListObjects concurrency cannot exceed the PostgreSQL work limit");
         }
         Ok(())
     }
@@ -1043,6 +1097,10 @@ const fn default_datastore_queries() -> u32 {
     100
 }
 
+const fn default_candidate_datastore_queries() -> u32 {
+    1_000
+}
+
 const fn default_tuple_items() -> u32 {
     10_000
 }
@@ -1056,6 +1114,18 @@ const fn default_concurrent_reads() -> u32 {
 }
 
 const fn default_batch_concurrency() -> u32 {
+    16
+}
+
+const fn default_candidates() -> u32 {
+    10_000
+}
+
+const fn default_residual_concurrency() -> u32 {
+    16
+}
+
+const fn default_stream_buffer() -> u32 {
     16
 }
 
@@ -1221,13 +1291,18 @@ evaluator: {}
         assert!(config.validate().is_err());
 
         config.transport.admission.authentication_attempts = 1;
+        config.list_objects.stream_buffer = 0;
+        assert!(config.validate().is_err());
+
+        config.list_objects.stream_buffer = 16;
         config.tls.reload_interval_seconds = 0;
         assert!(config.validate().is_err());
         Ok(())
     }
 
     #[test]
-    fn test_should_reject_evaluator_scheduling_above_postgres_work_limit() -> anyhow::Result<()> {
+    fn test_should_reject_evaluator_and_list_scheduling_above_postgres_work_limit()
+    -> anyhow::Result<()> {
         let mut config = ServerConfig::from(parse(VALID.as_bytes())?);
         config.storage.backend = super::StorageBackend::Postgres;
         config.storage.postgres.max_connections = 8;
@@ -1239,6 +1314,10 @@ evaluator: {}
         assert!(config.validate().is_err());
 
         config.evaluator.batch_concurrency = 8;
+        config.list_objects.residual_concurrency = 9;
+        assert!(config.validate().is_err());
+
+        config.list_objects.residual_concurrency = 8;
         config.validate()?;
         Ok(())
     }

@@ -1,5 +1,6 @@
 //! Independent finite ceilings for reverse candidate discovery.
 
+use openfga_check::CheckBudget;
 use openfga_domain::Limit;
 use typed_builder::TypedBuilder;
 
@@ -59,6 +60,52 @@ impl CandidateBudget {
 }
 
 impl Default for CandidateBudget {
+    fn default() -> Self {
+        Self::builder().build()
+    }
+}
+
+/// Independent candidate, residual-Check, concurrency, and stream ceilings.
+#[derive(Clone, Copy, Debug, TypedBuilder)]
+#[non_exhaustive]
+pub struct ListObjectsBudget {
+    #[builder(default = CandidateBudget::default())]
+    candidate: CandidateBudget,
+    #[builder(default = CheckBudget::default())]
+    check: CheckBudget,
+    #[builder(default = trusted_limit::<1_024>(16))]
+    residual_concurrency: Limit<1_024>,
+    #[builder(default = trusted_limit::<1_024>(16))]
+    stream_buffer: Limit<1_024>,
+}
+
+impl ListObjectsBudget {
+    /// Returns reverse-candidate ceilings.
+    #[must_use]
+    pub const fn candidate(self) -> CandidateBudget {
+        self.candidate
+    }
+
+    /// Returns the independent budget applied to every residual Check.
+    #[must_use]
+    pub const fn check(self) -> CheckBudget {
+        self.check
+    }
+
+    /// Returns maximum concurrent residual Checks.
+    #[must_use]
+    pub const fn maximum_residual_concurrency(self) -> usize {
+        self.residual_concurrency.as_usize()
+    }
+
+    /// Returns bounded stream channel capacity.
+    #[must_use]
+    pub const fn stream_buffer(self) -> usize {
+        self.stream_buffer.as_usize()
+    }
+}
+
+impl Default for ListObjectsBudget {
     fn default() -> Self {
         Self::builder().build()
     }

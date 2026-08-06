@@ -16,6 +16,7 @@ async-trait.workspace = true
 getrandom.workspace = true
 openfga-check.workspace = true
 openfga-domain.workspace = true
+openfga-list.workspace = true
 openfga-model.workspace = true
 openfga-storage.workspace = true
 thiserror.workspace = true

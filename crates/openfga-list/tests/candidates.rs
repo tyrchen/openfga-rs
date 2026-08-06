@@ -4,25 +4,37 @@ use std::{
     collections::BTreeSet,
     error::Error,
     num::NonZeroU32,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
-use openfga_domain::{
-    AuthorizationModelId, ConditionContext, ConsistencyPreference, ContextualTuples, Deadline,
-    InputLimits, Limit, ListControl, ListObjectsCommand, ModelSelection, Principal, PrincipalKind,
-    QueryContext, RelationshipTuple, RequestTimeout, StoreId, TupleKey,
+use async_trait::async_trait;
+use openfga_check::{
+    BatchCheckOutcome, CheckBudget, CheckError, CheckEvaluator, CheckOutcome, DirectCheckEvaluator,
 };
-use openfga_list::{Candidate, CandidateBudget, ListErrorKind, ReverseCandidateTraversal};
+use openfga_domain::{
+    AuthorizationModelId, BatchCheckCommand, CheckCommand, ConditionContext, ConsistencyPreference,
+    ContextualTuples, Deadline, InputLimits, Limit, ListControl, ListObjectsCommand,
+    ModelSelection, Principal, PrincipalKind, QueryContext, RelationshipTuple, RequestTimeout,
+    StoreId, TupleKey,
+};
+use openfga_list::{
+    Candidate, CandidateBudget, DirectListObjectsEngine, ListErrorKind, ListObjectsBudget,
+    ListObjectsEngine, ReverseCandidateTraversal,
+};
 use openfga_model::{
-    AuthorizationModelSource, DirectRestrictionSource, ModelCompiler, RelationSource,
-    RestrictionKindSource, RewriteSource, TypeDefinitionSource,
+    AuthorizationModelSource, CompiledModel, DirectRestrictionSource, ModelCompiler,
+    RelationSource, RestrictionKindSource, RewriteSource, TypeDefinitionSource,
 };
 use openfga_storage::{
     OperationContext, StorageCancellationToken, StoreName, StoreWriter, TupleReader,
     TupleWriteOptions, TupleWriter,
 };
 use openfga_storage_memory::{MemoryStorage, MemoryStorageConfig};
+use tokio_stream::StreamExt;
 
 const STORE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 const MODEL_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAW";
@@ -168,6 +180,151 @@ async fn test_should_mark_ambiguous_candidates_and_fail_closed_on_limits_and_can
     assert_eq!(error.kind(), ListErrorKind::Cancelled);
     shutdown(storage).await?;
     Ok(())
+}
+
+#[tokio::test]
+async fn test_should_residual_check_ambiguous_candidates_for_unary_and_streaming_results()
+-> Result<(), Box<dyn Error>> {
+    let storage = memory_storage().await?;
+    write_tuples(
+        storage.as_ref(),
+        vec![
+            tuple("document:included#owner@user:alice")?,
+            tuple("document:excluded#viewer@user:alice")?,
+            tuple("document:excluded#banned@user:alice")?,
+        ],
+    )
+    .await?;
+    let model = ModelCompiler::default().compile(&model()?)?;
+    let tuple_reader: Arc<dyn TupleReader> = storage.clone();
+    let engine = DirectListObjectsEngine::default();
+    let query = command("allowed", ContextualTuples::empty())?;
+    let outcome = engine
+        .list_objects(
+            &query,
+            Arc::clone(&model),
+            Arc::clone(&tuple_reader),
+            ListObjectsBudget::default(),
+            StorageCancellationToken::new(),
+        )
+        .await?;
+    assert_eq!(
+        outcome
+            .objects()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        vec!["document:included"],
+    );
+    assert_eq!(outcome.metadata().residual_checks(), 2);
+
+    let mut stream = engine
+        .streamed_list_objects(
+            &query,
+            model,
+            tuple_reader,
+            ListObjectsBudget::default(),
+            StorageCancellationToken::new(),
+        )
+        .await?;
+    let mut streamed = Vec::new();
+    while let Some(item) = stream.next().await {
+        streamed.push(item?.to_string());
+    }
+    assert_eq!(streamed, vec!["document:included"]);
+    shutdown(storage).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_should_cancel_and_join_residual_checks_when_stream_is_dropped()
+-> Result<(), Box<dyn Error>> {
+    let storage = memory_storage().await?;
+    write_tuples(
+        storage.as_ref(),
+        vec![
+            tuple("document:included#owner@user:alice")?,
+            tuple("document:excluded#viewer@user:alice")?,
+        ],
+    )
+    .await?;
+    let model = ModelCompiler::default().compile(&model()?)?;
+    let tuple_reader: Arc<dyn TupleReader> = storage.clone();
+    let evaluator = Arc::new(BlockingCheckEvaluator::default());
+    let engine = DirectListObjectsEngine::new(InputLimits::default(), evaluator.clone());
+    let stream = engine
+        .streamed_list_objects(
+            &command("allowed", ContextualTuples::empty())?,
+            model,
+            tuple_reader,
+            ListObjectsBudget::default(),
+            StorageCancellationToken::new(),
+        )
+        .await?;
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while evaluator.active.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    drop(stream);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while evaluator.active.load(Ordering::SeqCst) != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+
+    shutdown(storage).await?;
+    Ok(())
+}
+
+#[derive(Debug, Default)]
+struct BlockingCheckEvaluator {
+    active: AtomicUsize,
+    delegate: DirectCheckEvaluator,
+}
+
+#[async_trait]
+impl CheckEvaluator for BlockingCheckEvaluator {
+    async fn check(
+        &self,
+        command: &CheckCommand,
+        model: Arc<CompiledModel>,
+        tuples: Arc<dyn TupleReader>,
+        budget: CheckBudget,
+        cancellation: StorageCancellationToken,
+    ) -> Result<CheckOutcome, CheckError> {
+        self.active.fetch_add(1, Ordering::SeqCst);
+        let _active = ActiveCheck(&self.active);
+        cancellation.cancelled().await;
+        self.delegate
+            .check(command, model, tuples, budget, cancellation)
+            .await
+    }
+
+    async fn batch_check(
+        &self,
+        command: &BatchCheckCommand,
+        model: Arc<CompiledModel>,
+        tuples: Arc<dyn TupleReader>,
+        budget: CheckBudget,
+        cancellation: StorageCancellationToken,
+    ) -> Result<BatchCheckOutcome, CheckError> {
+        self.delegate
+            .batch_check(command, model, tuples, budget, cancellation)
+            .await
+    }
+}
+
+#[derive(Debug)]
+struct ActiveCheck<'a>(&'a AtomicUsize);
+
+impl Drop for ActiveCheck<'_> {
+    fn drop(&mut self) {
+        let _previous = self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 fn command(

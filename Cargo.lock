@@ -1579,12 +1579,15 @@ dependencies = [
 name = "openfga-list"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "openfga-check",
  "openfga-domain",
  "openfga-model",
  "openfga-storage",
  "openfga-storage-memory",
  "thiserror 2.0.19",
  "tokio",
+ "tokio-stream",
  "typed-builder",
 ]
 
@@ -1644,6 +1647,7 @@ dependencies = [
  "openfga-check",
  "openfga-condition",
  "openfga-domain",
+ "openfga-list",
  "openfga-model",
  "openfga-proto",
  "openfga-service",
@@ -1679,6 +1683,7 @@ dependencies = [
  "getrandom 0.4.3",
  "openfga-check",
  "openfga-domain",
+ "openfga-list",
  "openfga-model",
  "openfga-storage",
  "openfga-storage-memory",
@@ -1742,6 +1747,7 @@ dependencies = [
  "openfga-check",
  "openfga-condition",
  "openfga-domain",
+ "openfga-list",
  "openfga-model",
  "openfga-proto",
  "openfga-service",

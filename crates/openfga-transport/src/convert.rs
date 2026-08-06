@@ -51,6 +51,18 @@ pub(crate) fn model_id(value: &str) -> Result<AuthorizationModelId, ApiError> {
     })
 }
 
+pub(crate) fn type_name(value: &str, limits: &InputLimits) -> Result<TypeName, ApiError> {
+    TypeName::parse_with_limits(value, limits).map_err(|_| ApiError::invalid_request())
+}
+
+pub(crate) fn relation_name(value: &str, limits: &InputLimits) -> Result<RelationName, ApiError> {
+    RelationName::parse_with_limits(value, limits).map_err(|_| ApiError::invalid_request())
+}
+
+pub(crate) fn subject_ref(value: &str, limits: &InputLimits) -> Result<SubjectRef, ApiError> {
+    SubjectRef::parse_with_limits(value, limits).map_err(|_| ApiError::invalid_user())
+}
+
 pub(crate) fn tuple_key(
     object: &str,
     relation: &str,

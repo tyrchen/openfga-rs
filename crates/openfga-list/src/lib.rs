@@ -9,7 +9,14 @@
 mod budget;
 mod candidate;
 mod error;
+mod list_objects;
 
-pub use budget::{CandidateBudget, CandidateBudgetBuilder};
+pub use budget::{
+    CandidateBudget, CandidateBudgetBuilder, ListObjectsBudget, ListObjectsBudgetBuilder,
+};
 pub use candidate::{Candidate, CandidateMetadata, CandidateSet, ReverseCandidateTraversal};
 pub use error::{ListError, ListErrorKind};
+pub use list_objects::{
+    DirectListObjectsEngine, ListObjectsEngine, ListObjectsMetadata, ListObjectsOutcome,
+    ListObjectsStream,
+};

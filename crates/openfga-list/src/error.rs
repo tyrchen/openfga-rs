@@ -2,6 +2,7 @@
 
 use std::fmt;
 
+use openfga_check::{CheckError, CheckErrorKind};
 use openfga_model::{ModelLookupError, TupleValidationError};
 use openfga_storage::{StorageError, StorageErrorKind};
 use thiserror::Error;
@@ -35,6 +36,8 @@ pub enum ListErrorKind {
 
 #[derive(Debug, Error)]
 enum ListErrorSource {
+    #[error(transparent)]
+    Check(CheckError),
     #[error(transparent)]
     Storage(StorageError),
     #[error(transparent)]
@@ -111,6 +114,31 @@ impl From<TupleValidationError> for ListError {
             kind: ListErrorKind::InvalidTuple,
             code: source.code(),
             source: Some(ListErrorSource::TupleValidation(source)),
+        }
+    }
+}
+
+impl From<CheckError> for ListError {
+    fn from(source: CheckError) -> Self {
+        let kind = match source.kind() {
+            CheckErrorKind::InvalidModel => ListErrorKind::InvalidModel,
+            CheckErrorKind::InvalidTuple | CheckErrorKind::Condition => ListErrorKind::InvalidTuple,
+            CheckErrorKind::DepthExceeded => ListErrorKind::DepthExceeded,
+            CheckErrorKind::DispatchExceeded => ListErrorKind::DispatchExceeded,
+            CheckErrorKind::DatastoreQueryExceeded => ListErrorKind::DatastoreQueryExceeded,
+            CheckErrorKind::TupleItemExceeded | CheckErrorKind::ConditionCostExceeded => {
+                ListErrorKind::TupleItemExceeded
+            }
+            CheckErrorKind::StorageUnavailable => ListErrorKind::StorageUnavailable,
+            CheckErrorKind::Timeout => ListErrorKind::Timeout,
+            CheckErrorKind::Cancelled => ListErrorKind::Cancelled,
+            CheckErrorKind::Internal => ListErrorKind::Internal,
+        };
+        let code = source.code();
+        Self {
+            kind,
+            code,
+            source: Some(ListErrorSource::Check(source)),
         }
     }
 }
