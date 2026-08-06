@@ -22,6 +22,7 @@ const EXPECTED_PROTOC_DISTRIBUTION: &str = "protoc-bin-vendored 3.2.0";
 const EXPECTED_PROTOC_VERSION: &str = "31.1";
 const EXPECTED_PROST_VERSION: &str = "0.14.4";
 const EXPECTED_TONIC_VERSION: &str = "0.14.6";
+const EXPECTED_PBJSON_VERSION: &str = "0.9.0";
 const EXPECTED_IMPORT_PROVENANCE: &[(&str, &str, &str, &str)] = &[
     (
         "buf.build/envoyproxy/protoc-gen-validate",
@@ -78,6 +79,7 @@ const EXPECTED_PROTOC_BINARY_SHA256: &[(&str, &str)] = &[
 ];
 const GENERATED_FILES: &[&str] = &[
     "openfga.v1.rs",
+    "openfga.v1.serde.rs",
     "openfga_descriptor.bin",
     "route_metadata.rs",
 ];
@@ -135,6 +137,7 @@ struct ProtocLock {
 struct GeneratedLock {
     tonic: String,
     prost: String,
+    pbjson: String,
     aggregate_sha256: String,
 }
 
@@ -192,6 +195,8 @@ async fn main() -> Result<()> {
 
     let mut prost_config = Config::new();
     prost_config.protoc_executable(&protoc_binary);
+    prost_config.compile_well_known_types();
+    prost_config.extern_path(".google.protobuf", "::pbjson_types");
     tonic_prost_build::configure()
         .out_dir(&arguments.output)
         .file_descriptor_set_path(&descriptor_path)
@@ -200,6 +205,15 @@ async fn main() -> Result<()> {
         .extern_path(".validate", "::prost_types")
         .compile_with_config(prost_config, &proto_inputs, &includes)
         .context("failed to generate Tonic/Prost protocol artifacts")?;
+    let descriptors = tokio::fs::read(&descriptor_path)
+        .await
+        .context("failed to read generated protocol descriptors")?;
+    pbjson_build::Builder::new()
+        .out_dir(&arguments.output)
+        .register_descriptors(&descriptors)
+        .context("failed to register protocol descriptors for protobuf JSON")?
+        .build(&[".openfga.v1"])
+        .context("failed to generate protobuf JSON implementations")?;
 
     generate_route_metadata(
         &api_root.join("docs/openapiv2/apidocs.swagger.json"),
@@ -229,8 +243,9 @@ fn verify_lock_metadata(protocol_lock: &ProtocolLock) -> Result<()> {
     }
     if protocol_lock.generated.tonic != EXPECTED_TONIC_VERSION
         || protocol_lock.generated.prost != EXPECTED_PROST_VERSION
+        || protocol_lock.generated.pbjson != EXPECTED_PBJSON_VERSION
     {
-        bail!("protocol lock does not match the reviewed Tonic/Prost dependencies");
+        bail!("protocol lock does not match the reviewed Tonic/Prost/pbjson dependencies");
     }
     if !is_lower_hex(&protocol_lock.api.commit, 40)
         || !is_lower_hex(&protocol_lock.api.git_archive_sha256, 64)

@@ -7,8 +7,8 @@ use openfga_domain::{AuthorizationModelId, RelationshipTuple, StoreId, TupleKey}
 
 use crate::{
     Assertion, ChangeFilter, HealthStatus, MutationOutcome, ObjectRelationFilter, OperationContext,
-    Page, PageOptions, ReadOptions, ReverseTupleFilter, StorageError, StoreName, StoreRecord,
-    StoredAuthorizationModel, StoredTuple, TupleChange, TupleReadFilter, TupleStream,
+    Page, PageOptions, ReadOptions, ReverseTupleFilter, StorageError, StoreFilter, StoreName,
+    StoreRecord, StoredAuthorizationModel, StoredTuple, TupleChange, TupleReadFilter, TupleStream,
     TupleWriteOptions, UsersetTupleFilter,
 };
 
@@ -199,6 +199,7 @@ pub trait StoreReader: Send + Sync {
     async fn list_stores(
         &self,
         context: &OperationContext,
+        filter: &StoreFilter,
         options: &PageOptions,
     ) -> Result<Page<StoreRecord>, StorageError>;
 }

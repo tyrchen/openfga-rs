@@ -61,6 +61,7 @@
   "generated": {
     "tonic": "0.14.6",
     "prost": "0.14.4",
-    "aggregateSha256": "dfecad5d4d63ac155c98123979f66410dafa1393b959e372684e9feb5d9d06f4"
+    "pbjson": "0.9.0",
+    "aggregateSha256": "9691ab41efb5f56d2610d0c51c8cf7213736248526cc96db250d2ff7c0861ac7"
   }
 }

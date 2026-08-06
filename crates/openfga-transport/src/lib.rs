@@ -1,3 +1,22 @@
 //! gRPC and HTTP adapters, middleware, validation, and wire error mapping.
 
 #![forbid(unsafe_code)]
+
+mod api;
+mod config;
+mod convert;
+mod error;
+mod grpc;
+mod http;
+mod pagination;
+
+pub use api::OpenFgaApi;
+pub use config::{
+    OpenFgaServices, OpenFgaServicesBuilder, TransportConfig, TransportConfigBuilder,
+};
+pub use error::ApiError;
+pub use grpc::grpc_service;
+pub use http::http_router;
+
+#[cfg(test)]
+mod tests;

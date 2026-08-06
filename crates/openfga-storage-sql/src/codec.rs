@@ -160,6 +160,8 @@ struct AssertionDto {
     tuple: String,
     expectation: bool,
     contextual_tuples: Vec<TupleEnvelope>,
+    #[serde(default)]
+    condition_context: BTreeMap<String, ContextValueDto>,
 }
 
 pub(crate) fn encode_model(model: &StoredAuthorizationModel) -> Result<Vec<u8>, StorageError> {
@@ -655,6 +657,13 @@ impl AssertionDto {
                 .iter()
                 .map(TupleEnvelope::from_tuple)
                 .collect::<Result<_, _>>()?,
+            condition_context: assertion
+                .condition_context()
+                .iter()
+                .map(|(name, value)| {
+                    ContextValueDto::from_value(value).map(|value| (name.to_string(), value))
+                })
+                .collect::<Result<_, _>>()?,
         })
     }
 
@@ -670,8 +679,27 @@ impl AssertionDto {
             self.expectation,
             ContextualTuples::new(contextual_tuples, &limits)
                 .map_err(|error| integrity("persisted_assertion_context", error))?,
+            context_from_dto(self.condition_context, &limits)?,
         ))
     }
+}
+
+fn context_from_dto(
+    values: BTreeMap<String, ContextValueDto>,
+    limits: &InputLimits,
+) -> Result<ConditionContext, StorageError> {
+    let values = values
+        .into_iter()
+        .map(|(name, value)| {
+            Ok((
+                ParameterName::parse_with_limits(&name, limits)
+                    .map_err(|error| integrity("persisted_context_parameter", error))?,
+                value.into_value(limits)?,
+            ))
+        })
+        .collect::<Result<_, StorageError>>()?;
+    ConditionContext::new(values, limits)
+        .map_err(|error| integrity("persisted_context_invalid", error))
 }
 
 fn require_version(version: u8) -> Result<(), StorageError> {
@@ -732,9 +760,37 @@ mod tests {
         ConditionBinding, ConditionContext, ConditionReference, ContextValue, InputLimits,
         ParameterName, RelationshipTuple, TupleKey,
     };
-    use openfga_storage::StorageErrorKind;
+    use openfga_storage::{Assertion, StorageErrorKind};
 
-    use super::{MAXIMUM_TUPLE_PAYLOAD_BYTES, decode_tuple, encode_tuple};
+    use super::{
+        MAXIMUM_TUPLE_PAYLOAD_BYTES, decode_assertions, decode_tuple, encode_assertions,
+        encode_tuple,
+    };
+
+    #[test]
+    fn test_should_round_trip_assertion_condition_context() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let limits = InputLimits::default();
+        let context = ConditionContext::new(
+            BTreeMap::from([(
+                ParameterName::parse_with_limits("region", &limits)?,
+                ContextValue::String(openfga_domain::ContextString::new(
+                    "west".to_owned(),
+                    &limits,
+                )?),
+            )]),
+            &limits,
+        )?;
+        let assertion = Assertion::new(
+            "document:roadmap#viewer@user:anne".parse()?,
+            true,
+            openfga_domain::ContextualTuples::empty(),
+            context,
+        );
+        let decoded = decode_assertions(&encode_assertions(std::slice::from_ref(&assertion))?)?;
+        assert_eq!(decoded.as_ref(), &[assertion]);
+        Ok(())
+    }
 
     #[test]
     fn test_should_round_trip_typed_condition_context_without_loss()

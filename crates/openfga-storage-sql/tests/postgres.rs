@@ -8,8 +8,8 @@ use std::{
 };
 
 use openfga_domain::{
-    AuthorizationModelId, ConsistencyPreference, ContextualTuples, Deadline, InputLimits,
-    ObjectRef, RelationshipTuple, RequestTimeout, StoreId, TupleKey,
+    AuthorizationModelId, ConditionContext, ConsistencyPreference, ContextualTuples, Deadline,
+    InputLimits, ObjectRef, RelationshipTuple, RequestTimeout, StoreId, TupleKey,
 };
 use openfga_model::{
     AuthorizationModelSource, DirectRestrictionSource, ModelCompiler, RelationSource,
@@ -18,9 +18,9 @@ use openfga_model::{
 use openfga_storage::{
     Assertion, AssertionReader, AssertionWriter, ChangeFilter, ChangeReader, ConditionFilter,
     HealthCheck, ModelReader, ModelWriter, ObjectRelationFilter, OperationContext, PageOptions,
-    ReadOptions, StorageCancellationToken, StorageError, StorageErrorKind, StoreName, StoreReader,
-    StoreWriter, StoredAuthorizationModel, TupleReadFilter, TupleReader, TupleWriteOptions,
-    TupleWriter, WriteConflictPolicy,
+    ReadOptions, StorageCancellationToken, StorageError, StorageErrorKind, StoreFilter, StoreName,
+    StoreReader, StoreWriter, StoredAuthorizationModel, TupleReadFilter, TupleReader,
+    TupleWriteOptions, TupleWriter, WriteConflictPolicy,
     contract::{TupleContractFixture, verify_tuple_contract},
 };
 use openfga_storage_sql::{
@@ -80,11 +80,23 @@ async fn verify_management_and_shared_contract(
     );
     assert_eq!(
         storage
-            .list_stores(context, &page_options(1)?)
+            .list_stores(context, &StoreFilter::all(), &page_options(1)?)
             .await?
             .items()
             .len(),
         1
+    );
+    assert_eq!(
+        storage
+            .list_stores(
+                context,
+                &StoreFilter::named(StoreName::new("Postgres Store".to_owned())?),
+                &page_options(1)?,
+            )
+            .await?
+            .items()
+            .len(),
+        1,
     );
     assert_eq!(
         storage
@@ -193,6 +205,7 @@ async fn verify_management_and_shared_contract(
             vec![tuple("document:roadmap#viewer@user:carol")?],
             &InputLimits::default(),
         )?,
+        ConditionContext::empty(),
     );
     storage
         .write_assertions(context, store_id, model_id, vec![assertion.clone()])

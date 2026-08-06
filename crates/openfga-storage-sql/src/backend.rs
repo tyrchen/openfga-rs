@@ -19,7 +19,7 @@ use openfga_storage::{
     Assertion, AssertionReader, AssertionWriter, ChangeFilter, ChangeOperation, ChangeReader,
     HealthCheck, HealthStatus, ModelReader, ModelWriter, MutationOutcome, ObjectRelationFilter,
     OperationContext, Page, PageOptions, ReadOptions, ReverseTupleFilter, StorageCursor,
-    StorageError, StorageErrorKind, StoreName, StoreReader, StoreRecord, StoreWriter,
+    StorageError, StorageErrorKind, StoreFilter, StoreName, StoreReader, StoreRecord, StoreWriter,
     StoredAuthorizationModel, StoredTuple, TupleChange, TupleReadFilter, TupleReader, TupleStream,
     TupleWriteOptions, TupleWriter, UsersetTupleFilter, WriteConflictPolicy,
 };
@@ -766,11 +766,17 @@ impl StoreReader for PostgresStorage {
     async fn list_stores(
         &self,
         context: &OperationContext,
+        filter: &StoreFilter,
         options: &PageOptions,
     ) -> Result<Page<StoreRecord>, StorageError> {
         let pool = self.read_pool(context).await;
         let mut query = QueryBuilder::<Postgres>::new(store_select_columns());
         query.push(" WHERE deleted_at IS NULL");
+        if let Some(name) = filter.name() {
+            query
+                .push(" AND name = ")
+                .push_bind(name.as_str().to_owned());
+        }
         if let Some(after) = options.after() {
             let id = cursor_id::<StoreId>(after, "postgres_store_cursor_invalid")?;
             query.push(" AND id > ").push_bind(id.to_string());

@@ -9,8 +9,10 @@ readme.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+pbjson.workspace = true
+pbjson-types.workspace = true
 prost.workspace = true
-prost-types.workspace = true
+serde.workspace = true
 tonic.workspace = true
 tonic-prost.workspace = true
 

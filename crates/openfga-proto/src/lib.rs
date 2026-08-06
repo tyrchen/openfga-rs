@@ -14,6 +14,7 @@ pub mod openfga {
     #[allow(clippy::all, clippy::pedantic, missing_docs)]
     pub mod v1 {
         include!("generated/openfga.v1.rs");
+        include!("generated/openfga.v1.serde.rs");
     }
 }
 

@@ -722,7 +722,7 @@ pub struct RelationshipCondition {
     /// The keys must match the parameters defined by the condition, and the value types must
     /// match the parameter type definitions.
     #[prost(message, optional, tag = "2")]
-    pub context: ::core::option::Option<::prost_types::Struct>,
+    pub context: ::core::option::Option<::pbjson_types::Struct>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TupleKeyWithoutCondition {
@@ -761,7 +761,7 @@ pub struct Tuple {
     #[prost(message, optional, tag = "1")]
     pub key: ::core::option::Option<TupleKey>,
     #[prost(message, optional, tag = "2")]
-    pub timestamp: ::core::option::Option<::prost_types::Timestamp>,
+    pub timestamp: ::core::option::Option<::pbjson_types::Timestamp>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TupleKeys {
@@ -864,7 +864,7 @@ pub struct TupleChange {
     #[prost(enumeration = "TupleOperation", tag = "2")]
     pub operation: i32,
     #[prost(message, optional, tag = "3")]
-    pub timestamp: ::core::option::Option<::prost_types::Timestamp>,
+    pub timestamp: ::core::option::Option<::pbjson_types::Timestamp>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Store {
@@ -873,11 +873,11 @@ pub struct Store {
     #[prost(string, tag = "2")]
     pub name: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "3")]
-    pub created_at: ::core::option::Option<::prost_types::Timestamp>,
+    pub created_at: ::core::option::Option<::pbjson_types::Timestamp>,
     #[prost(message, optional, tag = "4")]
-    pub updated_at: ::core::option::Option<::prost_types::Timestamp>,
+    pub updated_at: ::core::option::Option<::pbjson_types::Timestamp>,
     #[prost(message, optional, tag = "5")]
-    pub deleted_at: ::core::option::Option<::prost_types::Timestamp>,
+    pub deleted_at: ::core::option::Option<::pbjson_types::Timestamp>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct UserTypeFilter {
@@ -963,7 +963,7 @@ pub struct ListObjectsRequest {
     /// Additional request context that will be used to evaluate any ABAC conditions encountered
     /// in the query evaluation.
     #[prost(message, optional, tag = "7")]
-    pub context: ::core::option::Option<::prost_types::Struct>,
+    pub context: ::core::option::Option<::pbjson_types::Struct>,
     /// Controls the consistency preference for this request. Default value is UNSPECIFIED, which will have the same behavior as MINIMIZE_LATENCY.
     #[prost(enumeration = "ConsistencyPreference", tag = "8")]
     pub consistency: i32,
@@ -990,7 +990,7 @@ pub struct ListUsersRequest {
     /// Additional request context that will be used to evaluate any ABAC conditions encountered
     /// in the query evaluation.
     #[prost(message, optional, tag = "7")]
-    pub context: ::core::option::Option<::prost_types::Struct>,
+    pub context: ::core::option::Option<::pbjson_types::Struct>,
     /// Controls the consistency preference for this request. Default value is UNSPECIFIED, which will have the same behavior as MINIMIZE_LATENCY.
     #[prost(enumeration = "ConsistencyPreference", tag = "8")]
     pub consistency: i32,
@@ -1017,7 +1017,7 @@ pub struct StreamedListObjectsRequest {
     /// Additional request context that will be used to evaluate any ABAC conditions encountered
     /// in the query evaluation.
     #[prost(message, optional, tag = "7")]
-    pub context: ::core::option::Option<::prost_types::Struct>,
+    pub context: ::core::option::Option<::pbjson_types::Struct>,
     /// Controls the consistency preference for this request. Default value is UNSPECIFIED, which will have the same behavior as MINIMIZE_LATENCY.
     #[prost(enumeration = "ConsistencyPreference", tag = "8")]
     pub consistency: i32,
@@ -1035,7 +1035,7 @@ pub struct ReadRequest {
     #[prost(message, optional, tag = "2")]
     pub tuple_key: ::core::option::Option<ReadRequestTupleKey>,
     #[prost(message, optional, tag = "3")]
-    pub page_size: ::core::option::Option<i32>,
+    pub page_size: ::core::option::Option<::pbjson_types::Int32Value>,
     #[prost(string, tag = "4")]
     pub continuation_token: ::prost::alloc::string::String,
     /// Controls the consistency preference for this request. Default value is UNSPECIFIED, which will have the same behavior as MINIMIZE_LATENCY.
@@ -1101,7 +1101,7 @@ pub struct CheckRequest {
     /// Additional request context that will be used to evaluate any ABAC conditions encountered
     /// in the query evaluation.
     #[prost(message, optional, tag = "6")]
-    pub context: ::core::option::Option<::prost_types::Struct>,
+    pub context: ::core::option::Option<::pbjson_types::Struct>,
     /// Controls the consistency preference for this request. Default value is UNSPECIFIED, which will have the same behavior as MINIMIZE_LATENCY.
     #[prost(enumeration = "ConsistencyPreference", tag = "7")]
     pub consistency: i32,
@@ -1141,7 +1141,7 @@ pub struct BatchCheckItem {
     #[prost(message, optional, tag = "2")]
     pub contextual_tuples: ::core::option::Option<ContextualTupleKeys>,
     #[prost(message, optional, tag = "3")]
-    pub context: ::core::option::Option<::prost_types::Struct>,
+    pub context: ::core::option::Option<::pbjson_types::Struct>,
     #[prost(string, tag = "4")]
     pub correlation_id: ::prost::alloc::string::String,
 }
@@ -1247,7 +1247,7 @@ pub struct ReadAuthorizationModelsRequest {
     #[prost(string, tag = "1")]
     pub store_id: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "2")]
-    pub page_size: ::core::option::Option<i32>,
+    pub page_size: ::core::option::Option<::pbjson_types::Int32Value>,
     #[prost(string, tag = "3")]
     pub continuation_token: ::prost::alloc::string::String,
 }
@@ -1290,11 +1290,11 @@ pub struct ReadChangesRequest {
     #[prost(string, tag = "2")]
     pub r#type: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "3")]
-    pub page_size: ::core::option::Option<i32>,
+    pub page_size: ::core::option::Option<::pbjson_types::Int32Value>,
     #[prost(string, tag = "4")]
     pub continuation_token: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "5")]
-    pub start_time: ::core::option::Option<::prost_types::Timestamp>,
+    pub start_time: ::core::option::Option<::pbjson_types::Timestamp>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ReadChangesResponse {
@@ -1315,9 +1315,9 @@ pub struct CreateStoreResponse {
     #[prost(string, tag = "2")]
     pub name: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "3")]
-    pub created_at: ::core::option::Option<::prost_types::Timestamp>,
+    pub created_at: ::core::option::Option<::pbjson_types::Timestamp>,
     #[prost(message, optional, tag = "4")]
-    pub updated_at: ::core::option::Option<::prost_types::Timestamp>,
+    pub updated_at: ::core::option::Option<::pbjson_types::Timestamp>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct UpdateStoreRequest {
@@ -1333,9 +1333,9 @@ pub struct UpdateStoreResponse {
     #[prost(string, tag = "2")]
     pub name: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "3")]
-    pub created_at: ::core::option::Option<::prost_types::Timestamp>,
+    pub created_at: ::core::option::Option<::pbjson_types::Timestamp>,
     #[prost(message, optional, tag = "4")]
-    pub updated_at: ::core::option::Option<::prost_types::Timestamp>,
+    pub updated_at: ::core::option::Option<::pbjson_types::Timestamp>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DeleteStoreRequest {
@@ -1356,16 +1356,16 @@ pub struct GetStoreResponse {
     #[prost(string, tag = "2")]
     pub name: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "3")]
-    pub created_at: ::core::option::Option<::prost_types::Timestamp>,
+    pub created_at: ::core::option::Option<::pbjson_types::Timestamp>,
     #[prost(message, optional, tag = "4")]
-    pub updated_at: ::core::option::Option<::prost_types::Timestamp>,
+    pub updated_at: ::core::option::Option<::pbjson_types::Timestamp>,
     #[prost(message, optional, tag = "5")]
-    pub deleted_at: ::core::option::Option<::prost_types::Timestamp>,
+    pub deleted_at: ::core::option::Option<::pbjson_types::Timestamp>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ListStoresRequest {
     #[prost(message, optional, tag = "1")]
-    pub page_size: ::core::option::Option<i32>,
+    pub page_size: ::core::option::Option<::pbjson_types::Int32Value>,
     #[prost(string, tag = "2")]
     pub continuation_token: ::prost::alloc::string::String,
     #[prost(string, tag = "3")]
@@ -1398,7 +1398,7 @@ pub struct Assertion {
     /// Additional request context that will be used to evaluate any ABAC conditions encountered
     /// in the query evaluation.
     #[prost(message, optional, tag = "4")]
-    pub context: ::core::option::Option<::prost_types::Struct>,
+    pub context: ::core::option::Option<::pbjson_types::Struct>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Assertions {

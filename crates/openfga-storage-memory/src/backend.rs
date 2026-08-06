@@ -14,9 +14,9 @@ use openfga_storage::{
     Assertion, AssertionReader, AssertionWriter, ChangeFilter, ChangeReader, HealthCheck,
     HealthStatus, ModelReader, ModelWriter, MutationOutcome, ObjectRelationFilter,
     OperationContext, Page, PageOptions, ReadOptions, ReverseTupleFilter, StorageError,
-    StorageErrorKind, StoreName, StoreReader, StoreRecord, StoreWriter, StoredAuthorizationModel,
-    StoredTuple, TupleChange, TupleReadFilter, TupleReader, TupleStream, TupleWriteOptions,
-    TupleWriter, UsersetTupleFilter,
+    StorageErrorKind, StoreFilter, StoreName, StoreReader, StoreRecord, StoreWriter,
+    StoredAuthorizationModel, StoredTuple, TupleChange, TupleReadFilter, TupleReader, TupleStream,
+    TupleWriteOptions, TupleWriter, UsersetTupleFilter,
 };
 use tokio::{
     sync::{mpsc, oneshot},
@@ -455,9 +455,11 @@ impl StoreReader for MemoryStorage {
     async fn list_stores(
         &self,
         context: &OperationContext,
+        filter: &StoreFilter,
         options: &PageOptions,
     ) -> Result<Page<StoreRecord>, StorageError> {
         self.dispatch(context, |reply| Command::ListStores {
+            filter: filter.clone(),
             options: options.clone(),
             reply,
         })

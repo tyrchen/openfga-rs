@@ -17,7 +17,7 @@ The source/tool pins are:
 | OpenFGA API | `f153694bfc20f7be303e33cabe72b668596c5a06` | Git archive SHA-256 `1c6139e0…9b34`; per-input SHA-256 checks |
 | API dependencies | exact BSR commits in upstream `buf.lock` | `buf.lock` SHA-256 `18331710…9961`; path-independent vendored aggregate `8afaacc6…7d28` |
 | `protoc` | `31.1`, distributed by `protoc-bin-vendored 3.2.0` | platform binary SHA-256 allowlist in `proto.lock.json` |
-| Tonic / Prost | `0.14.6` / `0.14.4` | `Cargo.lock` registry checksums |
+| Tonic / Prost / pbjson | `0.14.6` / `0.14.4` / `0.9.0` | `Cargo.lock` registry checksums |
 
 The complete unabridged hashes are in
 [`crates/openfga-proto/proto.lock.json`](../../crates/openfga-proto/proto.lock.json).
@@ -41,6 +41,7 @@ vendors/openfga-api @ f153694b
                                       │  ▼
 protoc-bin-vendored 3.2.0 ──verify──▶ openfga-proto-codegen
                                       │  ├─ openfga.v1.rs
+descriptor set ──▶ pbjson-build ──────┤  ├─ openfga.v1.serde.rs
 upstream Swagger ──route extraction───┘  ├─ openfga_descriptor.bin
                                          └─ route_metadata.rs
                                                    │
@@ -48,11 +49,11 @@ upstream Swagger ──route extraction───┘  ├─ openfga_descriptor.b
                                            openfga-proto crate
 ```
 
-The generated crate owns wire messages, Tonic clients/servers, the descriptor set, and the 18
-OpenFGA v1 HTTP route templates. AuthZEN paths in the merged Swagger document are deliberately
-excluded until Phase 6. Generated source is not hand-edited. Missing upstream proto comments are
-the sole reason the generated module locally allows `missing_docs`; project-owned public items
-remain documented.
+The generated crate owns wire messages, protobuf-JSON-compatible Serde implementations, Tonic
+clients/servers, the descriptor set, and the 18 OpenFGA v1 HTTP route templates. AuthZEN paths in
+the merged Swagger document are deliberately excluded until Phase 6. Generated source is not
+hand-edited. Missing upstream proto comments are the sole reason the generated module locally
+allows `missing_docs`; project-owned public items remain documented.
 
 ## HTTP route proof
 

@@ -10,3 +10,29 @@ rust-version.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+axum.workspace = true
+openfga-check.workspace = true
+openfga-condition.workspace = true
+openfga-domain.workspace = true
+openfga-model.workspace = true
+openfga-proto.workspace = true
+openfga-service.workspace = true
+openfga-storage.workspace = true
+pbjson-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+typed-builder.workspace = true
+ulid.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+openfga-storage-memory.workspace = true
+prost.workspace = true

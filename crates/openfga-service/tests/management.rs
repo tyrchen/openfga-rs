@@ -9,8 +9,8 @@ use std::{
 
 use async_trait::async_trait;
 use openfga_domain::{
-    AuthorizationModelId, ConsistencyPreference, ContextualTuples, Deadline, InputLimits,
-    ModelSelection, RelationshipTuple, RequestTimeout, StoreId, TupleKey,
+    AuthorizationModelId, ConditionContext, ConsistencyPreference, ContextualTuples, Deadline,
+    InputLimits, ModelSelection, RelationshipTuple, RequestTimeout, StoreId, TupleKey,
 };
 use openfga_model::{
     AuthorizationModelDefinition, DirectRestrictionSource, ModelCompiler, RelationSource,
@@ -22,8 +22,8 @@ use openfga_service::{
 };
 use openfga_storage::{
     Assertion, AssertionReader, AssertionWriter, ChangeFilter, ChangeReader, ModelReader,
-    ModelWriter, OperationContext, PageOptions, StorageCancellationToken, StoreName, StoreReader,
-    StoreWriter, TupleReadFilter, TupleReader, TupleWriteOptions, TupleWriter,
+    ModelWriter, OperationContext, PageOptions, StorageCancellationToken, StoreFilter, StoreName,
+    StoreReader, StoreWriter, TupleReadFilter, TupleReader, TupleWriteOptions, TupleWriter,
 };
 use openfga_storage_memory::{MemoryStorage, MemoryStorageConfig};
 
@@ -135,7 +135,7 @@ async fn exercise_store_and_model(
     );
     assert_eq!(
         stores
-            .list(context, &page_options(1, None)?)
+            .list(context, &StoreFilter::all(), &page_options(1, None)?)
             .await?
             .items()
             .len(),
@@ -228,7 +228,12 @@ async fn exercise_tuples_assertions_and_changes(
     assert_eq!(duplicate.kind(), ServiceErrorKind::InvalidRequest);
     assert_two_tuple_pages(tuples, context, store_id).await?;
 
-    let assertion = Assertion::new(anne.key().clone(), true, ContextualTuples::empty());
+    let assertion = Assertion::new(
+        anne.key().clone(),
+        true,
+        ContextualTuples::empty(),
+        ConditionContext::empty(),
+    );
     let resolved_id = assertions
         .write(
             context,
@@ -246,7 +251,12 @@ async fn exercise_tuples_assertions_and_changes(
         vec![tuple("document:roadmap#viewer@group:engineering")?],
         &InputLimits::default(),
     )?;
-    let invalid_assertion = Assertion::new(anne.key().clone(), true, invalid_context);
+    let invalid_assertion = Assertion::new(
+        anne.key().clone(),
+        true,
+        invalid_context,
+        ConditionContext::empty(),
+    );
     let invalid = assertions
         .write(
             context,

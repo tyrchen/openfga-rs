@@ -13,7 +13,7 @@ use openfga_domain::{
 use openfga_storage::{
     Assertion, ChangeFilter, ChangeOperation, ConditionFilter, MutationOutcome,
     ObjectRelationFilter, OperationContext, Page, PageOptions, ReadOptions, ReverseTupleFilter,
-    StorageCursor, StorageError, StorageErrorKind, StoreName, StoreRecord,
+    StorageCursor, StorageError, StorageErrorKind, StoreFilter, StoreName, StoreRecord,
     StoredAuthorizationModel, StoredTuple, TupleChange, TupleReadFilter, TupleWriteOptions,
     UsersetRestrictionFilter, UsersetTupleFilter, WriteConflictPolicy,
 };
@@ -392,6 +392,7 @@ impl MemoryState {
 
     pub(crate) fn list_stores(
         &self,
+        filter: &StoreFilter,
         options: &PageOptions,
     ) -> Result<Page<StoreRecord>, StorageError> {
         let after = options.after().map(parse_store_cursor).transpose()?;
@@ -399,7 +400,14 @@ impl MemoryState {
             .stores
             .keys()
             .copied()
-            .filter(|id| after.is_none_or(|cursor| *id > cursor));
+            .filter(|id| after.is_none_or(|cursor| *id > cursor))
+            .filter(|id| {
+                filter.name().is_none_or(|name| {
+                    self.stores
+                        .get(id)
+                        .is_some_and(|store| store.name() == name)
+                })
+            });
         let (ids, continuation) = bounded_page(ids, options.maximum_results());
         let stores = ids
             .into_iter()

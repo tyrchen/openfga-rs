@@ -4,7 +4,8 @@ use std::{fmt, sync::Arc};
 
 use openfga_domain::StoreId;
 use openfga_storage::{
-    OperationContext, Page, PageOptions, StoreName, StoreReader, StoreRecord, StoreWriter,
+    OperationContext, Page, PageOptions, StoreFilter, StoreName, StoreReader, StoreRecord,
+    StoreWriter,
 };
 
 use crate::{IdentifierSource, ServiceError};
@@ -116,10 +117,11 @@ impl StoreService {
     pub async fn list(
         &self,
         context: &OperationContext,
+        filter: &StoreFilter,
         options: &PageOptions,
     ) -> Result<Page<StoreRecord>, ServiceError> {
         context.check()?;
-        let page = self.reader.list_stores(context, options).await?;
+        let page = self.reader.list_stores(context, filter, options).await?;
         context.check()?;
         Ok(page)
     }

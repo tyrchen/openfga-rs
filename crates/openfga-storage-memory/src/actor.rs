@@ -8,9 +8,9 @@ use std::sync::{
 use openfga_domain::{AuthorizationModelId, RelationshipTuple, StoreId, TupleKey};
 use openfga_storage::{
     Assertion, ChangeFilter, HealthStatus, MutationOutcome, ObjectRelationFilter, OperationContext,
-    Page, PageOptions, ReadOptions, ReverseTupleFilter, StorageError, StoreName, StoreRecord,
-    StoredAuthorizationModel, StoredTuple, TupleChange, TupleReadFilter, TupleWriteOptions,
-    UsersetTupleFilter,
+    Page, PageOptions, ReadOptions, ReverseTupleFilter, StorageError, StoreFilter, StoreName,
+    StoreRecord, StoredAuthorizationModel, StoredTuple, TupleChange, TupleReadFilter,
+    TupleWriteOptions, UsersetTupleFilter,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -101,6 +101,7 @@ pub(crate) enum Command {
         reply: Reply<StoreRecord>,
     },
     ListStores {
+        filter: StoreFilter,
         options: PageOptions,
         reply: Reply<Page<StoreRecord>>,
     },
@@ -266,7 +267,11 @@ fn handle_command(state: &mut MemoryState, command: Command, context: &Operation
         } => send(reply, state.list_models(store_id, &options)),
         Command::WriteModel { model, reply } => send(reply, state.write_model(model)),
         Command::ReadStore { store_id, reply } => send(reply, state.read_store(store_id)),
-        Command::ListStores { options, reply } => send(reply, state.list_stores(&options)),
+        Command::ListStores {
+            filter,
+            options,
+            reply,
+        } => send(reply, state.list_stores(&filter, &options)),
         Command::CreateStore {
             store_id,
             name,

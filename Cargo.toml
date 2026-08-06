@@ -14,13 +14,16 @@ rust-version = "1.97.1"
 [workspace.dependencies]
 anyhow = { version = "~1.0.104", default-features = false, features = ["std"] }
 async-trait = "~0.1.91"
-axum = { version = "~0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
+axum = { version = "~0.8.9", default-features = false, features = ["http1", "json", "query", "tokio"] }
 base64 = { version = "~0.23.1", default-features = false, features = ["std"] }
 cel-parser = { version = "~0.10.1", default-features = false }
 getrandom = { version = "~0.4.3", default-features = false, features = ["std"] }
 clap = { version = "~4.6.5", default-features = false, features = ["derive", "error-context", "help", "std", "usage"] }
 hmac = { version = "~0.13.0", default-features = false, features = ["zeroize"] }
 jiff = { version = "~0.2.35", default-features = false, features = ["std"] }
+pbjson = { version = "~0.9.0", default-features = false }
+pbjson-build = { version = "~0.9.0", default-features = false }
+pbjson-types = { version = "~0.9.0", default-features = false }
 prost = { version = "~0.14.4", default-features = false, features = ["derive", "std"] }
 prost-types = { version = "~0.14.4", default-features = false }
 protoc-bin-vendored = "~3.2.0"
@@ -36,8 +39,8 @@ tokio = { version = "~1.53.1", default-features = false, features = ["macros", "
 tonic = { version = "~0.14.6", default-features = false, features = ["channel", "codegen", "transport"] }
 tonic-prost = { version = "~0.14.6", default-features = false }
 tonic-prost-build = { version = "~0.14.6", default-features = false, features = ["cleanup-markdown", "transport"] }
-tower = { version = "~0.5.3", default-features = false, features = ["limit"] }
-tower-http = { version = "~0.6.11", default-features = false, features = ["limit", "timeout"] }
+tower = { version = "~0.5.3", default-features = false, features = ["limit", "util"] }
+tower-http = { version = "~0.7.0", default-features = false, features = ["catch-panic", "limit", "propagate-header", "request-id", "sensitive-headers", "timeout", "trace"] }
 tracing = { version = "~0.1.44", default-features = false, features = ["attributes", "std"] }
 typed-builder = { version = "~0.23.2", default-features = false }
 ulid = { version = "~3.0.0", default-features = false }

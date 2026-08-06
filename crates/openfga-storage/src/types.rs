@@ -3,8 +3,8 @@
 use std::{collections::BTreeSet, fmt, num::NonZeroU32, sync::Arc, time::SystemTime};
 
 use openfga_domain::{
-    AuthorizationModelId, ChangeId, ConditionName, ContextualTuples, InputLimits, ObjectId,
-    ObjectRef, RelationName, RelationshipTuple, StoreId, SubjectRef, TupleKey, TypeName,
+    AuthorizationModelId, ChangeId, ConditionContext, ConditionName, ContextualTuples, InputLimits,
+    ObjectId, ObjectRef, RelationName, RelationshipTuple, StoreId, SubjectRef, TupleKey, TypeName,
 };
 use openfga_model::{AuthorizationModelSource, CompiledModel};
 
@@ -59,6 +59,33 @@ impl fmt::Debug for StoreName {
             .debug_struct("StoreName")
             .field("bytes", &self.0.len())
             .finish()
+    }
+}
+
+/// Exact-name predicate for stable store listings.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct StoreFilter {
+    name: Option<StoreName>,
+}
+
+impl StoreFilter {
+    /// Creates an unfiltered store listing predicate.
+    #[must_use]
+    pub const fn all() -> Self {
+        Self { name: None }
+    }
+
+    /// Creates an exact-name store listing predicate.
+    #[must_use]
+    pub const fn named(name: StoreName) -> Self {
+        Self { name: Some(name) }
+    }
+
+    /// Returns the optional exact-name constraint.
+    #[must_use]
+    pub const fn name(&self) -> Option<&StoreName> {
+        self.name.as_ref()
     }
 }
 
@@ -243,6 +270,7 @@ pub struct Assertion {
     tuple: TupleKey,
     expectation: bool,
     contextual_tuples: ContextualTuples,
+    condition_context: ConditionContext,
 }
 
 impl Assertion {
@@ -252,11 +280,13 @@ impl Assertion {
         tuple: TupleKey,
         expectation: bool,
         contextual_tuples: ContextualTuples,
+        condition_context: ConditionContext,
     ) -> Self {
         Self {
             tuple,
             expectation,
             contextual_tuples,
+            condition_context,
         }
     }
 
@@ -276,6 +306,12 @@ impl Assertion {
     #[must_use]
     pub const fn contextual_tuples(&self) -> &ContextualTuples {
         &self.contextual_tuples
+    }
+
+    /// Returns the bounded condition context for the asserted check.
+    #[must_use]
+    pub const fn condition_context(&self) -> &ConditionContext {
+        &self.condition_context
     }
 }
 

@@ -42,6 +42,7 @@ pub use traits::{
 pub use types::{
     Assertion, ChangeFilter, ChangeOperation, ConditionFilter, HealthStatus, MutationOutcome,
     ObjectRelationFilter, Page, PageOptions, ReadOptions, ReverseTupleFilter, StorageCursor,
-    StoreName, StoreRecord, StoredAuthorizationModel, StoredTuple, TupleChange, TupleReadFilter,
-    TupleWriteOptions, UsersetRestrictionFilter, UsersetTupleFilter, WriteConflictPolicy,
+    StoreFilter, StoreName, StoreRecord, StoredAuthorizationModel, StoredTuple, TupleChange,
+    TupleReadFilter, TupleWriteOptions, UsersetRestrictionFilter, UsersetTupleFilter,
+    WriteConflictPolicy,
 };

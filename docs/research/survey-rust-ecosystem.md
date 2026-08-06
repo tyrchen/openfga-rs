@@ -16,7 +16,7 @@ Versions below were resolved from crates.io on 2026-08-05. They are research pin
 | --- | --- | --- |
 | Runtime | `tokio 1.53.1` | Adopt with explicit `rt-multi-thread`, `macros`, `net`, `signal`, `sync`, `time` features. |
 | gRPC/protobuf | `tonic 0.14.6`, `tonic-prost 0.14.6`, `prost 0.14.4` | Adopt; tonic is the production Tokio/Tower-native gRPC implementation and supports streaming, TLS, health, and reflection. [Official repository](https://github.com/grpc/grpc-rust). |
-| HTTP/JSON | `axum 0.8.9`, `tower 0.5.3`, `tower-http 0.7.0` | Adopt for explicit OpenFGA HTTP routes/transcoding and shared middleware. Axum uses Tower services and forbids unsafe code. [Official repository](https://github.com/tokio-rs/axum). |
+| HTTP/JSON | `axum 0.8.9`, `tower 0.5.3`, `tower-http 0.7.0`, `pbjson 0.9.0` | Adopt explicit OpenFGA HTTP routes and shared Tower middleware; generate protobuf-JSON-compatible Serde implementations from the pinned descriptor set rather than hand-maintaining a second wire schema. [Axum](https://github.com/tokio-rs/axum), [pbjson](https://github.com/influxdata/pbjson). |
 | SQL | `sqlx 0.9.0` | Adopt with only `runtime-tokio`, `postgres`, `mysql`, `sqlite`, `migrate`, required type features; use checked queries. SQLx remains pure Rust and current 0.9 moved maintenance organization. [0.9 release](https://github.com/transact-rs/sqlx/discussions/4271). |
 | Cache | `moka 0.12.15` | Adopt for bounded concurrent weighted/TTL caches; isolate behind project traits. [Official repository](https://github.com/moka-rs/moka). |
 | Parsing | `winnow 1.0.4` | Adopt for tuple/user/reference and continuation-token grammars; zero-copy where ownership permits. [Official repository](https://github.com/winnow-rs/winnow). |

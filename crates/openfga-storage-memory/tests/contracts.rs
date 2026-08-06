@@ -11,8 +11,8 @@ use std::{
 };
 
 use openfga_domain::{
-    AuthorizationModelId, ConsistencyPreference, ContextualTuples, Deadline, InputLimits,
-    RelationName, RelationshipTuple, RequestTimeout, StoreId, TupleKey, TypeName,
+    AuthorizationModelId, ConditionContext, ConsistencyPreference, ContextualTuples, Deadline,
+    InputLimits, RelationName, RelationshipTuple, RequestTimeout, StoreId, TupleKey, TypeName,
 };
 use openfga_model::{
     AuthorizationModelSource, DirectRestrictionSource, ModelCompiler, RelationSource,
@@ -22,7 +22,7 @@ use openfga_storage::{
     Assertion, AssertionReader, AssertionWriter, ChangeFilter, ChangeOperation, ChangeReader,
     ConditionFilter, HealthCheck, ModelReader, ModelWriter, ObjectRelationFilter, OperationContext,
     PageOptions, ReadOptions, ReverseTupleFilter, StorageCancellationToken, StorageError,
-    StorageErrorKind, StoreName, StoreReader, StoreWriter, StoredAuthorizationModel,
+    StorageErrorKind, StoreFilter, StoreName, StoreReader, StoreWriter, StoredAuthorizationModel,
     TupleReadFilter, TupleReader, TupleWriteOptions, TupleWriter, UsersetRestrictionFilter,
     UsersetTupleFilter, WriteConflictPolicy,
     contract::{TupleContractFixture, verify_tuple_contract},
@@ -443,6 +443,7 @@ async fn test_should_publish_models_assertions_and_stable_pages() -> Result<(), 
         "document:roadmap#viewer@user:anne".parse()?,
         true,
         ContextualTuples::empty(),
+        ConditionContext::empty(),
     );
     let latest_id = MODEL_THREE.parse::<AuthorizationModelId>()?;
     storage
@@ -640,8 +641,16 @@ async fn assert_store_pagination(
             .await?;
     }
     let first = storage
-        .list_stores(context, &page_options(2, None)?)
+        .list_stores(context, &StoreFilter::all(), &page_options(2, None)?)
         .await?;
+    let named = storage
+        .list_stores(
+            context,
+            &StoreFilter::named(StoreName::new("additional".to_owned())?),
+            &page_options(10, None)?,
+        )
+        .await?;
+    assert_eq!(named.items().len(), 2);
     let first_ids: Vec<_> = first
         .items()
         .iter()
@@ -649,7 +658,11 @@ async fn assert_store_pagination(
         .collect();
     assert_eq!(first_ids, [STORE_ID, MODEL_ONE]);
     let second = storage
-        .list_stores(context, &page_options(2, first.continuation().cloned())?)
+        .list_stores(
+            context,
+            &StoreFilter::all(),
+            &page_options(2, first.continuation().cloned())?,
+        )
         .await?;
     let second_ids: Vec<_> = second
         .items()
@@ -661,7 +674,11 @@ async fn assert_store_pagination(
 
     let invalid_cursor = openfga_storage::StorageCursor::new(b"not-a-ulid".to_vec())?;
     let invalid = storage
-        .list_stores(context, &page_options(2, Some(invalid_cursor))?)
+        .list_stores(
+            context,
+            &StoreFilter::all(),
+            &page_options(2, Some(invalid_cursor))?,
+        )
         .await
         .err()
         .ok_or("invalid store cursor unexpectedly accepted")?;
