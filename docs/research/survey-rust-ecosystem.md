@@ -25,13 +25,13 @@ Versions below were resolved from crates.io on 2026-08-05. They are research pin
 | TLS/secrets | stable `rustls 0.23.x` with `aws-lc-rs`; `secrecy 0.10.3` | Adopt stable rustls only—not the 0.24 development release—and redacting secret types. [rustls](https://github.com/rustls/rustls), [secrecy](https://github.com/iqlusioninc/crates/tree/main/secrecy). |
 | Configuration | `config 0.15.25`, `serde_yaml`-compatible YAML provider | Adopt behind `ServerConfig`; YAML file + environment overrides; validate once into domain config. [Official repository](https://github.com/rust-cli/config-rs). |
 | Tests/benchmarks | `rstest 0.26.1`, `proptest 1.11.0`, `testcontainers 0.27.3`, `criterion 0.8.2` | Adopt only in dev-dependencies and only where each adds signal. |
-| CEL | `cel-interpreter 0.10.0` | Provisional only. Pure Rust and extensible, but OpenFGA compatibility must be demonstrated with CEL conformance and OpenFGA custom-type tests. [Official repository](https://github.com/cel-rust/cel-rust). |
+| CEL | `cel-parser 0.10.1`; project evaluator | Use the pure-Rust parser behind project types and implement the bounded evaluator in project code. Phase 0 rejected `cel-interpreter 0.10.0`; see the [conformance spike](./spike-cel-openfga-conformance.md). [Official repository](https://github.com/cel-rust/cel-rust). |
 
 ## Transport choice
 
 Tonic and Axum share Tokio, Hyper, and Tower, so one middleware policy can cover request IDs, tracing, authentication, timeouts, concurrency, load shedding, and body limits. Tonic's released branch documents gRPC streaming, rustls TLS, health, and reflection, while Axum 0.8 is the stable API line. A hand-written HTTP façade is preferable to a generic runtime transcoder when exact OpenFGA error bodies and route quirks need compatibility: generated protobuf messages remain the single wire model, and route adapters remain thin.
 
-`tonic-build` invokes `protoc` in common workflows. Builds must not depend on an ambient tool version. The proto crate will consume a pinned source snapshot and a pinned `protoc` artifact or checked-in generated Rust plus a reproducibility check; the Phase 0 proto spike decides which route produces the cleanest supply-chain and cross-platform story.
+`tonic-prost-build` invokes `protoc` in common workflows. Builds do not depend on an ambient tool version: Phase 0 pinned API commit `f153694b…`, uses checksum-verified `protoc 31.1`, checks in generated Rust, and requires byte-for-byte regeneration. See the [protocol spike](./spike-openfga-proto-generation.md).
 
 ## Storage choice
 
@@ -43,15 +43,15 @@ An embedded in-memory backend should use immutable compiled models plus actor-ow
 
 OpenFGA conditions are typed CEL Boolean expressions with scalar, duration, timestamp, bytes, list, map, any, and custom IP address values. OpenFGA tracks actual evaluation cost, caps it (default 100), supports partial/unknown evaluation, makes tuple context override request context, and returns an error for missing required parameters. See [OpenFGA conditions](https://openfga.dev/docs/modeling/conditions) and [CEL specification](https://github.com/cel-expr/cel-spec).
 
-`cel-interpreter` offers a pure-Rust parser/evaluator and custom functions, but its published metadata does not itself prove CEL conformance, canonical protobuf AST compatibility, OpenFGA IP address behavior, evaluation-cost equivalence, or cancellation inside comprehensions. Therefore:
+Phase 0 proved that `cel-interpreter` offers useful baseline value semantics but fails the required static typing, OpenFGA IP address, deterministic cost, prompt cancellation, and panic-freedom gates. Therefore:
 
 1. Define a project-owned `ConditionCompiler`/`CompiledCondition` boundary.
 2. Test the adapter against CEL conformance cases and vendored OpenFGA condition tests.
-3. Add OpenFGA types/functions and a deterministic project cost meter where the crate lacks them.
+3. Implement OpenFGA types/functions and a deterministic project cost meter in a project-owned evaluator over the parser AST.
 4. Reject model publication if compilation or Boolean output typing fails.
 5. Do not use the C++ FFI implementation by default: it conflicts with the repository's no-unsafe rule and increases build/supply-chain complexity.
 
-This is a deliberate provisional choice, not a missing decision: the compatibility gate determines whether `cel-interpreter` is adapted or replaced behind the same boundary.
+The compatibility gate is resolved: `cel-interpreter` is a test-only rejected candidate, while production depends on `cel-parser` and project-owned evaluation.
 
 ## Authentication and authorization
 
@@ -79,4 +79,4 @@ Native async trait methods are appropriate for statically dispatched internal tr
 
 ## Recommendation
 
-Build on Tokio + Tonic/Prost + Axum/Tower + SQLx + Moka + tracing/OpenTelemetry. Use Winnow and domain newtypes for parsing and validation. Keep CEL behind a compatibility adapter until Phase 0 conformance passes. This combination is idiomatic, mostly pure Rust, compatible with the repository's safety rules, and does not force authorization semantics into framework types.
+Build on Tokio + Tonic/Prost + Axum/Tower + SQLx + Moka + tracing/OpenTelemetry. Use Winnow and domain newtypes for parsing and validation. Keep CEL behind the project contract and use the selected parser plus bounded project evaluator. This combination is idiomatic, mostly pure Rust, compatible with the repository's safety rules, and does not force authorization semantics into framework types.

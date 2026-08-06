@@ -1,0 +1,12 @@
+[package]
+name = "openfga-cache"
+description = "Consistency-aware cache contracts and controllers for OpenFGA"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true

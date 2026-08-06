@@ -1,0 +1,19 @@
+[package]
+name = "openfga-condition"
+description = "Bounded OpenFGA-compatible CEL condition compilation and evaluation"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+cel-parser.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+cel-interpreter.workspace = true
+
+[lints]
+workspace = true

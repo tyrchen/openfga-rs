@@ -12,7 +12,7 @@ CompiledCondition::evaluate(request_context, tuple_context, budget, cancellation
   -> ConditionOutcome
 ```
 
-The selected adapter is provisional until Phase 0. No CEL crate type appears in domain, storage, model, or service public APIs. Project crates remain `#![forbid(unsafe_code)]`; an implementation requiring application FFI/unsafe is rejected unless repository policy explicitly changes.
+Phase 0 rejected `cel-interpreter 0.10.0` as the evaluator and selected a project-owned bounded evaluator over `cel-parser 0.10.1`; the evidence is in [`spike-cel-openfga-conformance.md`](../docs/research/spike-cel-openfga-conformance.md). No CEL crate type appears in domain, storage, model, or service public APIs. Project crates remain `#![forbid(unsafe_code)]`; an implementation requiring application FFI/unsafe is rejected unless repository policy explicitly changes.
 
 ## Compile semantics
 
@@ -30,14 +30,14 @@ Evaluation never logs expression context or secrets. Metrics use condition name/
 
 ## Phase 0 selection gate
 
-`cel-interpreter` is selected only if `spike-cel-openfga-conformance.md` demonstrates:
+The Phase 0 selection gate in [`spike-cel-openfga-conformance.md`](../docs/research/spike-cel-openfga-conformance.md) required `cel-interpreter` to demonstrate:
 
 - pass/fail parity on vendored OpenFGA condition tests and relevant CEL conformance cases;
 - OpenFGA type/function compatibility, unknown/partial semantics where observable, and precedence rules;
 - deterministic cost enforcement and prompt cancellation;
 - no unsafe code in project crates and acceptable dependency/license/security posture.
 
-Gaps may be closed in a project adapter if bounded and tested. Otherwise Phase 0 specifies a safe in-house subset implementation sufficient for the baseline or records a policy decision before implementation proceeds; conditions are never silently disabled.
+It failed the static-typing, cost, cancellation, OpenFGA IP address, and panic-freedom gates. The selected project evaluator closes those gaps over the parser AST, supports the exact pinned baseline surface, and rejects unsupported extensions at compilation; conditions are never silently disabled.
 
 ## Acceptance criteria
 

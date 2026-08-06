@@ -1,6 +1,6 @@
 # Delivery roadmap
 
-Status: Proposed · Audience: stakeholders and release owners
+Status: Active · Audience: stakeholders and release owners
 
 This roadmap states usable outcomes and release evidence. Detailed build order is in [`91-implementation-impl-plan.md`](91-implementation-impl-plan.md); milestone numbers map one-to-one to its phases.
 
@@ -20,7 +20,7 @@ M6 AuthZEN/optimization ◀─ M5 GA hardening ◀─ M4 consistency/scale
 
 | Milestone | Stakeholder outcome | Estimate | Demonstration | Exit evidence |
 | --- | --- | ---: | --- | --- |
-| M0 — Compatibility foundation | Technical risks and baseline are closed before product claims. | 3–5 weeks | Reproducible proto generation, CEL decision, ListObjects baseline proof, conformance harness boots Go/Rust targets. | Three spike reports, pinned protocols/tools, architecture/spec approval. |
+| M0 — Compatibility foundation (complete 2026-08-05) | Technical risks and baseline are closed before product claims. | 3–5 weeks | Reproducible proto generation, CEL decision, ListObjects baseline proof, conformance harness boots Go/Rust targets. | Three accepted spike reports, pinned protocols/tools, passing differential report. |
 | M1 — Model and local decisions | Developers can publish models/tuples and obtain correct Check decisions in a single process. | 8–12 weeks | In-memory store; model validation; conditions; Check/BatchCheck against upstream scenarios. | Domain/compiler/condition/oracle suites and differential Check report. |
 | M2 — Durable control/data plane | Operators can run the complete OpenFGA v1 API on PostgreSQL with migrations and security. | 10–14 weeks | gRPC + HTTP, stores/models/assertions/tuples/changes, PostgreSQL, OIDC/preshared auth, TLS. | API/SDK, storage transaction/migration, security, and failure reports. |
 | M3 — Enumeration parity | Applications can use ListObjects, streaming, ListUsers, and Expand with bounded behavior. | 8–12 weeks | Complex recursive/wildcard/intersection/difference cases under client cancellation. | Differential enumeration report, set properties, stream cleanup, query plans. |

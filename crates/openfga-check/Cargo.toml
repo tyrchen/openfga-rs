@@ -1,0 +1,12 @@
+[package]
+name = "openfga-check"
+description = "Correctness-first OpenFGA Check and BatchCheck engine"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true

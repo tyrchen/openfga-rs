@@ -1,29 +1,33 @@
-![](https://github.com/tyrchen/rust-lib-template/workflows/build/badge.svg)
-
 # openfga-rs
 
-description of the crate
+`openfga-rs` is a safe-Rust reimplementation of [OpenFGA](https://openfga.dev/). The project targets behavioral parity with the exact Go source and API revisions vendored in this repository; it is not yet production-ready.
 
-## How to use it
+Phase 0 establishes the reproducible workspace, protocol generation, compatibility harness, and evidence-backed choices for CEL and `ListObjects`. The dependency-ordered roadmap is in [the implementation plan](specs/91-implementation-impl-plan.md), and the current decisions are recorded in [the key-decisions log](specs/99-key-decisions.md).
+
+## Workspace
+
+- `apps/openfga-server`: server composition and the Phase 0 differential probe.
+- `crates/`: narrowly scoped domain, protocol, condition, storage, evaluation, service, and transport crates.
+- `tools/openfga-proto-codegen`: deterministic OpenFGA protocol generator.
+- `vendors/openfga`: pinned Go compatibility oracle.
+- `vendors/openfga-api`: pinned OpenFGA protocol source.
+- `specs/` and `docs/research/`: design contracts and implementation evidence.
+
+## Development
+
+Rust is pinned in [`rust-toolchain.toml`](rust-toolchain.toml). The compatibility targets bootstrap a checksum-verified Go toolchain under the ignored `.tools/` directory; the SDK smoke also requires Node.js and npm.
 
 ```bash
-$ cargo generate --git https://github.com/tyrchen/rust-lib-template
+make check                 # proto reproducibility, build, tests, format, lint, docs
+make clippy-strict         # boundary-oriented panic/index/unwrap linting
+make conformance           # CEL and ListObjects Phase 0 evidence
+make differential-smoke    # Go/Rust health comparison and official SDK smoke
+make audit
+make deny
 ```
 
-## Agent support
-
-Generated projects include agent-facing guidance for both Codex and Claude:
-
-- `AGENTS.md` for Codex project instructions.
-- `.agents/skills/{spec,research,impl}` for Codex skills.
-- `CLAUDE.md` and `.claude/skills/{spec,research,impl}` for Claude Code compatibility.
-
-Have fun with this crate!
+Generated Rust protocol artifacts are committed. Regenerate them with `make proto` and prove that regeneration is clean with `make check-proto`.
 
 ## License
 
-This project is distributed under the terms of MIT.
-
-See [LICENSE](LICENSE.md) for details.
-
-Copyright 2025 Tyr Chen
+Distributed under the [MIT License](LICENSE.md).

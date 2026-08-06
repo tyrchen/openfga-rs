@@ -14,51 +14,41 @@ repos:
       - id: end-of-file-fixer
       - id: mixed-line-ending
       - id: trailing-whitespace
-  - repo: https://github.com/psf/black
-    rev: 25.1.0
-    hooks:
-      - id: black
   - repo: local
     hooks:
       - id: cargo-fmt
-        name: cargo fmt
-        description: Format files with rustfmt.
-        entry: bash -c 'cargo +nightly fmt -- --check'
+        name: Rust formatting
+        entry: make fmt
         language: system
-        files: \.rs$
+        files: '\.rs$'
+        pass_filenames: false
+      - id: proto-reproducibility
+        name: Protocol reproducibility
+        entry: make check-proto
+        language: system
+        files: '(^Cargo\.(toml|lock)$|^rust-toolchain\.toml$|^vendors/openfga-api/|^crates/openfga-proto/|^tools/openfga-proto-codegen/)'
         pass_filenames: false
       - id: cargo-deny
-        name: cargo deny check
-        description: Check cargo dependencies
-        entry: bash -c 'cargo deny check -d'
+        name: Dependency policy
+        entry: make deny
         language: system
-        files: \.rs$
+        files: '(^Cargo\.(toml|lock)$|^deny\.toml$|/Cargo\.toml$)'
         pass_filenames: false
-      - id: typos
-        name: typos
-        description: check typo
-        entry: bash -c 'typos'
+      - id: cargo-build
+        name: Rust build
+        entry: make build
         language: system
-        files: \.*$
-        pass_filenames: false
-      - id: cargo-check
-        name: cargo check
-        description: Check the package for errors.
-        entry: bash -c 'cargo check --all'
-        language: system
-        files: \.rs$
+        files: '(^Cargo\.(toml|lock)$|\.rs$)'
         pass_filenames: false
       - id: cargo-clippy
-        name: cargo clippy
-        description: Lint rust sources
-        entry: bash -c 'cargo clippy --all-targets --all-features --tests --benches -- -D warnings'
+        name: Rust lints
+        entry: make clippy
         language: system
-        files: \.rs$
+        files: '(^Cargo\.(toml|lock)$|\.rs$)'
         pass_filenames: false
       - id: cargo-test
-        name: cargo test
-        description: unit test for the project
-        entry: bash -c 'cargo nextest run --all-features -- --include-ignored'
+        name: Rust tests
+        entry: make test
         language: system
-        files: \.rs$
+        files: '(^Cargo\.(toml|lock)$|\.rs$)'
         pass_filenames: false

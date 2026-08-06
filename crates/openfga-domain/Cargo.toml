@@ -1,0 +1,12 @@
+[package]
+name = "openfga-domain"
+description = "Validated domain values and commands for OpenFGA"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true

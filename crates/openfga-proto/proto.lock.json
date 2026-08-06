@@ -1,0 +1,28 @@
+{
+  "api": {
+    "repository": "https://github.com/openfga/api.git",
+    "commit": "f153694bfc20f7be303e33cabe72b668596c5a06",
+    "gitArchiveSha256": "1c6139e00b02e1b1d736f4070b87eb3b491ed31fd5dbe4285fbe2540a5789b34",
+    "bufLockSha256": "183317100d2a9ef772e49777dc2c99b9ea9c500f748bdb607c2df6a18bdd9961",
+    "vendoredImportsAggregateSha256": "8afaacc68fab3005a988d18edaf44cf38f309fc77de6601d04f0825a520d7d28"
+  },
+  "protoc": {
+    "version": "31.1",
+    "distribution": "protoc-bin-vendored 3.2.0",
+    "binarySha256": {
+      "linux-aarch64": "5ea6b5ee26c6169925d6c99c8141b855db02c4d382c60b48f535971791b6e8b8",
+      "linux-ppc64le": "4e33404682b4c09e8126ade198284f0de2fecee586b5f6569832f998a25e1eed",
+      "linux-s390x": "6867b2e740c858564873d14896c29be2f6ff19bfde4b58b166296caeb8918b0b",
+      "linux-x86": "4ead2930a0d1c57ef4cf573b30d804186c6f76480c4bef3eb6f129a95f7b4a1f",
+      "linux-x86_64": "caaf8517e57c57d34a7d6f0544172d9051abf58556aa35c70d3fb0d824b8cfbb",
+      "macos-aarch64": "a54e72a5c3b06f8eecd235a0ea22ca8494cec738a655cabbd0b9a9864f82f4f1",
+      "macos-x86_64": "773c020a052293bafe187e7c3cd0a0116e2d25798373c6fa1f47648e2a4d5303",
+      "windows-x86_64": "cbd1ca1fd6afd1bb6ddd1c09c118ecd4c50f928980857f16fe6fc23704ea17e2"
+    }
+  },
+  "generated": {
+    "tonic": "0.14.6",
+    "prost": "0.14.4",
+    "aggregateSha256": "dfecad5d4d63ac155c98123979f66410dafa1393b959e372684e9feb5d9d06f4"
+  }
+}

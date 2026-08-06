@@ -20,7 +20,7 @@ Candidate generation MUST be conservative: false positives are permitted before 
 
 Unary and streamed APIs use the same engine. Unary collects up to the response cap. Streaming applies backpressure through a bounded channel and stops promptly when the client disconnects. Ordering follows upstream observable guarantees only.
 
-The weighted worker pipeline remains experimental until the Phase 0 spike and optimization graduation gates prove equivalent behavior and a material benchmark win.
+The [Phase 0 algorithm spike](../docs/research/spike-listobjects-algorithm.md) measured a material worker-pipeline win but found unsupported shapes and panic-only failure branches. Reverse traversal plus residual Check is therefore the authoritative baseline. The weighted worker pipeline remains experimental until the optimization graduation gates prove complete equivalent behavior.
 
 ## ListUsers
 

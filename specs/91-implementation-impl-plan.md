@@ -1,10 +1,10 @@
 # Engineering implementation plan
 
-Status: Proposed · Depends on: all preceding specs
+Status: Active · Depends on: all preceding specs
 
 ## Readiness assessment
 
-The architectural contracts, upstream pin, research evidence, and release gates are ready. Production implementation is intentionally blocked on three Phase 0 facts: exact API/proto generation, OpenFGA-compatible CEL behavior, and the ListObjects baseline algorithm. The current workspace crates are placeholders and are not treated as reusable API.
+The architectural contracts, upstream pin, research evidence, and release gates are ready. Phase 0 resolved the exact API/proto generation, OpenFGA-compatible CEL implementation direction, and conservative ListObjects baseline. Phase 1 is the active implementation frontier; the Phase 0 crate skeletons contain no provisional public domain API.
 
 Before each implementation phase, re-check dependency versions and security posture; research versions are dated evidence. Every phase is an end-to-end, independently reviewed change set with no incomplete code or temporary fallback.
 
@@ -43,7 +43,7 @@ Phase 5: MySQL/SQLite + migration + GA evidence
           Phase 6a AuthZEN         Phase 6b proven fast paths
 ```
 
-## Phase 0 — De-risk compatibility foundations (M0, 3–5 weeks)
+## Phase 0 — De-risk compatibility foundations (M0, complete 2026-08-05)
 
 | # | Deliverable | Specs/research | Effort |
 | --- | --- | --- | ---: |
@@ -56,6 +56,8 @@ Phase 5: MySQL/SQLite + migration + GA evidence
 Exit gate: every spike resolves its decision (no “evaluate later”); generation reproduces from a clean checkout; dependency audit/deny passes; decisions/protocol pins are updated with evidence.
 
 Verification: artifact regeneration diff, spike test commands, harness smoke, documentation/link checks, full Rust gates for new workspace/API code, `cargo audit`, and `cargo deny check`.
+
+Completion evidence: the accepted [protocol](../docs/research/spike-openfga-proto-generation.md), [CEL](../docs/research/spike-cel-openfga-conformance.md), and [ListObjects](../docs/research/spike-listobjects-algorithm.md) spikes; the passing [differential report](../docs/research/phase0-differential-report.md); and finalized protocol/algorithm entries in `99-key-decisions.md`.
 
 ## Phase 1 — Semantic spine and local Check (M1, 8–12 weeks)
 
