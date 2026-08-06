@@ -1,0 +1,23 @@
+[package]
+name = "openfga-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+authors = ["Tyr Chen"]
+license = "MIT"
+rust-version = "1.97.1"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "~0.4.13"
+openfga-domain = { version = "0.1.0", path = "../crates/openfga-domain" }
+serde_json = { version = "~1.0.151", default-features = false, features = ["std"] }
+
+[[bin]]
+name = "domain_inputs"
+path = "fuzz_targets/domain_inputs.rs"
+test = false
+doc = false
+bench = false

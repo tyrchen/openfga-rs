@@ -7,6 +7,7 @@ GO_BASELINE := .tools/openfga-go-$(GO_BASELINE_COMMIT)
 GO_HTTP_ADDR ?= 127.0.0.1:18080
 GO_GRPC_ADDR ?= 127.0.0.1:18082
 RUST_PROBE_ADDR ?= 127.0.0.1:18081
+FUZZ_TIME ?= 15
 PROTO_OUTPUT := crates/openfga-proto/src/generated
 
 build:
@@ -17,6 +18,7 @@ test:
 
 fmt:
 	@$(CARGO) +$(RUSTFMT_TOOLCHAIN) fmt --all -- --check
+	@$(CARGO) +$(RUSTFMT_TOOLCHAIN) fmt --manifest-path fuzz/Cargo.toml -- --check
 
 clippy:
 	@$(CARGO) clippy --workspace --all-targets -- -D warnings
@@ -133,6 +135,13 @@ listobjects-spike: verify-go-tool verify-go-pin
 
 conformance: cel-spike listobjects-spike
 
+fuzz-domain:
+	@phase1_tmp=$$(mktemp -d); \
+	trap 'rm -rf "$$phase1_tmp"' EXIT; \
+	cp -R fuzz/corpus/domain_inputs "$$phase1_tmp/corpus"; \
+	$(CARGO) +$(RUSTFMT_TOOLCHAIN) fuzz run domain_inputs "$$phase1_tmp/corpus" -- \
+		-max_total_time=$(FUZZ_TIME) -max_len=8192
+
 audit:
 	@$(CARGO) audit
 
@@ -168,5 +177,5 @@ update-submodule:
 
 .PHONY: audit build cel-baseline cel-spike check check-agent-sync check-docs check-proto \
 	clippy clippy-strict \
-	conformance deny differential-smoke doc fmt go-baseline listobjects-spike proto release test \
+	conformance deny differential-smoke doc fmt fuzz-domain go-baseline listobjects-spike proto release test \
 	update-submodule verify-go-pin verify-go-tool

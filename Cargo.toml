@@ -1,5 +1,6 @@
 [workspace]
 members = ["apps/*", "crates/*", "tools/*"]
+exclude = ["fuzz"]
 resolver = "3"
 
 [workspace.package]
@@ -13,13 +14,17 @@ rust-version = "1.97.1"
 [workspace.dependencies]
 anyhow = { version = "~1.0.104", default-features = false, features = ["std"] }
 axum = { version = "~0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
+base64 = { version = "~0.23.1", default-features = false, features = ["std"] }
 cel-interpreter = { version = "~0.10.0", default-features = false, features = ["chrono", "regex"] }
 cel-parser = { version = "~0.10.1", default-features = false }
 clap = { version = "~4.6.5", default-features = false, features = ["derive", "error-context", "help", "std", "usage"] }
+hmac = { version = "~0.13.0", default-features = false, features = ["zeroize"] }
 prost = { version = "~0.14.4", default-features = false, features = ["derive", "std"] }
 prost-types = { version = "~0.14.4", default-features = false }
 protoc-bin-vendored = "~3.2.0"
+proptest = { version = "~1.11.0", default-features = false, features = ["std"] }
 reqwest = { version = "~0.13.4", default-features = false, features = ["http2", "json", "rustls"] }
+secrecy = { version = "~0.10.3", default-features = false }
 serde = { version = "~1.0.229", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "~1.0.151", default-features = false, features = ["std"] }
 sha2 = { version = "~0.11.0", default-features = false }
@@ -30,6 +35,9 @@ tonic-prost = { version = "~0.14.6", default-features = false }
 tonic-prost-build = { version = "~0.14.6", default-features = false, features = ["cleanup-markdown", "transport"] }
 tower = { version = "~0.5.3", default-features = false, features = ["limit"] }
 tower-http = { version = "~0.6.11", default-features = false, features = ["limit", "timeout"] }
+typed-builder = { version = "~0.23.2", default-features = false }
+ulid = { version = "~3.0.0", default-features = false }
+winnow = { version = "~1.0.4", default-features = false, features = ["ascii", "std"] }
 
 # Workspace crates
 openfga-auth = { path = "crates/openfga-auth" }
