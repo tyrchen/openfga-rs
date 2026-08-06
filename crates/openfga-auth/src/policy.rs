@@ -221,6 +221,52 @@ impl AuthorizationPolicy {
         }
         Err(AuthorizationError::Forbidden)
     }
+
+    /// Authorizes an action before an untrusted store identifier has been parsed.
+    ///
+    /// This action-only preflight prevents validation and admission oracles. Store-scoped actions
+    /// still require a subsequent full [`Self::authorize`] check once the store ID is valid.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthorizationError::Forbidden`] when the principal has no grant for the action.
+    pub fn authorize_action(
+        &self,
+        principal: &Principal,
+        action: Action,
+    ) -> Result<(), AuthorizationError> {
+        if self.bindings.iter().any(|binding| {
+            &binding.principal_id == principal.id() && binding.actions.contains(&action)
+        }) {
+            Ok(())
+        } else {
+            Err(AuthorizationError::Forbidden)
+        }
+    }
+
+    /// Authorizes a store-scoped action when the untrusted store identifier cannot be parsed.
+    ///
+    /// Only an all-store binding can possibly cover an unidentified store. Finite store bindings
+    /// fail closed without exposing identifier-validation or admission behavior.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthorizationError::Forbidden`] when no all-store binding grants the action.
+    pub fn authorize_unparsed_store(
+        &self,
+        principal: &Principal,
+        action: Action,
+    ) -> Result<(), AuthorizationError> {
+        if self.bindings.iter().any(|binding| {
+            &binding.principal_id == principal.id()
+                && binding.actions.contains(&action)
+                && matches!(binding.stores, StoreScope::Any)
+        }) {
+            Ok(())
+        } else {
+            Err(AuthorizationError::Forbidden)
+        }
+    }
 }
 
 /// A redacted service-authorization failure.
@@ -268,6 +314,10 @@ mod tests {
         assert_eq!(
             policy.authorize(&principal, Action::GetStore, Some(FORBIDDEN_STORE.parse()?)),
             Err(AuthorizationError::Forbidden)
+        );
+        assert_eq!(
+            policy.authorize_unparsed_store(&principal, Action::Read),
+            Err(AuthorizationError::Forbidden),
         );
         let debug = format!("{policy:?}");
         assert!(!debug.contains("reader"));

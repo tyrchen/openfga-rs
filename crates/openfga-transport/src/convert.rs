@@ -13,9 +13,9 @@ use openfga_domain::{
     TypeName, ValidationReason,
 };
 use openfga_model::{
-    AuthorizationModelDefinition, ConditionSource, DirectRestrictionSource, RelationSource,
-    RestrictionKindSource, RestrictionKindSourceRef, RewriteSource, RewriteSourceRef,
-    TypeDefinitionSource,
+    AuthorizationModelDefinition, ConditionParameterTypeError, ConditionSource,
+    DirectRestrictionSource, RelationSource, RestrictionKindSource, RestrictionKindSourceRef,
+    RewriteSource, RewriteSourceRef, TypeDefinitionSource,
 };
 use openfga_proto::openfga::{
     v1 as pb, v1::condition_param_type_ref::TypeName as WireParameterTypeName,
@@ -76,9 +76,26 @@ fn domain_parse_too_long(error: &DomainError) -> bool {
     )
 }
 
-pub(crate) fn relationship_tuple(
+pub(crate) fn relationship_tuple_for_write(
     tuple: pb::TupleKey,
     limits: &InputLimits,
+    measured_context_bytes: usize,
+) -> Result<RelationshipTuple, ApiError> {
+    relationship_tuple_with_context_policy(tuple, limits, Some(measured_context_bytes))
+}
+
+pub(crate) fn relationship_tuple_for_wire_semantics(
+    tuple: pb::TupleKey,
+    limits: &InputLimits,
+    measured_container_bytes: usize,
+) -> Result<RelationshipTuple, ApiError> {
+    relationship_tuple_with_context_policy(tuple, limits, Some(measured_container_bytes))
+}
+
+fn relationship_tuple_with_context_policy(
+    tuple: pb::TupleKey,
+    limits: &InputLimits,
+    measured_context_bytes: Option<usize>,
 ) -> Result<RelationshipTuple, ApiError> {
     let key = tuple_key(&tuple.object, &tuple.relation, &tuple.user, limits)?;
     let condition = tuple
@@ -86,7 +103,12 @@ pub(crate) fn relationship_tuple(
         .map(|condition| {
             let name = ConditionName::parse_with_limits(&condition.name, limits)
                 .map_err(|_| ApiError::invalid_request())?;
-            let context = condition_context(condition.context, limits)?;
+            let context = match measured_context_bytes {
+                Some(measured) => {
+                    condition_context_for_wire_semantics(condition.context, limits, measured)
+                }
+                None => condition_context(condition.context, limits),
+            }?;
             Ok::<_, ApiError>(ConditionReference::Conditional(ConditionBinding::new(
                 name, context,
             )))
@@ -125,14 +147,15 @@ pub(crate) fn tuple_read_filter(
         .map_err(|_| ApiError::invalid_request())
 }
 
-pub(crate) fn contextual_tuples(
+pub(crate) fn contextual_tuples_for_wire_semantics(
     tuples: Option<pb::ContextualTupleKeys>,
     limits: &InputLimits,
+    measured_container_bytes: usize,
 ) -> Result<ContextualTuples, ApiError> {
     let tuples = tuples
         .map_or_else(Vec::new, |value| value.tuple_keys)
         .into_iter()
-        .map(|tuple| relationship_tuple(tuple, limits))
+        .map(|tuple| relationship_tuple_for_wire_semantics(tuple, limits, measured_container_bytes))
         .collect::<Result<Vec<_>, _>>()?;
     ContextualTuples::new(tuples, limits).map_err(|_| ApiError::invalid_request())
 }
@@ -146,6 +169,19 @@ pub(crate) fn condition_context(
         .transpose()?
         .unwrap_or_else(|| Value::Object(Map::new()));
     ConditionContext::try_from_json(value, limits).map_err(|_| ApiError::invalid_request())
+}
+
+pub(crate) fn condition_context_for_wire_semantics(
+    context: Option<pbjson_types::Struct>,
+    limits: &InputLimits,
+    measured_wire_bytes: usize,
+) -> Result<ConditionContext, ApiError> {
+    let value = context
+        .map(|context| serde_json::to_value(context).map_err(|_| ApiError::invalid_request()))
+        .transpose()?
+        .unwrap_or_else(|| Value::Object(Map::new()));
+    ConditionContext::try_from_json_for_wire_semantics(value, limits, measured_wire_bytes)
+        .map_err(|_| ApiError::invalid_request())
 }
 
 pub(crate) fn model_definition(
@@ -197,12 +233,12 @@ fn type_definition(
                 .iter()
                 .map(|restriction| direct_restriction(restriction, limits))
                 .collect::<Result<Vec<_>, _>>()?;
-            Ok(RelationSource::new(
-                RelationName::parse_with_limits(name, limits)
-                    .map_err(|_| ApiError::invalid_request())?,
-                rewrite_source(rewrite, limits, 0)?,
-                restrictions,
-            ))
+            let name = RelationName::parse_with_limits(name, limits)
+                .map_err(|_| ApiError::invalid_request())?;
+            Ok(match rewrite_source(rewrite, limits, 0)? {
+                Some(rewrite) => RelationSource::new(name, rewrite, restrictions),
+                None => RelationSource::with_invalid_rewrite(name, restrictions),
+            })
         })
         .collect::<Result<Vec<_>, ApiError>>()?;
     Ok(TypeDefinitionSource::new(name, relations))
@@ -212,20 +248,19 @@ fn rewrite_source(
     rewrite: &pb::Userset,
     limits: &InputLimits,
     depth: usize,
-) -> Result<RewriteSource, ApiError> {
+) -> Result<Option<RewriteSource>, ApiError> {
     if depth >= MAXIMUM_REWRITE_DEPTH {
         return Err(ApiError::invalid_request());
     }
-    let userset = rewrite
-        .userset
-        .as_ref()
-        .ok_or_else(ApiError::invalid_request)?;
+    let Some(userset) = rewrite.userset.as_ref() else {
+        return Ok(None);
+    };
     match userset {
-        pb::userset::Userset::This(_) => Ok(RewriteSource::Direct),
-        pb::userset::Userset::ComputedUserset(value) => Ok(RewriteSource::Computed(
+        pb::userset::Userset::This(_) => Ok(Some(RewriteSource::Direct)),
+        pb::userset::Userset::ComputedUserset(value) => Ok(Some(RewriteSource::Computed(
             RelationName::parse_with_limits(&value.relation, limits)
                 .map_err(|_| ApiError::invalid_request())?,
-        )),
+        ))),
         pb::userset::Userset::TupleToUserset(value) => {
             let tupleset = value
                 .tupleset
@@ -235,37 +270,43 @@ fn rewrite_source(
                 .computed_userset
                 .as_ref()
                 .ok_or_else(ApiError::invalid_request)?;
-            Ok(RewriteSource::TupleToUserset {
+            Ok(Some(RewriteSource::TupleToUserset {
                 tupleset: RelationName::parse_with_limits(&tupleset.relation, limits)
                     .map_err(|_| ApiError::invalid_request())?,
                 computed: RelationName::parse_with_limits(&computed.relation, limits)
                     .map_err(|_| ApiError::invalid_request())?,
-            })
+            }))
         }
         pb::userset::Userset::Union(value) => {
-            rewrite_children(&value.child, limits, depth).map(RewriteSource::Union)
+            Ok(rewrite_children(&value.child, limits, depth)?.map(RewriteSource::Union))
         }
         pb::userset::Userset::Intersection(value) => {
-            rewrite_children(&value.child, limits, depth).map(RewriteSource::Intersection)
+            Ok(rewrite_children(&value.child, limits, depth)?.map(RewriteSource::Intersection))
         }
-        pb::userset::Userset::Difference(value) => Ok(RewriteSource::Difference {
-            base: Box::new(rewrite_source(
+        pb::userset::Userset::Difference(value) => {
+            let base = rewrite_source(
                 value
                     .base
                     .as_deref()
                     .ok_or_else(ApiError::invalid_request)?,
                 limits,
                 depth + 1,
-            )?),
-            subtract: Box::new(rewrite_source(
+            )?;
+            let subtract = rewrite_source(
                 value
                     .subtract
                     .as_deref()
                     .ok_or_else(ApiError::invalid_request)?,
                 limits,
                 depth + 1,
-            )?),
-        }),
+            )?;
+            Ok(base
+                .zip(subtract)
+                .map(|(base, subtract)| RewriteSource::Difference {
+                    base: Box::new(base),
+                    subtract: Box::new(subtract),
+                }))
+        }
     }
 }
 
@@ -273,14 +314,15 @@ fn rewrite_children(
     children: &[pb::Userset],
     limits: &InputLimits,
     depth: usize,
-) -> Result<Vec<RewriteSource>, ApiError> {
-    if children.is_empty() || children.len() > limits.operands() {
+) -> Result<Option<Vec<RewriteSource>>, ApiError> {
+    if children.len() > limits.operands() {
         return Err(ApiError::invalid_request());
     }
-    children
+    let children = children
         .iter()
         .map(|child| rewrite_source(child, limits, depth + 1))
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(children.into_iter().collect())
 }
 
 fn direct_restriction(
@@ -317,61 +359,130 @@ fn condition_source(
         ConditionName::parse_with_limits(key, limits).map_err(|_| ApiError::invalid_request())?;
     let name = ConditionName::parse_with_limits(&condition.name, limits)
         .map_err(|_| ApiError::invalid_request())?;
-    let parameters = condition
-        .parameters
-        .iter()
-        .map(|(name, parameter)| {
-            Ok((
-                ParameterName::parse_with_limits(name, limits)
-                    .map_err(|_| ApiError::invalid_request())?,
-                parameter_type(parameter, 0)?,
-            ))
-        })
-        .collect::<Result<BTreeMap<_, _>, ApiError>>()?;
-    Ok(ConditionSource::new(
-        key,
-        ConditionDefinition::new(name, condition.expression.clone(), parameters),
-    ))
+    let mut entries = condition.parameters.iter().collect::<Vec<_>>();
+    entries.sort_by_key(|(parameter, _)| *parameter);
+    let mut parameters = BTreeMap::new();
+    let mut parameter_type_errors = Vec::new();
+    for (index, (parameter_name, parameter)) in entries.into_iter().enumerate() {
+        let parameter_name = ParameterName::parse_with_limits(parameter_name, limits)
+            .map_err(|_| ApiError::invalid_request())?;
+        match parameter_type(parameter, 0) {
+            Ok(parameter_type) => {
+                parameters.insert(parameter_name, parameter_type);
+            }
+            Err(error) => parameter_type_errors.push((
+                u32::try_from(index).unwrap_or(u32::MAX),
+                error.with_parameter(parameter_name),
+            )),
+        }
+    }
+    let definition = ConditionDefinition::new(name, condition.expression.clone(), parameters);
+    Ok(if parameter_type_errors.is_empty() {
+        ConditionSource::new(key, definition)
+    } else {
+        ConditionSource::with_parameter_type_errors(key, definition, parameter_type_errors)
+    })
+}
+
+#[derive(Debug)]
+enum ParameterTypeDecodeError {
+    Unknown {
+        type_name: Box<str>,
+    },
+    GenericArity {
+        type_name: Box<str>,
+        expected: usize,
+        found: usize,
+    },
+}
+
+impl ParameterTypeDecodeError {
+    fn with_parameter(self, parameter: ParameterName) -> ConditionParameterTypeError {
+        match self {
+            Self::Unknown { type_name } => ConditionParameterTypeError::Unknown {
+                parameter,
+                type_name,
+            },
+            Self::GenericArity {
+                type_name,
+                expected,
+                found,
+            } => ConditionParameterTypeError::GenericArity {
+                parameter,
+                type_name,
+                expected,
+                found,
+            },
+        }
+    }
 }
 
 fn parameter_type(
     value: &pb::ConditionParamTypeRef,
     depth: usize,
-) -> Result<ParameterType, ApiError> {
+) -> Result<ParameterType, ParameterTypeDecodeError> {
     if depth >= MAXIMUM_REWRITE_DEPTH {
-        return Err(ApiError::invalid_request());
+        return Err(ParameterTypeDecodeError::GenericArity {
+            type_name: "nested_parameter_type".into(),
+            expected: MAXIMUM_REWRITE_DEPTH,
+            found: depth.saturating_add(1),
+        });
     }
-    let wire_type = WireParameterTypeName::try_from(value.type_name)
-        .map_err(|_| ApiError::invalid_request())?;
-    let scalar = |parameter| {
-        if value.generic_types.is_empty() {
-            Ok(parameter)
-        } else {
-            Err(ApiError::invalid_request())
+    let wire_type = WireParameterTypeName::try_from(value.type_name).ok();
+    let type_name = wire_type.map_or_else(
+        || value.type_name.to_string().into_boxed_str(),
+        |value| value.as_str_name().into(),
+    );
+    let expected = match wire_type {
+        Some(WireParameterTypeName::List | WireParameterTypeName::Map) => 1,
+        Some(WireParameterTypeName::Unspecified) | None => {
+            return Err(ParameterTypeDecodeError::Unknown { type_name });
         }
+        Some(_) => 0,
     };
+    if value.generic_types.len() != expected {
+        return Err(ParameterTypeDecodeError::GenericArity {
+            type_name,
+            expected,
+            found: value.generic_types.len(),
+        });
+    }
     match wire_type {
-        WireParameterTypeName::Any => scalar(ParameterType::any()),
-        WireParameterTypeName::Bool => scalar(ParameterType::bool()),
-        WireParameterTypeName::String => scalar(ParameterType::string()),
-        WireParameterTypeName::Int => scalar(ParameterType::int()),
-        WireParameterTypeName::Uint => scalar(ParameterType::uint()),
-        WireParameterTypeName::Double => scalar(ParameterType::double()),
-        WireParameterTypeName::Duration => scalar(ParameterType::duration()),
-        WireParameterTypeName::Timestamp => scalar(ParameterType::timestamp()),
-        WireParameterTypeName::Ipaddress => scalar(ParameterType::ip_address()),
-        WireParameterTypeName::List | WireParameterTypeName::Map => {
+        Some(WireParameterTypeName::Any) => Ok(ParameterType::any()),
+        Some(WireParameterTypeName::Bool) => Ok(ParameterType::bool()),
+        Some(WireParameterTypeName::String) => Ok(ParameterType::string()),
+        Some(WireParameterTypeName::Int) => Ok(ParameterType::int()),
+        Some(WireParameterTypeName::Uint) => Ok(ParameterType::uint()),
+        Some(WireParameterTypeName::Double) => Ok(ParameterType::double()),
+        Some(WireParameterTypeName::Duration) => Ok(ParameterType::duration()),
+        Some(WireParameterTypeName::Timestamp) => Ok(ParameterType::timestamp()),
+        Some(WireParameterTypeName::Ipaddress) => Ok(ParameterType::ip_address()),
+        Some(wire_type @ (WireParameterTypeName::List | WireParameterTypeName::Map)) => {
             let [generic] = value.generic_types.as_slice() else {
-                return Err(ApiError::invalid_request());
+                return Err(ParameterTypeDecodeError::GenericArity {
+                    type_name,
+                    expected: 1,
+                    found: value.generic_types.len(),
+                });
             };
             let generic = parameter_type(generic, depth + 1)?;
             if wire_type == WireParameterTypeName::List {
-                ParameterType::list(generic).map_err(|_| ApiError::invalid_request())
+                ParameterType::list(generic).map_err(|_| ParameterTypeDecodeError::GenericArity {
+                    type_name,
+                    expected: 1,
+                    found: 1,
+                })
             } else {
-                ParameterType::map(generic).map_err(|_| ApiError::invalid_request())
+                ParameterType::map(generic).map_err(|_| ParameterTypeDecodeError::GenericArity {
+                    type_name,
+                    expected: 1,
+                    found: 1,
+                })
             }
         }
-        WireParameterTypeName::Unspecified => Err(ApiError::invalid_request()),
+        Some(WireParameterTypeName::Unspecified) | None => {
+            Err(ParameterTypeDecodeError::Unknown { type_name })
+        }
     }
 }
 
@@ -465,21 +576,22 @@ pub(crate) fn assertion(value: &Assertion) -> Result<pb::Assertion, ApiError> {
     })
 }
 
-pub(crate) fn domain_assertion(
+pub(crate) fn domain_assertion_for_wire_semantics(
     value: pb::Assertion,
     limits: &InputLimits,
+    measured_container_bytes: usize,
 ) -> Result<Assertion, ApiError> {
     let tuple = value.tuple_key.ok_or_else(ApiError::missing_tuple_key)?;
     let contextual = value
         .contextual_tuples
         .into_iter()
-        .map(|tuple| relationship_tuple(tuple, limits))
+        .map(|tuple| relationship_tuple_for_wire_semantics(tuple, limits, measured_container_bytes))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Assertion::new(
         tuple_key(&tuple.object, &tuple.relation, &tuple.user, limits)?,
         value.expectation,
         ContextualTuples::new(contextual, limits).map_err(|_| ApiError::invalid_request())?,
-        condition_context(value.context, limits)?,
+        condition_context_for_wire_semantics(value.context, limits, measured_container_bytes)?,
     ))
 }
 

@@ -293,6 +293,10 @@ pub(crate) struct AdmissionConfig {
     pub(crate) authentication_attempts: u32,
     #[serde(default = "default_authentication_failures")]
     pub(crate) authentication_failures: u32,
+    #[serde(default = "default_global_authentication_attempts")]
+    pub(crate) global_authentication_attempts: u32,
+    #[serde(default = "default_global_authentication_failures")]
+    pub(crate) global_authentication_failures: u32,
     #[serde(default = "default_administration_rate")]
     pub(crate) administration: u32,
     #[serde(default = "default_read_rate")]
@@ -311,6 +315,8 @@ impl Default for AdmissionConfig {
             window_seconds: default_rate_window_seconds(),
             authentication_attempts: default_authentication_attempts(),
             authentication_failures: default_authentication_failures(),
+            global_authentication_attempts: default_global_authentication_attempts(),
+            global_authentication_failures: default_global_authentication_failures(),
             administration: default_administration_rate(),
             reads: default_read_rate(),
             writes: default_write_rate(),
@@ -456,6 +462,7 @@ impl ServerConfig {
         self.validate_storage()?;
         self.validate_transport()?;
         self.validate_evaluator()?;
+        self.validate_database_concurrency()?;
         self.validate_telemetry()?;
         bounded_duration(
             self.shutdown.drain_timeout_ms,
@@ -486,6 +493,14 @@ impl ServerConfig {
             .authentication_failures(nonzero_rate(
                 policy.authentication_failures,
                 "authentication failure",
+            )?)
+            .global_authentication_attempts(nonzero_rate(
+                policy.global_authentication_attempts,
+                "global authentication attempt",
+            )?)
+            .global_authentication_failures(nonzero_rate(
+                policy.global_authentication_failures,
+                "global authentication failure",
             )?)
             .administration(nonzero_rate(policy.administration, "administration")?)
             .reads(nonzero_rate(policy.reads, "read")?)
@@ -753,6 +768,8 @@ impl ServerConfig {
         if [
             self.transport.admission.authentication_attempts,
             self.transport.admission.authentication_failures,
+            self.transport.admission.global_authentication_attempts,
+            self.transport.admission.global_authentication_failures,
             self.transport.admission.administration,
             self.transport.admission.reads,
             self.transport.admission.writes,
@@ -781,6 +798,19 @@ impl ServerConfig {
             .context("evaluator concurrent read limit is invalid")?;
         Limit::<1_000>::new(self.evaluator.batch_concurrency)
             .context("evaluator batch concurrency is invalid")?;
+        Ok(())
+    }
+
+    fn validate_database_concurrency(&self) -> Result<()> {
+        if self.storage.backend == StorageBackend::Postgres
+            && (self.evaluator.concurrent_reads > self.storage.postgres.max_connections
+                || self.evaluator.batch_concurrency > self.storage.postgres.max_connections)
+        {
+            bail!(
+                "evaluator concurrent reads and batch concurrency cannot exceed the PostgreSQL \
+                 work limit"
+            );
+        }
         Ok(())
     }
 
@@ -943,6 +973,14 @@ const fn default_authentication_attempts() -> u32 {
 
 const fn default_authentication_failures() -> u32 {
     2_000
+}
+
+const fn default_global_authentication_attempts() -> u32 {
+    200_000
+}
+
+const fn default_global_authentication_failures() -> u32 {
+    20_000
 }
 
 const fn default_administration_rate() -> u32 {
@@ -1185,6 +1223,23 @@ evaluator: {}
         config.transport.admission.authentication_attempts = 1;
         config.tls.reload_interval_seconds = 0;
         assert!(config.validate().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_reject_evaluator_scheduling_above_postgres_work_limit() -> anyhow::Result<()> {
+        let mut config = ServerConfig::from(parse(VALID.as_bytes())?);
+        config.storage.backend = super::StorageBackend::Postgres;
+        config.storage.postgres.max_connections = 8;
+        config.evaluator.concurrent_reads = 9;
+        assert!(config.validate().is_err());
+
+        config.evaluator.concurrent_reads = 8;
+        config.evaluator.batch_concurrency = 9;
+        assert!(config.validate().is_err());
+
+        config.evaluator.batch_concurrency = 8;
+        config.validate()?;
         Ok(())
     }
 

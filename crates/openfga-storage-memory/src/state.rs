@@ -84,7 +84,6 @@ impl MemoryState {
         filter: &TupleReadFilter,
         options: &PageOptions,
     ) -> Result<Page<StoredTuple>, StorageError> {
-        self.require_store(store_id)?;
         let after = options.after().map(parse_tuple_cursor).transpose()?;
         let mut candidates = self
             .tuples
@@ -209,7 +208,6 @@ impl MemoryState {
         writes: Vec<RelationshipTuple>,
         options: TupleWriteOptions,
     ) -> Result<MutationOutcome, StorageError> {
-        self.require_store(store_id)?;
         let total = deletes.len().saturating_add(writes.len());
         if total > self.limits.write_tuples() {
             return Err(StorageError::new(
@@ -218,6 +216,11 @@ impl MemoryState {
             ));
         }
 
+        let delete_order = deletes.clone();
+        let write_order = writes
+            .iter()
+            .map(|tuple| tuple.key().clone())
+            .collect::<Vec<_>>();
         let delete_keys = unique_delete_keys(deletes)?;
         let write_tuples = unique_write_tuples(writes)?;
         if delete_keys.iter().any(|key| write_tuples.contains_key(key)) {
@@ -229,17 +232,18 @@ impl MemoryState {
         self.faults.check(MutationFaultStage::Validated)?;
         context.check()?;
 
+        self.validate_persisted_conflicts(
+            store_id,
+            &delete_order,
+            &write_order,
+            &write_tuples,
+            options,
+        )?;
+
         let mut prepared_deletes = Vec::new();
         for key in delete_keys {
-            match self.tuples.get(&(store_id, key.clone())) {
-                Some(stored) => prepared_deletes.push(stored.tuple().clone()),
-                None if options.on_missing_delete() == WriteConflictPolicy::Ignore => {}
-                None => {
-                    return Err(StorageError::new(
-                        StorageErrorKind::Conflict,
-                        "missing_tuple_delete",
-                    ));
-                }
+            if let Some(stored) = self.tuples.get(&(store_id, key.clone())) {
+                prepared_deletes.push(stored.tuple().clone());
             }
         }
         self.faults.check(MutationFaultStage::DeletesPrepared)?;
@@ -247,14 +251,7 @@ impl MemoryState {
 
         let mut prepared_writes = Vec::new();
         for (key, tuple) in write_tuples {
-            if self.tuples.contains_key(&(store_id, key)) {
-                if options.on_duplicate_write() == WriteConflictPolicy::Error {
-                    return Err(StorageError::new(
-                        StorageErrorKind::Conflict,
-                        "duplicate_tuple_write",
-                    ));
-                }
-            } else {
+            if !self.tuples.contains_key(&(store_id, key.clone())) {
                 prepared_writes.push(tuple);
             }
         }
@@ -309,6 +306,53 @@ impl MemoryState {
         Ok(MutationOutcome::new(change_ids))
     }
 
+    fn validate_persisted_conflicts(
+        &self,
+        store_id: StoreId,
+        deletes: &[TupleKey],
+        writes: &[TupleKey],
+        requested: &BTreeMap<TupleKey, RelationshipTuple>,
+        options: TupleWriteOptions,
+    ) -> Result<(), StorageError> {
+        if options.on_missing_delete() == WriteConflictPolicy::Error
+            && let Some(key) = deletes
+                .iter()
+                .find(|key| !self.tuples.contains_key(&(store_id, (*key).clone())))
+        {
+            return Err(
+                StorageError::new(StorageErrorKind::Conflict, "missing_tuple_delete")
+                    .with_tuple(key.clone()),
+            );
+        }
+        if options.on_duplicate_write() == WriteConflictPolicy::Error
+            && let Some(key) = writes
+                .iter()
+                .find(|key| self.tuples.contains_key(&(store_id, (*key).clone())))
+        {
+            return Err(
+                StorageError::new(StorageErrorKind::Conflict, "duplicate_tuple_write")
+                    .with_tuple(key.clone()),
+            );
+        }
+        if options.on_duplicate_write() == WriteConflictPolicy::Ignore
+            && let Some(key) = writes.iter().find(|key| {
+                self.tuples
+                    .get(&(store_id, (*key).clone()))
+                    .is_some_and(|stored| {
+                        requested
+                            .get(*key)
+                            .is_some_and(|tuple| stored.tuple() != tuple)
+                    })
+            })
+        {
+            return Err(
+                StorageError::new(StorageErrorKind::Conflict, "tuple_condition_conflict")
+                    .with_tuple(key.clone()),
+            );
+        }
+        Ok(())
+    }
+
     pub(crate) fn read_model(
         &self,
         store_id: StoreId,
@@ -341,7 +385,6 @@ impl MemoryState {
         store_id: StoreId,
         options: &PageOptions,
     ) -> Result<Page<Arc<StoredAuthorizationModel>>, StorageError> {
-        self.require_store(store_id)?;
         let after = options.after().map(parse_model_cursor).transpose()?;
         let ids = self
             .model_ids
@@ -372,7 +415,6 @@ impl MemoryState {
     ) -> Result<(), StorageError> {
         let store_id = *model.store_id();
         let model_id = *model.model_id();
-        self.require_store(store_id)?;
         if let Some(existing) = self.models.get(&(store_id, model_id)) {
             let kind = if existing.compiled().fingerprint() == model.compiled().fingerprint() {
                 StorageErrorKind::AlreadyExists
@@ -451,20 +493,8 @@ impl MemoryState {
         Ok(renamed)
     }
 
-    pub(crate) fn delete_store(&mut self, store_id: StoreId) -> Result<(), StorageError> {
-        if self.stores.remove(&store_id).is_none() {
-            return Err(not_found());
-        }
-        self.tuples.retain(|(store, _), _| *store != store_id);
-        self.forward.retain(|(store, _, _), _| *store != store_id);
-        self.reverse
-            .retain(|(store, _, _, _), _| *store != store_id);
-        self.usersets.retain(|(store, _, _), _| *store != store_id);
-        self.models.retain(|(store, _), _| *store != store_id);
-        self.model_ids.remove(&store_id);
-        self.assertions.retain(|(store, _), _| *store != store_id);
-        self.changes.retain(|(store, _), _| *store != store_id);
-        Ok(())
+    pub(crate) fn delete_store(&mut self, store_id: StoreId) {
+        self.stores.remove(&store_id);
     }
 
     pub(crate) fn read_assertions(
@@ -504,7 +534,6 @@ impl MemoryState {
         filter: &ChangeFilter,
         options: &PageOptions,
     ) -> Result<Page<TupleChange>, StorageError> {
-        self.require_store(store_id)?;
         let after = options.after().map(parse_change_cursor).transpose()?;
         let mut changes =
             self.changes
@@ -604,13 +633,6 @@ impl MemoryState {
             key.relation().clone(),
         );
         remove_index_key(&mut self.reverse, &reverse_key, key);
-    }
-
-    fn require_store(&self, store_id: StoreId) -> Result<(), StorageError> {
-        self.stores
-            .contains_key(&store_id)
-            .then_some(())
-            .ok_or_else(not_found)
     }
 
     fn require_model(

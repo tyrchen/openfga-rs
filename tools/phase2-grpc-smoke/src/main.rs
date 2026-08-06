@@ -9,7 +9,7 @@ use clap::Parser;
 use openfga_proto::openfga::v1::{self as pb, open_fga_service_client::OpenFgaServiceClient};
 use serde::Serialize;
 use tonic::{
-    Code, Request,
+    Request,
     metadata::{Ascii, MetadataValue},
     transport::{Certificate, Channel, ClientTlsConfig, Endpoint},
 };
@@ -38,13 +38,16 @@ struct ScenarioReport {
     assertion_count: usize,
     change_count: usize,
     delete_only: Evidence,
-    update_unimplemented: Evidence,
-    invalid_page_code: String,
-    invalid_store_code: String,
-    missing_tuple_code: String,
-    object_too_long_code: String,
-    relation_too_long_code: String,
-    invalid_user_code: String,
+    update_unimplemented: WireError,
+    invalid_page: WireError,
+    invalid_store: WireError,
+    missing_tuple: WireError,
+    object_too_long: WireError,
+    relation_too_long: WireError,
+    invalid_user: WireError,
+    empty_write: WireError,
+    missing_type: WireError,
+    missing_relation: WireError,
 }
 
 #[derive(Debug, Eq, PartialEq, Serialize)]
@@ -58,6 +61,13 @@ enum Evidence {
 enum Decision {
     Allowed,
     Denied,
+}
+
+#[derive(Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WireError {
+    code: String,
+    message: String,
 }
 
 #[tokio::main]
@@ -176,17 +186,16 @@ async fn scenario(
         } else {
             bail!("delete-only Write did not complete")
         },
-        update_unimplemented: if errors.update_unimplemented {
-            Evidence::Pass
-        } else {
-            bail!("UpdateStore did not return Unimplemented")
-        },
-        invalid_page_code: errors.invalid_page_code,
-        invalid_store_code: errors.invalid_store_code,
-        missing_tuple_code: errors.missing_tuple_code,
-        object_too_long_code: errors.object_too_long_code,
-        relation_too_long_code: errors.relation_too_long_code,
-        invalid_user_code: errors.invalid_user_code,
+        update_unimplemented: errors.update_unimplemented,
+        invalid_page: errors.invalid_page,
+        invalid_store: errors.invalid_store,
+        missing_tuple: errors.missing_tuple,
+        object_too_long: errors.object_too_long,
+        relation_too_long: errors.relation_too_long,
+        invalid_user: errors.invalid_user,
+        empty_write: errors.empty_write,
+        missing_type: errors.missing_type,
+        missing_relation: errors.missing_relation,
     })
 }
 
@@ -363,6 +372,11 @@ async fn delete_only(
     Ok(true)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the ordered exact-wire matrix is kept together so Go and Rust exercise identical \
+              state"
+)]
 async fn error_parity(
     client: &mut OpenFgaServiceClient<Channel>,
     token: Option<&MetadataValue<Ascii>>,
@@ -384,8 +398,8 @@ async fn error_parity(
         .list_stores(request(
             pb::ListStoresRequest {
                 page_size: Some(pbjson_types::Int32Value { value: 101 }),
-                continuation_token: String::new(),
-                name: String::new(),
+                continuation_token: "!".to_owned(),
+                name: "x".to_owned(),
             },
             token,
         ))
@@ -412,8 +426,8 @@ async fn error_parity(
         model_id,
         Some(check_tuple(
             &format!("document:{}", "x".repeat(513)),
-            "viewer",
-            "user:anne",
+            &"r".repeat(51),
+            "x",
         )),
     )
     .await
@@ -440,30 +454,63 @@ async fn error_parity(
     )
     .await
     .context("malformed Check user unexpectedly succeeded")?;
+    let empty_write = client
+        .write(request(
+            pb::WriteRequest {
+                store_id: store_id.to_owned(),
+                writes: None,
+                deletes: None,
+                authorization_model_id: model_id.to_owned(),
+            },
+            token,
+        ))
+        .await
+        .err()
+        .context("empty Write unexpectedly succeeded")?;
+    let missing_type = invalid_check(
+        client,
+        token,
+        store_id,
+        model_id,
+        Some(check_tuple("unknown:roadmap", "viewer", "user:anne")),
+    )
+    .await
+    .context("Check with a missing type unexpectedly succeeded")?;
+    let missing_relation = invalid_check(
+        client,
+        token,
+        store_id,
+        model_id,
+        Some(check_tuple("document:roadmap", "editor", "user:anne")),
+    )
+    .await
+    .context("Check with a missing relation unexpectedly succeeded")?;
     Ok(ErrorEvidence {
-        update_unimplemented: update.code() == Code::Unimplemented,
-        invalid_page_code: public_code(&page, "page_size_invalid", "PageSize")?,
-        invalid_store_code: public_code(&store, "store_id_invalid_length", "StoreId")?,
-        missing_tuple_code: public_code(
-            &missing_tuple,
-            "tuple_key_value_not_specified",
-            "TupleKey",
-        )?,
-        object_too_long_code: public_code(&object_too_long, "object_too_long", "Object")?,
-        relation_too_long_code: public_code(&relation_too_long, "relation_too_long", "Relation")?,
-        invalid_user_code: public_code(&invalid_user, "invalid_user", "user")?,
+        update_unimplemented: wire_error(&update),
+        invalid_page: wire_error(&page),
+        invalid_store: wire_error(&store),
+        missing_tuple: wire_error(&missing_tuple),
+        object_too_long: wire_error(&object_too_long),
+        relation_too_long: wire_error(&relation_too_long),
+        invalid_user: wire_error(&invalid_user),
+        empty_write: wire_error(&empty_write),
+        missing_type: wire_error(&missing_type),
+        missing_relation: wire_error(&missing_relation),
     })
 }
 
 #[derive(Debug)]
 struct ErrorEvidence {
-    update_unimplemented: bool,
-    invalid_page_code: String,
-    invalid_store_code: String,
-    missing_tuple_code: String,
-    object_too_long_code: String,
-    relation_too_long_code: String,
-    invalid_user_code: String,
+    update_unimplemented: WireError,
+    invalid_page: WireError,
+    invalid_store: WireError,
+    missing_tuple: WireError,
+    object_too_long: WireError,
+    relation_too_long: WireError,
+    invalid_user: WireError,
+    empty_write: WireError,
+    missing_type: WireError,
+    missing_relation: WireError,
 }
 
 async fn invalid_check(
@@ -498,23 +545,10 @@ fn check_tuple(object: &str, relation: &str, user: &str) -> pb::CheckRequestTupl
     }
 }
 
-fn public_code(
-    status: &tonic::Status,
-    expected: &'static str,
-    baseline_marker: &str,
-) -> Result<String> {
-    let message = status.message();
-    if message
-        .split_once(':')
-        .is_some_and(|(code, _)| code == expected)
-        || message.contains(baseline_marker)
-    {
-        Ok(expected.to_owned())
-    } else {
-        bail!(
-            "gRPC error did not classify as {expected}: code={:?}, message={message}",
-            status.code(),
-        )
+fn wire_error(status: &tonic::Status) -> WireError {
+    WireError {
+        code: format!("{:?}", status.code()),
+        message: status.message().to_owned(),
     }
 }
 

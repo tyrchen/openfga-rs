@@ -56,7 +56,10 @@ mod source;
 mod tuple_validation;
 
 pub use compiler::{CompiledModel, MODEL_COMPILER_FORMAT_VERSION, ModelCompiler};
-pub use error::{DeclarationPath, ModelError, ModelErrorCode, ModelErrors, ModelLookupError};
+pub use error::{
+    ConditionParameterTypeError, DeclarationPath, ModelError, ModelErrorCode, ModelErrorDetail,
+    ModelErrors, ModelLookupError,
+};
 pub use ir::{
     CompiledRelation, ConditionId, ConditionRequirement, DirectRestriction, NodeId, RelationId,
     RestrictionKind, RewriteNode, TypeId,

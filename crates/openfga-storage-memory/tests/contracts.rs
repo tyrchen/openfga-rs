@@ -11,8 +11,9 @@ use std::{
 };
 
 use openfga_domain::{
-    AuthorizationModelId, ConditionContext, ConsistencyPreference, ContextualTuples, Deadline,
-    InputLimits, RelationName, RelationshipTuple, RequestTimeout, StoreId, TupleKey, TypeName,
+    AuthorizationModelId, ConditionBinding, ConditionContext, ConditionName, ConditionReference,
+    ConsistencyPreference, ContextualTuples, Deadline, InputLimits, RelationName,
+    RelationshipTuple, RequestTimeout, StoreId, TupleKey, TypeName,
 };
 use openfga_model::{
     AuthorizationModelSource, DirectRestrictionSource, ModelCompiler, RelationSource,
@@ -36,6 +37,67 @@ const MODEL_ONE: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAW";
 const MODEL_TWO: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAX";
 const MODEL_THREE: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAY";
 const MODEL_IDS: [&str; 3] = [MODEL_ONE, MODEL_TWO, MODEL_THREE];
+
+#[tokio::test]
+async fn test_should_persist_namespace_data_without_a_store_record() -> Result<(), Box<dyn Error>> {
+    let mut storage = MemoryStorage::start(MemoryStorageConfig::default())?;
+    let context = operation_context()?;
+    let store_id = STORE_ID.parse()?;
+    storage
+        .write_model(
+            &context,
+            stored_model(store_id, MODEL_ONE, SystemTime::UNIX_EPOCH)?,
+        )
+        .await?;
+
+    let relationship = tuple("document:roadmap#viewer@user:anne")?;
+    storage
+        .write_tuples(
+            &context,
+            store_id,
+            Vec::new(),
+            vec![relationship.clone()],
+            TupleWriteOptions::default(),
+        )
+        .await?;
+    assert_eq!(
+        storage
+            .read_tuples(
+                &context,
+                store_id,
+                &TupleReadFilter::all(),
+                &page_options(10, None)?,
+            )
+            .await?
+            .items()
+            .len(),
+        1,
+    );
+    storage
+        .write_tuples(
+            &context,
+            store_id,
+            vec![relationship.key().clone()],
+            Vec::new(),
+            TupleWriteOptions::default(),
+        )
+        .await?;
+    assert!(
+        storage
+            .read_tuples(
+                &context,
+                store_id,
+                &TupleReadFilter::all(),
+                &page_options(10, None)?,
+            )
+            .await?
+            .items()
+            .is_empty(),
+    );
+
+    storage.stop().await?;
+    Ok(())
+}
 
 #[tokio::test]
 async fn test_should_pass_backend_independent_tuple_contract() -> Result<(), Box<dyn Error>> {
@@ -349,6 +411,27 @@ async fn test_should_enforce_conflict_ignore_and_concurrent_write_contracts()
         )
         .await?;
     assert!(ignored.change_ids().is_empty());
+
+    let condition_conflict = RelationshipTuple::new(
+        relationship.key().clone(),
+        ConditionReference::Conditional(ConditionBinding::new(
+            ConditionName::parse_with_limits("alternate", &InputLimits::default())?,
+            ConditionContext::empty(),
+        )),
+    );
+    let conflict = storage
+        .write_tuples(
+            &context,
+            store_id,
+            Vec::new(),
+            vec![condition_conflict],
+            TupleWriteOptions::new(WriteConflictPolicy::Error, WriteConflictPolicy::Ignore),
+        )
+        .await
+        .err()
+        .ok_or("ignore accepted a different condition on an existing tuple")?;
+    assert_eq!(conflict.kind(), StorageErrorKind::Conflict);
+    assert_eq!(conflict.code(), "tuple_condition_conflict");
 
     let missing_key: TupleKey = "document:missing#viewer@user:anne".parse()?;
     let ignored = storage

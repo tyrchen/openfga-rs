@@ -2,6 +2,7 @@
 
 use std::{error::Error as StdError, fmt};
 
+use openfga_domain::TupleKey;
 use thiserror::Error;
 
 /// Stable storage failure category used by services and transports.
@@ -38,6 +39,7 @@ pub struct StorageError {
     code: &'static str,
     #[source]
     source: Option<Box<dyn StdError + Send + Sync>>,
+    tuple: Option<Box<TupleKey>>,
 }
 
 impl StorageError {
@@ -48,6 +50,7 @@ impl StorageError {
             kind,
             code,
             source: None,
+            tuple: None,
         }
     }
 
@@ -62,6 +65,7 @@ impl StorageError {
             kind,
             code,
             source: Some(Box::new(source)),
+            tuple: None,
         }
     }
 
@@ -76,6 +80,19 @@ impl StorageError {
     pub const fn code(&self) -> &'static str {
         self.code
     }
+
+    /// Attaches the validated tuple responsible for a structured mutation conflict.
+    #[must_use]
+    pub fn with_tuple(mut self, tuple: TupleKey) -> Self {
+        self.tuple = Some(Box::new(tuple));
+        self
+    }
+
+    /// Returns the validated tuple responsible for a mutation conflict.
+    #[must_use]
+    pub fn tuple(&self) -> Option<&TupleKey> {
+        self.tuple.as_deref()
+    }
 }
 
 impl fmt::Debug for StorageError {
@@ -85,6 +102,7 @@ impl fmt::Debug for StorageError {
             .field("kind", &self.kind)
             .field("code", &self.code)
             .field("source", &self.source.as_ref().map(|_| "[REDACTED]"))
+            .field("tuple", &self.tuple.as_ref().map(|_| "[REDACTED]"))
             .finish_non_exhaustive()
     }
 }

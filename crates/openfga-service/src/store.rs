@@ -88,11 +88,11 @@ impl StoreService {
         Ok(record)
     }
 
-    /// Deletes one store and its owned state.
+    /// Idempotently removes one store record without deleting namespace data.
     ///
     /// # Errors
     ///
-    /// Returns store-not-found, cancellation, timeout, or backend failure.
+    /// Returns cancellation, timeout, or backend failure.
     #[tracing::instrument(skip_all, fields(operation = "delete_store", store_id = %store_id))]
     pub async fn delete(
         &self,

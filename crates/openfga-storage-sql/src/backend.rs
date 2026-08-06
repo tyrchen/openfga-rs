@@ -28,7 +28,10 @@ use sqlx::{
     FromRow, PgPool, Postgres, QueryBuilder, Transaction,
     postgres::{PgConnectOptions, PgPoolOptions},
 };
-use tokio::time::{Instant, sleep_until};
+use tokio::{
+    sync::{OwnedSemaphorePermit, Semaphore},
+    time::{Instant, sleep_until},
+};
 use tracing::{instrument, warn};
 use ulid::Ulid;
 
@@ -56,9 +59,19 @@ pub(crate) static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migratio
 pub struct PostgresStorage {
     primary: PgPool,
     replica: Option<PgPool>,
+    work_permits: Arc<Semaphore>,
     config: PostgresStorageConfig,
     compiler: ModelCompiler,
     faults: Arc<dyn PostgresMutationFaultInjector>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PreparedTupleMutation<'a> {
+    deletes: &'a BTreeSet<TupleKey>,
+    writes: &'a BTreeMap<TupleKey, RelationshipTuple>,
+    delete_order: &'a [TupleKey],
+    write_order: &'a [TupleKey],
+    options: TupleWriteOptions,
 }
 
 impl PostgresStorage {
@@ -107,9 +120,18 @@ impl PostgresStorage {
             }
             None => None,
         };
+        let work_permits = Arc::new(Semaphore::new(
+            usize::try_from(config.max_connections.get()).map_err(|_| {
+                StorageError::new(
+                    StorageErrorKind::Integrity,
+                    "postgres_work_limit_out_of_range",
+                )
+            })?,
+        ));
         Ok(Self {
             primary,
             replica,
+            work_permits,
             config,
             compiler: ModelCompiler::default(),
             faults,
@@ -154,6 +176,25 @@ impl PostgresStorage {
         self.replica.as_ref()
     }
 
+    async fn acquire_work(
+        &self,
+        context: &OperationContext,
+    ) -> Result<OwnedSemaphorePermit, StorageError> {
+        context.check()?;
+        let acquire = Arc::clone(&self.work_permits).acquire_owned();
+        tokio::pin!(acquire);
+        let deadline = Instant::from_std(context.deadline().instant());
+        tokio::select! {
+            biased;
+            () = context.cancellation().cancelled() => Err(cancelled()),
+            () = sleep_until(deadline) => Err(timed_out()),
+            result = &mut acquire => result.map_err(|_| StorageError::new(
+                StorageErrorKind::Unavailable,
+                "postgres_work_admission_closed",
+            )),
+        }
+    }
+
     async fn read_pool<'a>(&'a self, context: &OperationContext) -> &'a PgPool {
         if matches!(
             context.consistency(),
@@ -195,22 +236,29 @@ impl PostgresStorage {
         context: &OperationContext,
         transaction: &mut Transaction<'_, Postgres>,
         store_id: StoreId,
-        deletes: &BTreeSet<TupleKey>,
-        writes: &BTreeMap<TupleKey, RelationshipTuple>,
-        options: TupleWriteOptions,
+        mutation: PreparedTupleMutation<'_>,
     ) -> Result<Vec<ChangeId>, StorageError> {
+        let PreparedTupleMutation {
+            deletes,
+            writes,
+            delete_order,
+            write_order,
+            options,
+        } = mutation;
         configure_transaction_deadline(context, transaction).await?;
         self.faults.check(PostgresMutationStage::BeforeLock)?;
-        ensure_store_in_transaction(context, transaction, store_id).await?;
         let mut affected = deletes.clone();
         affected.extend(writes.keys().cloned());
         let mut existing = BTreeMap::new();
         for key in &affected {
             execute(
                 context,
-                sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-                    .bind(key.to_string())
-                    .execute(&mut **transaction),
+                sqlx::query(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($2, hashtextextended($1, 0)))",
+                )
+                .bind(store_id.to_string())
+                .bind(key.to_string())
+                .execute(&mut **transaction),
                 "postgres_tuple_lock_failed",
             )
             .await?;
@@ -222,7 +270,7 @@ impl PostgresStorage {
         }
         self.faults.check(PostgresMutationStage::AfterLock)?;
 
-        validate_conflict_policy(deletes, writes, &existing, options)?;
+        validate_conflict_policy(delete_order, write_order, writes, &existing, options)?;
         let timestamp_ms = transaction_timestamp(context, transaction).await?;
         let mut changes = Vec::with_capacity(deletes.len().saturating_add(writes.len()));
 
@@ -296,6 +344,7 @@ impl TupleReader for PostgresStorage {
         filter: &TupleReadFilter,
         options: &PageOptions,
     ) -> Result<Page<StoredTuple>, StorageError> {
+        let _work_permit = self.acquire_work(context).await?;
         context.check()?;
         let pool = self.read_pool(context).await;
         let mut query = QueryBuilder::<Postgres>::new(tuple_select_prefix());
@@ -329,6 +378,7 @@ impl TupleReader for PostgresStorage {
         store_id: StoreId,
         key: &TupleKey,
     ) -> Result<StoredTuple, StorageError> {
+        let _work_permit = self.acquire_work(context).await?;
         let pool = self.read_pool(context).await;
         let parts = TupleParts::from_key(key);
         let store_id_text = store_id.to_string();
@@ -365,6 +415,7 @@ impl TupleReader for PostgresStorage {
         filter: &ObjectRelationFilter,
         options: ReadOptions,
     ) -> Result<TupleStream, StorageError> {
+        let _work_permit = self.acquire_work(context).await?;
         let pool = self.read_pool(context).await;
         let mut query = QueryBuilder::<Postgres>::new(tuple_select_prefix());
         query
@@ -397,6 +448,7 @@ impl TupleReader for PostgresStorage {
         filter: &UsersetTupleFilter,
         options: ReadOptions,
     ) -> Result<TupleStream, StorageError> {
+        let _work_permit = self.acquire_work(context).await?;
         let pool = self.read_pool(context).await;
         let mut query = QueryBuilder::<Postgres>::new(tuple_select_prefix());
         query
@@ -443,6 +495,7 @@ impl TupleReader for PostgresStorage {
         filter: &ReverseTupleFilter,
         options: ReadOptions,
     ) -> Result<TupleStream, StorageError> {
+        let _work_permit = self.acquire_work(context).await?;
         let pool = self.read_pool(context).await;
         let mut query = QueryBuilder::<Postgres>::new(tuple_select_prefix());
         query
@@ -483,6 +536,7 @@ impl TupleReader for PostgresStorage {
         store_id: StoreId,
         key: &TupleKey,
     ) -> Result<bool, StorageError> {
+        let _work_permit = self.acquire_work(context).await?;
         let pool = self.read_pool(context).await;
         let parts = TupleParts::from_key(key);
         let store_id_text = store_id.to_string();
@@ -516,6 +570,7 @@ impl TupleReader for PostgresStorage {
         store_id: StoreId,
         filter: &ObjectRelationFilter,
     ) -> Result<u64, StorageError> {
+        let _work_permit = self.acquire_work(context).await?;
         let pool = self.read_pool(context).await;
         let mut query = QueryBuilder::<Postgres>::new("SELECT COUNT(*) FROM tuples");
         query
@@ -556,7 +611,13 @@ impl TupleWriter for PostgresStorage {
         writes: Vec<RelationshipTuple>,
         options: TupleWriteOptions,
     ) -> Result<MutationOutcome, StorageError> {
+        let _work_permit = self.acquire_work(context).await?;
         context.check()?;
+        let delete_order = deletes.clone();
+        let write_order = writes
+            .iter()
+            .map(|tuple| tuple.key().clone())
+            .collect::<Vec<_>>();
         let deletes = unique_deletes(deletes)?;
         let writes = unique_writes(writes)?;
         if deletes.len().saturating_add(writes.len())
@@ -587,9 +648,13 @@ impl TupleWriter for PostgresStorage {
                 context,
                 &mut transaction,
                 store_id,
-                &deletes,
-                &writes,
-                options,
+                PreparedTupleMutation {
+                    deletes: &deletes,
+                    writes: &writes,
+                    delete_order: &delete_order,
+                    write_order: &write_order,
+                    options,
+                },
             )
             .await;
         let change_ids = match result {
@@ -618,6 +683,7 @@ impl ModelReader for PostgresStorage {
         store_id: StoreId,
         model_id: AuthorizationModelId,
     ) -> Result<Arc<StoredAuthorizationModel>, StorageError> {
+        let _work_permit = self.acquire_work(context).await?;
         let pool = self.read_pool(context).await;
         let store_id_text = store_id.to_string();
         let model_id_text = model_id.to_string();
@@ -644,6 +710,7 @@ impl ModelReader for PostgresStorage {
         context: &OperationContext,
         store_id: StoreId,
     ) -> Result<Arc<StoredAuthorizationModel>, StorageError> {
+        let _work_permit = self.acquire_work(context).await?;
         let pool = self.read_pool(context).await;
         let store_id_text = store_id.to_string();
         let row = execute(
@@ -671,6 +738,7 @@ impl ModelReader for PostgresStorage {
         store_id: StoreId,
         options: &PageOptions,
     ) -> Result<Page<Arc<StoredAuthorizationModel>>, StorageError> {
+        let _work_permit = self.acquire_work(context).await?;
         let pool = self.read_pool(context).await;
         let mut query = QueryBuilder::<Postgres>::new(model_select_columns());
         query
@@ -714,6 +782,7 @@ impl ModelWriter for PostgresStorage {
         context: &OperationContext,
         model: Arc<StoredAuthorizationModel>,
     ) -> Result<(), StorageError> {
+        let _work_permit = self.acquire_work(context).await?;
         let payload = encode_model(&model)?;
         let written_at_ms = system_time_to_millis(model.written_at())?;
         execute(
@@ -748,6 +817,7 @@ impl StoreReader for PostgresStorage {
         context: &OperationContext,
         store_id: StoreId,
     ) -> Result<StoreRecord, StorageError> {
+        let _work_permit = self.acquire_work(context).await?;
         let pool = self.read_pool(context).await;
         let store_id_text = store_id.to_string();
         let row = execute(
@@ -773,6 +843,7 @@ impl StoreReader for PostgresStorage {
         filter: &StoreFilter,
         options: &PageOptions,
     ) -> Result<Page<StoreRecord>, StorageError> {
+        let _work_permit = self.acquire_work(context).await?;
         let pool = self.read_pool(context).await;
         let mut query = QueryBuilder::<Postgres>::new(store_select_columns());
         query.push(" WHERE deleted_at IS NULL");
@@ -820,6 +891,7 @@ impl StoreWriter for PostgresStorage {
         store_id: StoreId,
         name: StoreName,
     ) -> Result<StoreRecord, StorageError> {
+        let _work_permit = self.acquire_work(context).await?;
         let row = execute(
             context,
             sqlx::query_as::<_, StoreRow>(
@@ -843,6 +915,7 @@ impl StoreWriter for PostgresStorage {
         store_id: StoreId,
         name: StoreName,
     ) -> Result<StoreRecord, StorageError> {
+        let _work_permit = self.acquire_work(context).await?;
         let row = execute(
             context,
             sqlx::query_as::<_, StoreRow>(
@@ -865,7 +938,8 @@ impl StoreWriter for PostgresStorage {
         context: &OperationContext,
         store_id: StoreId,
     ) -> Result<(), StorageError> {
-        let result = execute(
+        let _work_permit = self.acquire_work(context).await?;
+        execute(
             context,
             sqlx::query("DELETE FROM stores WHERE id = $1")
                 .bind(store_id.to_string())
@@ -873,12 +947,6 @@ impl StoreWriter for PostgresStorage {
             "postgres_delete_store_failed",
         )
         .await?;
-        if result.rows_affected() == 0 {
-            return Err(StorageError::new(
-                StorageErrorKind::NotFound,
-                "postgres_store_not_found",
-            ));
-        }
         Ok(())
     }
 }
@@ -891,6 +959,7 @@ impl AssertionReader for PostgresStorage {
         store_id: StoreId,
         model_id: AuthorizationModelId,
     ) -> Result<Arc<[Assertion]>, StorageError> {
+        let _work_permit = self.acquire_work(context).await?;
         let pool = self.read_pool(context).await;
         match execute(
             context,
@@ -919,6 +988,7 @@ impl AssertionWriter for PostgresStorage {
         model_id: AuthorizationModelId,
         assertions: Vec<Assertion>,
     ) -> Result<(), StorageError> {
+        let _work_permit = self.acquire_work(context).await?;
         let payload = encode_assertions(&assertions)?;
         execute(
             context,
@@ -948,6 +1018,7 @@ impl ChangeReader for PostgresStorage {
         filter: &ChangeFilter,
         options: &PageOptions,
     ) -> Result<Page<TupleChange>, StorageError> {
+        let _work_permit = self.acquire_work(context).await?;
         let pool = self.read_pool(context).await;
         let mut query = QueryBuilder::<Postgres>::new(change_select_columns());
         query
@@ -1321,54 +1392,42 @@ fn unique_writes(
 }
 
 fn validate_conflict_policy(
-    deletes: &BTreeSet<TupleKey>,
-    writes: &BTreeMap<TupleKey, RelationshipTuple>,
+    deletes: &[TupleKey],
+    writes: &[TupleKey],
+    requested: &BTreeMap<TupleKey, RelationshipTuple>,
     existing: &BTreeMap<TupleKey, RelationshipTuple>,
     options: TupleWriteOptions,
 ) -> Result<(), StorageError> {
     if matches!(options.on_missing_delete(), WriteConflictPolicy::Error)
-        && deletes.iter().any(|key| !existing.contains_key(key))
+        && let Some(key) = deletes.iter().find(|key| !existing.contains_key(*key))
     {
-        return Err(StorageError::new(
-            StorageErrorKind::Conflict,
-            "tuple_delete_missing",
-        ));
+        return Err(
+            StorageError::new(StorageErrorKind::Conflict, "tuple_delete_missing")
+                .with_tuple(key.clone()),
+        );
     }
     if matches!(options.on_duplicate_write(), WriteConflictPolicy::Error)
-        && writes.keys().any(|key| existing.contains_key(key))
+        && let Some(key) = writes.iter().find(|key| existing.contains_key(*key))
     {
-        return Err(StorageError::new(
-            StorageErrorKind::Conflict,
-            "tuple_write_duplicate",
-        ));
+        return Err(
+            StorageError::new(StorageErrorKind::Conflict, "tuple_write_duplicate")
+                .with_tuple(key.clone()),
+        );
+    }
+    if matches!(options.on_duplicate_write(), WriteConflictPolicy::Ignore)
+        && let Some(key) = writes.iter().find(|key| {
+            existing
+                .get(*key)
+                .zip(requested.get(*key))
+                .is_some_and(|(stored, requested)| stored != requested)
+        })
+    {
+        return Err(
+            StorageError::new(StorageErrorKind::Conflict, "tuple_condition_conflict")
+                .with_tuple(key.clone()),
+        );
     }
     Ok(())
-}
-
-async fn ensure_store_in_transaction(
-    context: &OperationContext,
-    transaction: &mut Transaction<'_, Postgres>,
-    store_id: StoreId,
-) -> Result<(), StorageError> {
-    let found = execute(
-        context,
-        sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM stores WHERE id = $1 AND deleted_at IS NULL FOR KEY \
-             SHARE)",
-        )
-        .bind(store_id.to_string())
-        .fetch_one(&mut **transaction),
-        "postgres_store_check_failed",
-    )
-    .await?;
-    if found {
-        Ok(())
-    } else {
-        Err(StorageError::new(
-            StorageErrorKind::NotFound,
-            "postgres_store_not_found",
-        ))
-    }
 }
 
 async fn read_exact_in_transaction(

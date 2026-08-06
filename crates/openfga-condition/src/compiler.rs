@@ -8,10 +8,11 @@ use cel_parser::{
     reference::Val,
 };
 use openfga_domain::{
-    ConditionContext, ConditionName, Fingerprint, FingerprintBuilder, ParameterName,
+    ConditionContext, ConditionName, ContextValue, Fingerprint, FingerprintBuilder, ParameterName,
 };
 
 use crate::{
+    ConditionContextError,
     error::{CompileError, CompileErrorKind, EvaluationError},
     evaluator::evaluate,
     ir::{
@@ -21,6 +22,7 @@ use crate::{
     types::{
         CancellationCheck, CompiledMetadata, ConditionDefinition, ConditionLimits,
         ConditionOutcome, EvaluationBudget, EvaluationContexts, ParameterType, ParameterTypeKind,
+        ParameterTypeRef,
     },
     value::RuntimeValue,
 };
@@ -51,7 +53,9 @@ impl ConditionCompiler {
         let mut lowerer = Lowerer::new(definition);
         let root = lowerer.lower(&expression)?;
         if lowerer.node(root)?.static_type != StaticType::Bool {
-            return Err(CompileError::new(CompileErrorKind::NonBooleanResult, 0));
+            return Err(CompileError::non_boolean(static_type_name(
+                &lowerer.node(root)?.static_type,
+            )));
         }
         let metadata = CompiledMetadata {
             fingerprint: fingerprint_definition(definition),
@@ -67,6 +71,24 @@ impl ConditionCompiler {
             runtime_value_bytes: limits.runtime_value_bytes(),
             runtime_collection_items: limits.runtime_collection_items(),
         })
+    }
+}
+
+const fn static_type_name(value: &StaticType) -> &'static str {
+    match value {
+        StaticType::Dyn => "dyn",
+        StaticType::Null => "null_type",
+        StaticType::Bool => "bool",
+        StaticType::Int => "int",
+        StaticType::Uint => "uint",
+        StaticType::Double => "double",
+        StaticType::String => "string",
+        StaticType::Bytes => "bytes",
+        StaticType::Duration => "duration",
+        StaticType::Timestamp => "timestamp",
+        StaticType::IpAddress => "ipaddress",
+        StaticType::List(_) => "list",
+        StaticType::Map(_) => "map",
     }
 }
 
@@ -119,8 +141,68 @@ impl CompiledCondition {
         self.metadata.fingerprint
     }
 
-    pub(crate) const fn parameters(&self) -> &BTreeMap<ParameterName, ParameterType> {
+    /// Validates every supplied persisted tuple-context entry against declared parameters.
+    ///
+    /// Missing entries remain valid because request context may supply them during evaluation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded diagnostic for an unknown parameter or incompatible value.
+    pub fn validate_context(
+        &self,
+        context: &ConditionContext,
+    ) -> Result<(), ConditionContextError> {
+        for (name, value) in context {
+            let Some(parameter_type) = self.parameters.get(name) else {
+                return Err(ConditionContextError::unknown(name.clone()));
+            };
+            crate::value::convert_parameter(value, parameter_type).map_err(|_| {
+                ConditionContextError::invalid(
+                    name.clone(),
+                    parameter_type_name(parameter_type),
+                    context_value_type(value),
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Returns declared parameter types in canonical name order.
+    #[must_use]
+    pub const fn parameters(&self) -> &BTreeMap<ParameterName, ParameterType> {
         &self.parameters
+    }
+}
+
+const fn parameter_type_name(parameter_type: &ParameterType) -> &'static str {
+    match parameter_type.as_ref() {
+        ParameterTypeRef::Any => "interface {}",
+        ParameterTypeRef::Bool => "bool",
+        ParameterTypeRef::String
+        | ParameterTypeRef::Duration
+        | ParameterTypeRef::Timestamp
+        | ParameterTypeRef::IpAddress => "string",
+        ParameterTypeRef::Int => "int64",
+        ParameterTypeRef::Uint => "uint64",
+        ParameterTypeRef::Double => "float64",
+        ParameterTypeRef::Bytes => "[]uint8",
+        ParameterTypeRef::List(_) => "[]interface {}",
+        ParameterTypeRef::Map(_) => "map[string]interface {}",
+    }
+}
+
+const fn context_value_type(value: &ContextValue) -> &'static str {
+    match value {
+        ContextValue::Null => "<nil>",
+        ContextValue::Bool(_) => "bool",
+        ContextValue::Int(_) => "int64",
+        ContextValue::Uint(_) => "uint64",
+        ContextValue::Double(_) => "float64",
+        ContextValue::String(_) => "string",
+        ContextValue::Bytes(_) => "[]uint8",
+        ContextValue::List(_) => "[]interface {}",
+        ContextValue::Map(_) => "map[string]interface {}",
+        _ => "unknown",
     }
 }
 
@@ -338,7 +420,7 @@ impl<'a> Lowerer<'a> {
             .iter()
             .find(|(parameter, _)| parameter.as_str() == name)
         else {
-            return Err(CompileError::new(CompileErrorKind::UnknownIdentifier, 0));
+            return Err(CompileError::unknown_identifier(name));
         };
         Ok(self.push(
             NodeKind::Parameter(parameter.clone()),
@@ -523,11 +605,18 @@ impl<'a> Lowerer<'a> {
         }
         let left = self.lower(left)?;
         let right = self.lower(right)?;
-        let output = binary_type(
-            operator,
-            &self.node(left)?.static_type,
-            &self.node(right)?.static_type,
-        )?;
+        let left_type = &self.node(left)?.static_type;
+        let right_type = &self.node(right)?.static_type;
+        let output = binary_type(operator, left_type, right_type).map_err(|error| {
+            if error.kind() == CompileErrorKind::TypeMismatch {
+                CompileError::no_matching_overload(
+                    binary_function_name(operator),
+                    vec![static_type_name(left_type), static_type_name(right_type)],
+                )
+            } else {
+                error
+            }
+        })?;
         Ok(self.push(
             NodeKind::Binary {
                 operator,
@@ -550,7 +639,22 @@ impl<'a> Lowerer<'a> {
             .iter()
             .map(|argument| self.lower(argument))
             .collect::<Result<Vec<_>, _>>()?;
-        let output = function_type(function, target, &arguments, &self.nodes)?;
+        let output = function_type(function, target, &arguments, &self.nodes).map_err(|error| {
+            if matches!(
+                error.kind(),
+                CompileErrorKind::TypeMismatch | CompileErrorKind::Unsupported
+            ) {
+                let argument_types = target
+                    .into_iter()
+                    .chain(arguments.iter().copied())
+                    .filter_map(|id| self.nodes.get(id))
+                    .map(|node| static_type_name(&node.static_type))
+                    .collect();
+                CompileError::no_matching_overload(name, argument_types)
+            } else {
+                error
+            }
+        })?;
         Ok(self.push(
             NodeKind::Call {
                 function,
@@ -607,6 +711,24 @@ impl<'a> Lowerer<'a> {
             }),
             output,
         ))
+    }
+}
+
+const fn binary_function_name(operator: BinaryOperator) -> &'static str {
+    match operator {
+        BinaryOperator::Add => "_+_",
+        BinaryOperator::Subtract => "_-_",
+        BinaryOperator::Multiply => "_*_",
+        BinaryOperator::Divide => "_/_",
+        BinaryOperator::Modulo => "_%_",
+        BinaryOperator::Equal => "_==_",
+        BinaryOperator::NotEqual => "_!=_",
+        BinaryOperator::Greater => "_>_",
+        BinaryOperator::GreaterEqual => "_>=_",
+        BinaryOperator::Less => "_<_",
+        BinaryOperator::LessEqual => "_<=_",
+        BinaryOperator::In => "_in_",
+        BinaryOperator::Index => "_[_]",
     }
 }
 

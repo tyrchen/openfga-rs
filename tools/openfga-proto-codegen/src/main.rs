@@ -21,6 +21,8 @@ const EXPECTED_API_REPOSITORY: &str = "https://github.com/openfga/api.git";
 const EXPECTED_PROTOC_DISTRIBUTION: &str = "protoc-bin-vendored 3.2.0";
 const EXPECTED_PROTOC_VERSION: &str = "31.1";
 const EXPECTED_PROST_VERSION: &str = "0.14.4";
+const EXPECTED_PROST_REFLECT_VERSION: &str = "0.16.5";
+const EXPECTED_PROST_VALIDATE_TYPES_VERSION: &str = "0.2.9";
 const EXPECTED_TONIC_VERSION: &str = "0.14.6";
 const EXPECTED_PBJSON_VERSION: &str = "0.9.0";
 const EXPECTED_IMPORT_PROVENANCE: &[(&str, &str, &str, &str)] = &[
@@ -137,6 +139,8 @@ struct ProtocLock {
 struct GeneratedLock {
     tonic: String,
     prost: String,
+    prost_reflect: String,
+    prost_validate_types: String,
     pbjson: String,
     aggregate_sha256: String,
 }
@@ -192,11 +196,24 @@ async fn main() -> Result<()> {
         .collect::<Vec<_>>();
     let includes = vec![api_root.clone(), vendor_root, protoc_include];
     let descriptor_path = arguments.output.join("openfga_descriptor.bin");
+    let reflection_bootstrap = arguments.output.join(".reflection-bootstrap");
+    tokio::fs::create_dir(&reflection_bootstrap)
+        .await
+        .context("failed to create reflection bootstrap directory")?;
 
     let mut prost_config = Config::new();
     prost_config.protoc_executable(&protoc_binary);
+    prost_config.out_dir(&reflection_bootstrap);
     prost_config.compile_well_known_types();
     prost_config.extern_path(".google.protobuf", "::pbjson_types");
+    prost_reflect_build::Builder::new()
+        .file_descriptor_set_path(&descriptor_path)
+        .file_descriptor_set_bytes("crate::FILE_DESCRIPTOR_SET")
+        .configure(&mut prost_config, &proto_inputs, &includes)
+        .context("failed to configure pinned protobuf reflection")?;
+    tokio::fs::remove_dir_all(&reflection_bootstrap)
+        .await
+        .context("failed to remove reflection bootstrap directory")?;
     tonic_prost_build::configure()
         .out_dir(&arguments.output)
         .file_descriptor_set_path(&descriptor_path)
@@ -208,12 +225,17 @@ async fn main() -> Result<()> {
     let descriptors = tokio::fs::read(&descriptor_path)
         .await
         .context("failed to read generated protocol descriptors")?;
-    pbjson_build::Builder::new()
+    let mut json_builder = pbjson_build::Builder::new();
+    json_builder
+        .ignore_unknown_fields()
+        .ignore_unknown_enum_variants()
         .out_dir(&arguments.output)
         .register_descriptors(&descriptors)
         .context("failed to register protocol descriptors for protobuf JSON")?
         .build(&[".openfga.v1"])
         .context("failed to generate protobuf JSON implementations")?;
+    reject_duplicate_generated_map_keys(&arguments.output.join("openfga.v1.serde.rs")).await?;
+    reject_unknown_generated_numeric_enums(&arguments.output.join("openfga.v1.serde.rs")).await?;
 
     generate_route_metadata(
         &api_root.join("docs/openapiv2/apidocs.swagger.json"),
@@ -222,6 +244,59 @@ async fn main() -> Result<()> {
     .await?;
     verify_generated_artifacts(&arguments.output, &protocol_lock.generated).await?;
 
+    Ok(())
+}
+
+async fn reject_unknown_generated_numeric_enums(path: &Path) -> Result<()> {
+    const ENUMS: &[&str] = &[
+        "AuthErrorCode",
+        "ConsistencyPreference",
+        "ErrorCode",
+        "InternalErrorCode",
+        "NotFoundErrorCode",
+        "TupleOperation",
+        "UnprocessableContentErrorCode",
+        "condition_param_type_ref::TypeName",
+    ];
+    let mut generated = tokio::fs::read_to_string(path).await.with_context(|| {
+        format!(
+            "failed to read generated protobuf JSON at {}",
+            path.display()
+        )
+    })?;
+    for name in ENUMS {
+        let permissive = format!("x.try_into().ok().or_else(|| Some({name}::default()))");
+        let replacements = generated.matches(&permissive).count();
+        if replacements == 0 {
+            bail!("pbjson output contains no recognized numeric deserializer for {name}");
+        }
+        generated = generated.replace(&permissive, "x.try_into().ok()");
+    }
+    tokio::fs::write(path, generated)
+        .await
+        .with_context(|| format!("failed to harden protobuf JSON at {}", path.display()))?;
+    Ok(())
+}
+
+async fn reject_duplicate_generated_map_keys(path: &Path) -> Result<()> {
+    const GENERATED: &str = "map_.next_value::<std::collections::HashMap<_, _>>()?";
+    const PROJECT_OWNED: &str =
+        "map_.next_value::<crate::DuplicateRejectingMap<_, _>>()?.into_inner()";
+
+    let generated = tokio::fs::read_to_string(path).await.with_context(|| {
+        format!(
+            "failed to read generated protobuf JSON at {}",
+            path.display()
+        )
+    })?;
+    let replacements = generated.matches(GENERATED).count();
+    if replacements == 0 {
+        bail!("pbjson output contains no recognized protobuf map deserializers");
+    }
+    let hardened = generated.replace(GENERATED, PROJECT_OWNED);
+    tokio::fs::write(path, hardened)
+        .await
+        .with_context(|| format!("failed to harden protobuf JSON at {}", path.display()))?;
     Ok(())
 }
 
@@ -243,6 +318,8 @@ fn verify_lock_metadata(protocol_lock: &ProtocolLock) -> Result<()> {
     }
     if protocol_lock.generated.tonic != EXPECTED_TONIC_VERSION
         || protocol_lock.generated.prost != EXPECTED_PROST_VERSION
+        || protocol_lock.generated.prost_reflect != EXPECTED_PROST_REFLECT_VERSION
+        || protocol_lock.generated.prost_validate_types != EXPECTED_PROST_VALIDATE_TYPES_VERSION
         || protocol_lock.generated.pbjson != EXPECTED_PBJSON_VERSION
     {
         bail!("protocol lock does not match the reviewed Tonic/Prost/pbjson dependencies");
@@ -302,6 +379,14 @@ async fn verify_workspace_dependency_versions(
     let locked_versions = cargo_locked_versions(&contents)?;
     let expected = [
         ("prost", protocol_lock.generated.prost.as_str()),
+        (
+            "prost-reflect",
+            protocol_lock.generated.prost_reflect.as_str(),
+        ),
+        (
+            "prost-validate-types",
+            protocol_lock.generated.prost_validate_types.as_str(),
+        ),
         ("protoc-bin-vendored", "3.2.0"),
         ("tonic", protocol_lock.generated.tonic.as_str()),
     ];
@@ -323,7 +408,14 @@ fn cargo_locked_versions(contents: &str) -> Result<BTreeMap<String, String>> {
             package_name = Some(name);
         } else if let (Some(name), Some(version)) =
             (package_name.take(), quoted_toml_value(line, "version"))
-            && ["prost", "protoc-bin-vendored", "tonic"].contains(&name.as_str())
+            && [
+                "prost",
+                "prost-reflect",
+                "prost-validate-types",
+                "protoc-bin-vendored",
+                "tonic",
+            ]
+            .contains(&name.as_str())
             && versions.insert(name.clone(), version).is_some()
         {
             bail!("Cargo.lock contains duplicate reviewed protocol package {name}");

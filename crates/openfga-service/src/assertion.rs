@@ -5,6 +5,7 @@ use std::{fmt, sync::Arc};
 use openfga_domain::{AuthorizationModelId, InputLimits, ModelSelection, StoreId};
 use openfga_storage::{
     Assertion, AssertionReader, AssertionWriter, ModelReader, OperationContext, StoreReader,
+    StoredAuthorizationModel,
 };
 
 use crate::ServiceError;
@@ -16,6 +17,10 @@ pub struct AssertionSet {
     model_id: AuthorizationModelId,
     assertions: Arc<[Assertion]>,
 }
+
+/// An immutable authorization model selected before assertion payload conversion.
+#[derive(Clone, Debug)]
+pub struct ResolvedAssertionModel(Arc<StoredAuthorizationModel>);
 
 impl AssertionSet {
     /// Creates a resolved assertion set.
@@ -44,7 +49,6 @@ impl AssertionSet {
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct AssertionService {
-    stores: Arc<dyn StoreReader>,
     models: Arc<dyn ModelReader>,
     reader: Arc<dyn AssertionReader>,
     writer: Arc<dyn AssertionWriter>,
@@ -54,15 +58,14 @@ pub struct AssertionService {
 impl AssertionService {
     /// Creates a service with an explicit boundary limit policy.
     #[must_use]
-    pub const fn new(
-        stores: Arc<dyn StoreReader>,
+    pub fn new(
+        _stores: Arc<dyn StoreReader>,
         models: Arc<dyn ModelReader>,
         reader: Arc<dyn AssertionReader>,
         writer: Arc<dyn AssertionWriter>,
         limits: InputLimits,
     ) -> Self {
         Self {
-            stores,
             models,
             reader,
             writer,
@@ -82,7 +85,6 @@ impl AssertionService {
         store_id: StoreId,
         selection: ModelSelection,
     ) -> Result<AssertionSet, ServiceError> {
-        crate::common::require_store(self.stores.as_ref(), context, store_id).await?;
         let model =
             crate::common::resolve_model(self.models.as_ref(), context, store_id, selection)
                 .await?;
@@ -112,18 +114,80 @@ impl AssertionService {
         store_id: StoreId,
         selection: ModelSelection,
         assertions: Vec<Assertion>,
+        encoded_size: usize,
+        encoded_size_limit: usize,
     ) -> Result<AuthorizationModelId, ServiceError> {
+        let model = self
+            .resolve_write_model(context, store_id, selection)
+            .await?;
+        self.write_resolved(
+            context,
+            store_id,
+            model,
+            assertions,
+            encoded_size,
+            encoded_size_limit,
+        )
+        .await
+    }
+
+    /// Selects the immutable model before assertion payload conversion.
+    ///
+    /// # Errors
+    ///
+    /// Returns model-not-found, cancellation, timeout, or backend failure.
+    pub async fn resolve_write_model(
+        &self,
+        context: &OperationContext,
+        store_id: StoreId,
+        selection: ModelSelection,
+    ) -> Result<ResolvedAssertionModel, ServiceError> {
+        crate::common::resolve_model(self.models.as_ref(), context, store_id, selection)
+            .await
+            .map(ResolvedAssertionModel)
+    }
+
+    /// Validates and atomically replaces assertions using a preselected model.
+    ///
+    /// # Errors
+    ///
+    /// Returns invalid tuple, resource, cancellation, timeout, or backend failure.
+    pub async fn write_resolved(
+        &self,
+        context: &OperationContext,
+        store_id: StoreId,
+        model: ResolvedAssertionModel,
+        assertions: Vec<Assertion>,
+        encoded_size: usize,
+        encoded_size_limit: usize,
+    ) -> Result<AuthorizationModelId, ServiceError> {
+        let model = model.0;
+        if encoded_size > encoded_size_limit {
+            return Err(ServiceError::resource_exhausted_with_limit(
+                "assertion_byte_limit",
+                encoded_size_limit,
+            ));
+        }
         if assertions.len() > self.limits.assertions() {
             return Err(ServiceError::resource_exhausted("assertion_item_limit"));
         }
-        crate::common::require_store(self.stores.as_ref(), context, store_id).await?;
-        let model =
-            crate::common::resolve_model(self.models.as_ref(), context, store_id, selection)
-                .await?;
         for assertion in &assertions {
-            model.compiled().validate_query_tuple(assertion.tuple())?;
+            model
+                .compiled()
+                .validate_query_tuple(assertion.tuple())
+                .map_err(|error| ServiceError::assertion_tuple(error, assertion.tuple().clone()))?;
             for tuple in assertion.contextual_tuples().as_slice() {
-                model.compiled().validate_relationship_tuple(tuple)?;
+                let condition_parameter_count =
+                    crate::common::condition_parameter_count(model.as_ref(), tuple);
+                model
+                    .compiled()
+                    .validate_relationship_tuple(tuple)
+                    .map_err(ServiceError::from)
+                    .map_err(|error| {
+                        error
+                            .with_relationship_tuple(tuple)
+                            .with_condition_parameter_count(condition_parameter_count)
+                    })?;
             }
         }
         let model_id = *model.model_id();
@@ -141,7 +205,6 @@ impl fmt::Debug for AssertionService {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("AssertionService")
-            .field("stores", &"dyn StoreReader")
             .field("models", &"dyn ModelReader")
             .field("reader", &"dyn AssertionReader")
             .field("writer", &"dyn AssertionWriter")

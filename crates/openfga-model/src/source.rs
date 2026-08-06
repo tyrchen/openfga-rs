@@ -8,6 +8,8 @@ use openfga_domain::{
     TypeName,
 };
 
+use crate::ConditionParameterTypeError;
+
 /// Authorization-model declarations before the service assigns store/model identity.
 #[non_exhaustive]
 pub struct AuthorizationModelDefinition {
@@ -149,6 +151,7 @@ fn source_fingerprint(source: &AuthorizationModelSource) -> Fingerprint {
         builder.write_u64(source_length(type_definition.relations.len()));
         for relation in &type_definition.relations {
             builder.write_str(relation.name.as_str());
+            builder.write_tag(u8::from(relation.rewrite_valid));
             write_rewrite_fingerprint(&relation.rewrite, &mut builder);
             builder.write_u64(source_length(relation.restrictions.len()));
             for restriction in &relation.restrictions {
@@ -258,6 +261,7 @@ impl fmt::Debug for TypeDefinitionSource {
 pub struct RelationSource {
     pub(crate) name: RelationName,
     pub(crate) rewrite: RewriteSource,
+    pub(crate) rewrite_valid: bool,
     pub(crate) restrictions: Vec<DirectRestrictionSource>,
 }
 
@@ -272,8 +276,32 @@ impl RelationSource {
         Self {
             name,
             rewrite,
+            rewrite_valid: true,
             restrictions,
         }
+    }
+
+    /// Creates a relation whose wire rewrite was absent.
+    ///
+    /// The compiler deterministically rejects this source as
+    /// [`InvalidRewrite`](crate::ModelErrorCode::InvalidRewrite).
+    #[must_use]
+    pub fn with_invalid_rewrite(
+        name: RelationName,
+        restrictions: Vec<DirectRestrictionSource>,
+    ) -> Self {
+        Self {
+            name,
+            rewrite: RewriteSource::Direct,
+            rewrite_valid: false,
+            restrictions,
+        }
+    }
+
+    /// Returns whether the wire source contained a rewrite alternative.
+    #[must_use]
+    pub const fn has_valid_rewrite(&self) -> bool {
+        self.rewrite_valid
     }
 
     /// Returns the declared relation name.
@@ -301,6 +329,7 @@ impl fmt::Debug for RelationSource {
             .debug_struct("RelationSource")
             .field("name", &self.name)
             .field("rewrite", &self.rewrite)
+            .field("rewrite_valid", &self.rewrite_valid)
             .field("restrictions", &self.restrictions.len())
             .finish_non_exhaustive()
     }
@@ -509,13 +538,32 @@ impl RestrictionKindSource {
 pub struct ConditionSource {
     pub(crate) key: ConditionName,
     pub(crate) definition: ConditionDefinition,
+    pub(crate) parameter_type_errors: Vec<(u32, ConditionParameterTypeError)>,
 }
 
 impl ConditionSource {
     /// Creates a condition source entry.
     #[must_use]
     pub const fn new(key: ConditionName, definition: ConditionDefinition) -> Self {
-        Self { key, definition }
+        Self {
+            key,
+            definition,
+            parameter_type_errors: Vec::new(),
+        }
+    }
+
+    /// Creates a condition source retaining malformed wire parameter-type diagnostics.
+    #[must_use]
+    pub const fn with_parameter_type_errors(
+        key: ConditionName,
+        definition: ConditionDefinition,
+        parameter_type_errors: Vec<(u32, ConditionParameterTypeError)>,
+    ) -> Self {
+        Self {
+            key,
+            definition,
+            parameter_type_errors,
+        }
     }
 
     /// Returns the condition map key.
@@ -537,6 +585,7 @@ impl fmt::Debug for ConditionSource {
             .debug_struct("ConditionSource")
             .field("key", &self.key)
             .field("definition", &self.definition)
+            .field("parameter_type_errors", &self.parameter_type_errors.len())
             .finish_non_exhaustive()
     }
 }

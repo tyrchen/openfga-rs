@@ -2,7 +2,10 @@
 
 use std::fmt;
 
-use openfga_domain::{ConditionReference, RelationshipTuple, SubjectRef, TupleKey};
+use openfga_condition::ConditionContextError;
+use openfga_domain::{
+    ConditionBinding, ConditionReference, ParameterName, RelationshipTuple, SubjectRef, TupleKey,
+};
 use thiserror::Error;
 
 use crate::{
@@ -29,6 +32,7 @@ pub struct TupleValidationError {
     code: &'static str,
     #[source]
     source: Option<ModelLookupError>,
+    condition_context: Option<Box<ConditionContextError>>,
 }
 
 impl TupleValidationError {
@@ -37,6 +41,7 @@ impl TupleValidationError {
             kind,
             code,
             source: None,
+            condition_context: None,
         }
     }
 
@@ -49,6 +54,16 @@ impl TupleValidationError {
             kind,
             code,
             source: Some(source),
+            condition_context: None,
+        }
+    }
+
+    fn condition_context(source: ConditionContextError) -> Self {
+        Self {
+            kind: TupleValidationErrorKind::Relationship,
+            code: "relationship_condition_context_invalid",
+            source: None,
+            condition_context: Some(Box::new(source)),
         }
     }
 
@@ -63,6 +78,21 @@ impl TupleValidationError {
     pub const fn code(&self) -> &'static str {
         self.code
     }
+
+    /// Returns the safely bounded invalid condition parameter, when applicable.
+    #[must_use]
+    pub const fn parameter(&self) -> Option<&ParameterName> {
+        match &self.condition_context {
+            Some(source) => Some(source.parameter()),
+            None => None,
+        }
+    }
+
+    /// Returns the structured condition-context diagnostic, when applicable.
+    #[must_use]
+    pub fn condition_context_error(&self) -> Option<&ConditionContextError> {
+        self.condition_context.as_deref()
+    }
 }
 
 impl fmt::Debug for TupleValidationError {
@@ -72,6 +102,10 @@ impl fmt::Debug for TupleValidationError {
             .field("kind", &self.kind)
             .field("code", &self.code)
             .field("has_source", &self.source.is_some())
+            .field(
+                "condition_context",
+                &self.condition_context.as_ref().map(|_| "[REDACTED]"),
+            )
             .finish()
     }
 }
@@ -87,6 +121,14 @@ impl CompiledModel {
         &self,
         tuple: &TupleKey,
     ) -> Result<RelationId, TupleValidationError> {
+        self.type_id(tuple.object().object_type())
+            .map_err(|source| {
+                TupleValidationError::lookup(
+                    TupleValidationErrorKind::Query,
+                    "query_object_type_missing",
+                    source,
+                )
+            })?;
         let relation = self
             .relation_id(tuple.object().object_type(), tuple.relation())
             .map_err(|source| {
@@ -110,6 +152,14 @@ impl CompiledModel {
         &self,
         tuple: &RelationshipTuple,
     ) -> Result<(), TupleValidationError> {
+        self.type_id(tuple.key().object().object_type())
+            .map_err(|source| {
+                TupleValidationError::lookup(
+                    TupleValidationErrorKind::Relationship,
+                    "relationship_object_type_missing",
+                    source,
+                )
+            })?;
         let relation_id = self
             .relation_id(tuple.key().object().object_type(), tuple.key().relation())
             .map_err(|source| {
@@ -126,14 +176,25 @@ impl CompiledModel {
                 source,
             )
         })?;
-        if self.matches_restriction(tuple, relation.restrictions())? {
-            Ok(())
-        } else {
-            Err(TupleValidationError::new(
-                TupleValidationErrorKind::Relationship,
-                "relationship_tuple_not_permitted",
-            ))
+        self.type_id(tuple.key().subject().subject_type())
+            .map_err(|source| {
+                TupleValidationError::lookup(
+                    TupleValidationErrorKind::Relationship,
+                    "relationship_subject_type_missing",
+                    source,
+                )
+            })?;
+        if let SubjectRef::Userset(userset) = tuple.key().subject() {
+            self.relation_id(userset.object().object_type(), userset.relation())
+                .map_err(|source| {
+                    TupleValidationError::lookup(
+                        TupleValidationErrorKind::Relationship,
+                        "relationship_userset_relation_missing",
+                        source,
+                    )
+                })?;
         }
+        self.validate_relationship_condition(tuple, relation.restrictions())
     }
 
     /// Validates a relationship tuple for durable persistence.
@@ -178,64 +239,110 @@ impl CompiledModel {
         Ok(())
     }
 
-    fn matches_restriction(
+    fn validate_relationship_condition(
         &self,
         tuple: &RelationshipTuple,
         restrictions: &[DirectRestriction],
-    ) -> Result<bool, TupleValidationError> {
-        let Ok(subject_type) = self.type_id(tuple.key().subject().subject_type()) else {
-            return Ok(false);
-        };
-        let class = match tuple.key().subject() {
-            SubjectRef::Object(_) => DirectClass::Object,
-            SubjectRef::TypedWildcard(_) => DirectClass::Wildcard,
-            SubjectRef::Userset(userset) => {
-                let Ok(relation) =
-                    self.relation_id(userset.object().object_type(), userset.relation())
-                else {
-                    return Ok(false);
-                };
-                DirectClass::Userset(relation)
-            }
-            _ => {
-                return Err(TupleValidationError::new(
-                    TupleValidationErrorKind::CompiledModel,
-                    "subject_reference_unsupported",
-                ));
-            }
-        };
-        for restriction in restrictions {
-            if restriction.subject_type() == subject_type
-                && restriction_kind_matches(restriction.kind(), class)
-                && self.condition_requirement_matches(restriction.condition(), tuple.condition())?
-            {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
-    fn condition_requirement_matches(
-        &self,
-        requirement: ConditionRequirement,
-        reference: &ConditionReference,
-    ) -> Result<bool, TupleValidationError> {
-        match (requirement, reference) {
-            (ConditionRequirement::Unconditional, ConditionReference::Unconditional) => Ok(true),
-            (
-                ConditionRequirement::Required(condition_id),
-                ConditionReference::Conditional(binding),
-            ) => self
-                .condition(condition_id)
-                .map(|condition| condition.name() == binding.name())
+    ) -> Result<(), TupleValidationError> {
+        let subject_type =
+            self.type_id(tuple.key().subject().subject_type())
                 .map_err(|source| {
                     TupleValidationError::lookup(
                         TupleValidationErrorKind::CompiledModel,
-                        "restriction_condition_invalid",
+                        "relationship_subject_type_invalid",
+                        source,
+                    )
+                })?;
+        let class = self.relationship_direct_class(tuple.key().subject())?;
+        let matching = restrictions
+            .iter()
+            .filter(|restriction| {
+                restriction.subject_type() == subject_type
+                    && restriction_kind_matches(restriction.kind(), class)
+            })
+            .collect::<Vec<_>>();
+        if matching.is_empty() {
+            return Err(TupleValidationError::new(
+                TupleValidationErrorKind::Relationship,
+                "relationship_tuple_not_permitted",
+            ));
+        }
+        match tuple.condition() {
+            ConditionReference::Unconditional => validate_unconditional(&matching),
+            ConditionReference::Conditional(binding) => {
+                self.validate_conditional(binding, &matching)
+            }
+            _ => Err(TupleValidationError::new(
+                TupleValidationErrorKind::CompiledModel,
+                "subject_condition_unsupported",
+            )),
+        }
+    }
+
+    fn relationship_direct_class(
+        &self,
+        subject: &SubjectRef,
+    ) -> Result<DirectClass, TupleValidationError> {
+        match subject {
+            SubjectRef::Object(_) => Ok(DirectClass::Object),
+            SubjectRef::TypedWildcard(_) => Ok(DirectClass::Wildcard),
+            SubjectRef::Userset(userset) => self
+                .relation_id(userset.object().object_type(), userset.relation())
+                .map(DirectClass::Userset)
+                .map_err(|source| {
+                    TupleValidationError::lookup(
+                        TupleValidationErrorKind::CompiledModel,
+                        "relationship_userset_relation_invalid",
                         source,
                     )
                 }),
-            _ => Ok(false),
+            _ => Err(TupleValidationError::new(
+                TupleValidationErrorKind::CompiledModel,
+                "subject_reference_unsupported",
+            )),
+        }
+    }
+
+    fn validate_conditional(
+        &self,
+        binding: &ConditionBinding,
+        restrictions: &[&DirectRestriction],
+    ) -> Result<(), TupleValidationError> {
+        self.condition_id(binding.name()).map_err(|source| {
+            TupleValidationError::lookup(
+                TupleValidationErrorKind::Relationship,
+                "relationship_condition_undefined",
+                source,
+            )
+        })?;
+        let matched = restrictions
+            .iter()
+            .try_fold(false, |matched, restriction| {
+                let required = match restriction.condition() {
+                    ConditionRequirement::Unconditional => return Ok(matched),
+                    ConditionRequirement::Required(id) => self.condition(id).map_err(|source| {
+                        TupleValidationError::lookup(
+                            TupleValidationErrorKind::CompiledModel,
+                            "restriction_condition_invalid",
+                            source,
+                        )
+                    })?,
+                };
+                if required.name() != binding.name() {
+                    return Ok(matched);
+                }
+                required
+                    .validate_context(binding.context())
+                    .map_err(TupleValidationError::condition_context)?;
+                Ok::<bool, TupleValidationError>(true)
+            })?;
+        if matched {
+            Ok(())
+        } else {
+            Err(TupleValidationError::new(
+                TupleValidationErrorKind::Relationship,
+                "relationship_condition_invalid",
+            ))
         }
     }
 }
@@ -256,6 +363,20 @@ fn restriction_kind_matches(kind: RestrictionKind, class: DirectClass) -> bool {
     ) && match (kind, class) {
         (RestrictionKind::Userset(expected), DirectClass::Userset(actual)) => expected == actual,
         _ => true,
+    }
+}
+
+fn validate_unconditional(restrictions: &[&DirectRestriction]) -> Result<(), TupleValidationError> {
+    if restrictions
+        .iter()
+        .any(|restriction| restriction.condition() == ConditionRequirement::Unconditional)
+    {
+        Ok(())
+    } else {
+        Err(TupleValidationError::new(
+            TupleValidationErrorKind::Relationship,
+            "relationship_condition_missing",
+        ))
     }
 }
 

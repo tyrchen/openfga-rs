@@ -80,6 +80,8 @@ transport:
     windowSeconds: 60
     authenticationAttempts: 20000
     authenticationFailures: 2000
+    globalAuthenticationAttempts: 200000
+    globalAuthenticationFailures: 20000
     administration: 1000
     reads: 10000
     writes: 2000
@@ -105,6 +107,11 @@ shutdown:
 Omit `replicaUrlEnv` when there is no replica. Latency-preferring reads use a configured replica
 only while its replay lag is within `replicaMaxLagMs`; otherwise they conservatively use the
 primary.
+
+Authentication attempt and failure limits apply independently to each direct TCP peer IP. The
+global authentication limits are separate emergency ceilings across all peers. Forwarded client-IP
+headers are deliberately ignored; a trusted reverse proxy must enforce its own original-client
+limits because this service only trusts the socket peer address.
 
 ## Secret inventory
 

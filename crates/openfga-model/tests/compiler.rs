@@ -246,7 +246,8 @@ fn test_should_require_ttu_target_relation_on_every_permitted_type() -> Result<(
 }
 
 #[test]
-fn test_should_accept_computed_cycle_with_concrete_entrypoints() -> Result<(), Box<dyn Error>> {
+fn test_should_reject_computed_cycle_even_with_concrete_entrypoints() -> Result<(), Box<dyn Error>>
+{
     let source = source_model(
         "1.1",
         vec![
@@ -270,11 +271,15 @@ fn test_should_accept_computed_cycle_with_concrete_entrypoints() -> Result<(), B
         Vec::new(),
     )?;
 
-    let model = ModelCompiler::default().compile(&source)?;
-    let admin = model.relation_id(&type_name("account")?, &relation_name("admin")?)?;
-    let member = model.relation_id(&type_name("account")?, &relation_name("member")?)?;
-    assert_eq!(model.recursion_group(admin), model.recursion_group(member));
-    assert!(model.recursion_group(admin).is_some());
+    let Err(errors) = ModelCompiler::default().compile(&source) else {
+        return Err("computed cycle unexpectedly compiled".into());
+    };
+    assert!(
+        errors
+            .errors()
+            .iter()
+            .all(|error| error.code() == ModelErrorCode::ForbiddenComputedCycle)
+    );
     Ok(())
 }
 

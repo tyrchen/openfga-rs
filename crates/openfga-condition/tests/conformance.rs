@@ -3,8 +3,8 @@
 use std::{collections::BTreeMap, error::Error};
 
 use openfga_condition::{
-    CancellationToken, CompileErrorKind, ConditionCompiler, ConditionDefinition, ConditionLimits,
-    EvaluationBudget, EvaluationErrorKind, ParameterType,
+    CancellationToken, CompileErrorKind, ConditionCompiler, ConditionContextErrorKind,
+    ConditionDefinition, ConditionLimits, EvaluationBudget, EvaluationErrorKind, ParameterType,
 };
 use openfga_domain::{ConditionContext, ConditionName, InputLimits, Limit, ParameterName};
 use proptest::proptest;
@@ -101,6 +101,36 @@ fn test_should_type_parameters_and_overlay_tuple_context() -> Result<(), Box<dyn
     )?;
     assert!(outcome.condition_met());
     assert!(outcome.cost() > 0);
+    Ok(())
+}
+
+#[test]
+fn test_should_preserve_condition_context_parameter_diagnostics() -> Result<(), Box<dyn Error>> {
+    let parameters = BTreeMap::from([(ParameterName::try_from("label")?, ParameterType::string())]);
+    let compiled = ConditionCompiler::default().compile(
+        &definition("typed", "label == 'ok'", parameters)?,
+        &ConditionLimits::default(),
+    )?;
+    let limits = InputLimits::default();
+    let invalid = ConditionContext::try_from_json(json!({"label": 1}), &limits)?;
+    let error = compiled
+        .validate_context(&invalid)
+        .err()
+        .ok_or("invalid context type unexpectedly accepted")?;
+    assert_eq!(error.kind(), ConditionContextErrorKind::InvalidParameter);
+    assert_eq!(error.parameter().as_str(), "label");
+    assert_eq!(error.expected_type(), Some("string"));
+    assert_eq!(error.found_type(), Some("float64"));
+
+    let unknown = ConditionContext::try_from_json(json!({"unknown": true}), &limits)?;
+    let error = compiled
+        .validate_context(&unknown)
+        .err()
+        .ok_or("unknown context parameter unexpectedly accepted")?;
+    assert_eq!(error.kind(), ConditionContextErrorKind::UnknownParameter);
+    assert_eq!(error.parameter().as_str(), "unknown");
+    assert_eq!(error.expected_type(), None);
+    assert_eq!(error.found_type(), None);
     Ok(())
 }
 

@@ -18,15 +18,17 @@ mod model;
 mod store;
 mod tuple;
 
-pub use assertion::{AssertionService, AssertionSet};
+pub use assertion::{AssertionService, AssertionSet, ResolvedAssertionModel};
 pub use change::ChangeService;
-pub use check::CheckService;
+pub use check::{CheckService, ResolvedCheckModel};
 pub use clock::{ServiceClock, SystemServiceClock};
-pub use error::{ServiceError, ServiceErrorKind};
+pub use error::{
+    ModelRelationType, ModelSemanticContext, ModelSetOperator, ServiceError, ServiceErrorKind,
+};
 pub use identifier::{
     IdentifierSource, IdentifierSourceError, IdentifierSourceErrorKind, SystemIdentifierSource,
     SystemIdentifierSourceConfig,
 };
 pub use model::{ModelPublication, ModelService};
 pub use store::StoreService;
-pub use tuple::TupleService;
+pub use tuple::{ResolvedTupleWriteModel, TupleContextSizePolicy, TupleService};

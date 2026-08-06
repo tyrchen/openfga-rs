@@ -282,7 +282,10 @@ fn handle_command(state: &mut MemoryState, command: Command, context: &Operation
             name,
             reply,
         } => send(reply, state.rename_store(store_id, name)),
-        Command::DeleteStore { store_id, reply } => send(reply, state.delete_store(store_id)),
+        Command::DeleteStore { store_id, reply } => {
+            state.delete_store(store_id);
+            send(reply, Ok(()));
+        }
         Command::ReadAssertions {
             store_id,
             model_id,

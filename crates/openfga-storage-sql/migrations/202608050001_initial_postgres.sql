@@ -26,7 +26,7 @@ CREATE INDEX stores_active_id_idx
     ON stores (id COLLATE "C") WHERE deleted_at IS NULL;
 
 CREATE TABLE authorization_models (
-    store_id VARCHAR(26) COLLATE "C" NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
+    store_id VARCHAR(26) COLLATE "C" NOT NULL,
     model_id VARCHAR(26) COLLATE "C" NOT NULL,
     schema_version VARCHAR(16) NOT NULL,
     compiler_format_version INTEGER NOT NULL,
@@ -53,7 +53,7 @@ CREATE TABLE assertions (
 );
 
 CREATE TABLE tuples (
-    store_id VARCHAR(26) COLLATE "C" NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
+    store_id VARCHAR(26) COLLATE "C" NOT NULL,
     object_type VARCHAR(254) COLLATE "C" NOT NULL,
     object_id VARCHAR(512) COLLATE "C" NOT NULL,
     relation VARCHAR(50) COLLATE "C" NOT NULL,
@@ -118,7 +118,7 @@ CREATE INDEX tuples_userset_idx ON tuples (
 ) WHERE subject_kind = 1;
 
 CREATE TABLE tuple_changes (
-    store_id VARCHAR(26) COLLATE "C" NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
+    store_id VARCHAR(26) COLLATE "C" NOT NULL,
     change_id VARCHAR(26) COLLATE "C" NOT NULL,
     object_type VARCHAR(254) COLLATE "C" NOT NULL,
     object_id VARCHAR(512) COLLATE "C" NOT NULL,

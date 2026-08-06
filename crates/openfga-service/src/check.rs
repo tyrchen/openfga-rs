@@ -5,12 +5,19 @@ use std::{fmt, sync::Arc};
 use openfga_check::{
     BatchCheckOutcome, CheckBudget, CheckEvaluator, CheckOutcome, DirectCheckEvaluator,
 };
-use openfga_domain::{BatchCheckCommand, CheckCommand, ModelSelection, QueryContext};
+use openfga_domain::{
+    BatchCheckCommand, CheckCommand, ConsistencyPreference, Deadline, ModelSelection, QueryContext,
+    StoreId,
+};
 use openfga_storage::{
     ModelReader, OperationContext, StorageCancellationToken, StoredAuthorizationModel, TupleReader,
 };
 
 use crate::ServiceError;
+
+/// An immutable model selected before hostile Check payload conversion.
+#[derive(Debug)]
+pub struct ResolvedCheckModel(Arc<StoredAuthorizationModel>);
 
 /// Transport-neutral Check and `BatchCheck` orchestration.
 #[derive(Clone)]
@@ -76,11 +83,25 @@ impl CheckService {
         let model = self
             .resolve_model(command.query(), cancellation.clone())
             .await?;
+        self.check_resolved(command, model, cancellation).await
+    }
+
+    /// Evaluates one already-converted command with its preselected immutable model.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed evaluator, cancellation, timeout, or finite-resource failures.
+    pub async fn check_resolved(
+        &self,
+        command: &CheckCommand,
+        model: ResolvedCheckModel,
+        cancellation: StorageCancellationToken,
+    ) -> Result<CheckOutcome, ServiceError> {
         let outcome = self
             .evaluator
             .check(
                 command,
-                Arc::clone(model.compiled()),
+                Arc::clone(model.0.compiled()),
                 Arc::clone(&self.tuples),
                 self.budget,
                 cancellation,
@@ -114,11 +135,26 @@ impl CheckService {
         let model = self
             .resolve_model(command.query(), cancellation.clone())
             .await?;
+        self.batch_check_resolved(command, model, cancellation)
+            .await
+    }
+
+    /// Evaluates one converted batch with its preselected immutable model.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed evaluator, root cancellation, timeout, or finite-resource failures.
+    pub async fn batch_check_resolved(
+        &self,
+        command: &BatchCheckCommand,
+        model: ResolvedCheckModel,
+        cancellation: StorageCancellationToken,
+    ) -> Result<BatchCheckOutcome, ServiceError> {
         let outcome = self
             .evaluator
             .batch_check(
                 command,
-                Arc::clone(model.compiled()),
+                Arc::clone(model.0.compiled()),
                 Arc::clone(&self.tuples),
                 self.budget,
                 cancellation,
@@ -129,28 +165,38 @@ impl CheckService {
         outcome
     }
 
+    /// Resolves an explicit or latest model before Check payload conversion.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed model-resolution, cancellation, timeout, or backend failures.
+    pub async fn resolve_transport_model(
+        &self,
+        store_id: StoreId,
+        selection: ModelSelection,
+        consistency: ConsistencyPreference,
+        deadline: Deadline,
+        cancellation: StorageCancellationToken,
+    ) -> Result<ResolvedCheckModel, ServiceError> {
+        let context = OperationContext::new(consistency, deadline, cancellation);
+        crate::common::resolve_model(self.models.as_ref(), &context, store_id, selection)
+            .await
+            .map(ResolvedCheckModel)
+    }
+
     async fn resolve_model(
         &self,
         query: &QueryContext,
         cancellation: StorageCancellationToken,
-    ) -> Result<Arc<StoredAuthorizationModel>, ServiceError> {
-        let context = OperationContext::new(query.consistency(), query.deadline(), cancellation);
-        context.check()?;
-        let model = match query.model_selection() {
-            ModelSelection::Explicit(model_id) => self
-                .models
-                .read_model(&context, query.store_id(), model_id)
-                .await
-                .map_err(ServiceError::model_storage)?,
-            ModelSelection::Latest => self
-                .models
-                .read_latest_model(&context, query.store_id())
-                .await
-                .map_err(ServiceError::model_storage)?,
-            _ => return Err(ServiceError::unsupported_model_selection()),
-        };
-        context.check()?;
-        Ok(model)
+    ) -> Result<ResolvedCheckModel, ServiceError> {
+        self.resolve_transport_model(
+            query.store_id(),
+            query.model_selection(),
+            query.consistency(),
+            query.deadline(),
+            cancellation,
+        )
+        .await
     }
 }
 

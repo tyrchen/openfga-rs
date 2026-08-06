@@ -12,9 +12,13 @@ rust-version.workspace = true
 pbjson.workspace = true
 pbjson-types.workspace = true
 prost.workspace = true
+prost-reflect.workspace = true
 serde.workspace = true
 tonic.workspace = true
 tonic-prost.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
 
 [lints]
 workspace = true

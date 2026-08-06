@@ -62,7 +62,11 @@ impl ContextString {
     ///
     /// Returns [`ValidationError`] when the UTF-8 value exceeds the per-value limit.
     pub fn new(value: String, limits: &InputLimits) -> Result<Self, ValidationError> {
-        if value.len() > limits.context_string_bytes() {
+        Self::new_with_limit(value, limits.context_string_bytes())
+    }
+
+    fn new_with_limit(value: String, limit: usize) -> Result<Self, ValidationError> {
+        if value.len() > limit {
             return Err(ValidationError::new(
                 "context_string",
                 ValidationReason::TooLarge,
@@ -99,7 +103,11 @@ impl ContextBytes {
     ///
     /// Returns [`ValidationError`] when the value exceeds the per-value limit.
     pub fn new(value: Vec<u8>, limits: &InputLimits) -> Result<Self, ValidationError> {
-        if value.len() > limits.context_string_bytes() {
+        Self::new_with_limit(value, limits.context_string_bytes())
+    }
+
+    fn new_with_limit(value: Vec<u8>, limit: usize) -> Result<Self, ValidationError> {
+        if value.len() > limit {
             return Err(ValidationError::new(
                 "context_bytes",
                 ValidationReason::TooLarge,
@@ -284,7 +292,7 @@ impl ContextValue {
     /// Returns [`ValidationError`] for oversized strings/collections, excessive
     /// nesting, invalid parameter-map keys, or non-finite numbers.
     pub fn try_from_json(value: Value, limits: &InputLimits) -> Result<Self, ValidationError> {
-        convert_json_value(value, limits, 1)
+        convert_json_value(value, limits, 1, limits.context_string_bytes())
     }
 
     fn update_fingerprint(&self, builder: &mut FingerprintBuilder) {
@@ -357,6 +365,7 @@ fn convert_json_value(
     value: Value,
     limits: &InputLimits,
     depth: usize,
+    value_byte_limit: usize,
 ) -> Result<ContextValue, ValidationError> {
     if depth > limits.context_depth() {
         return Err(ValidationError::new(
@@ -372,7 +381,9 @@ fn convert_json_value(
             .ok_or_else(|| ValidationError::new("context_number", ValidationReason::OutOfRange))
             .and_then(FiniteFloat::new)
             .map(ContextValue::Double),
-        Value::String(value) => ContextString::new(value, limits).map(ContextValue::String),
+        Value::String(value) => {
+            ContextString::new_with_limit(value, value_byte_limit).map(ContextValue::String)
+        }
         Value::Array(values) => {
             if values.len() > limits.context_collection_items() {
                 return Err(ValidationError::new(
@@ -385,7 +396,7 @@ fn convert_json_value(
             })?;
             values
                 .into_iter()
-                .map(|value| convert_json_value(value, limits, child_depth))
+                .map(|value| convert_json_value(value, limits, child_depth, value_byte_limit))
                 .collect::<Result<Vec<_>, _>>()
                 .and_then(|values| ContextList::new(values, limits))
                 .map(ContextValue::List)
@@ -403,7 +414,7 @@ fn convert_json_value(
             let mut converted = BTreeMap::new();
             for (key, value) in values {
                 let key = ContextKey::new(key, limits)?;
-                let value = convert_json_value(value, limits, child_depth)?;
+                let value = convert_json_value(value, limits, child_depth, value_byte_limit)?;
                 converted.insert(key, value);
             }
             ContextMap::new(converted, limits).map(ContextValue::Map)
@@ -415,15 +426,24 @@ fn convert_json_value(
 struct ContextStats {
     bytes: usize,
     values: usize,
+    byte_limit: Option<usize>,
 }
 
 impl ContextStats {
-    fn add_bytes(&mut self, bytes: usize, limits: &InputLimits) -> Result<(), ValidationError> {
+    const fn bounded(byte_limit: usize) -> Self {
+        Self {
+            bytes: 0,
+            values: 0,
+            byte_limit: Some(byte_limit),
+        }
+    }
+
+    fn add_bytes(&mut self, bytes: usize) -> Result<(), ValidationError> {
         self.bytes = self
             .bytes
             .checked_add(bytes)
             .ok_or_else(|| ValidationError::new("condition_context", ValidationReason::TooLarge))?;
-        if self.bytes > limits.context_bytes() {
+        if self.byte_limit.is_some_and(|limit| self.bytes > limit) {
             return Err(ValidationError::new(
                 "condition_context",
                 ValidationReason::TooLarge,
@@ -451,6 +471,7 @@ fn validate_context_value(
     depth: usize,
     limits: &InputLimits,
     stats: &mut ContextStats,
+    enforce_value_byte_limit: bool,
 ) -> Result<(), ValidationError> {
     if depth > limits.context_depth() {
         return Err(ValidationError::new(
@@ -461,27 +482,27 @@ fn validate_context_value(
     stats.add_value(limits)?;
     match value {
         ContextValue::Null => Ok(()),
-        ContextValue::Bool(_) => stats.add_bytes(1, limits),
+        ContextValue::Bool(_) => stats.add_bytes(1),
         ContextValue::Int(_) | ContextValue::Uint(_) | ContextValue::Double(_) => {
-            stats.add_bytes(8, limits)
+            stats.add_bytes(8)
         }
         ContextValue::String(value) => {
-            if value.0.len() > limits.context_string_bytes() {
+            if enforce_value_byte_limit && value.0.len() > limits.context_string_bytes() {
                 return Err(ValidationError::new(
                     "context_string",
                     ValidationReason::TooLarge,
                 ));
             }
-            stats.add_bytes(value.0.len(), limits)
+            stats.add_bytes(value.0.len())
         }
         ContextValue::Bytes(value) => {
-            if value.0.len() > limits.context_string_bytes() {
+            if enforce_value_byte_limit && value.0.len() > limits.context_string_bytes() {
                 return Err(ValidationError::new(
                     "context_bytes",
                     ValidationReason::TooLarge,
                 ));
             }
-            stats.add_bytes(value.0.len(), limits)
+            stats.add_bytes(value.0.len())
         }
         ContextValue::List(values) => {
             if values.0.len() > limits.context_collection_items() {
@@ -494,7 +515,13 @@ fn validate_context_value(
                 ValidationError::new("condition_context", ValidationReason::TooDeep)
             })?;
             for value in &values.0 {
-                validate_context_value(value, child_depth, limits, stats)?;
+                validate_context_value(
+                    value,
+                    child_depth,
+                    limits,
+                    stats,
+                    enforce_value_byte_limit,
+                )?;
             }
             Ok(())
         }
@@ -515,8 +542,14 @@ fn validate_context_value(
                         ValidationReason::TooLarge,
                     ));
                 }
-                stats.add_bytes(key.0.len(), limits)?;
-                validate_context_value(value, child_depth, limits, stats)?;
+                stats.add_bytes(key.0.len())?;
+                validate_context_value(
+                    value,
+                    child_depth,
+                    limits,
+                    stats,
+                    enforce_value_byte_limit,
+                )?;
             }
             Ok(())
         }
@@ -541,16 +574,25 @@ impl ConditionContext {
         values: BTreeMap<ParameterName, ContextValue>,
         limits: &InputLimits,
     ) -> Result<Self, ValidationError> {
+        Self::new_with_policy(values, limits, Some(limits.context_bytes()), true)
+    }
+
+    fn new_with_policy(
+        values: BTreeMap<ParameterName, ContextValue>,
+        limits: &InputLimits,
+        byte_limit: Option<usize>,
+        enforce_value_byte_limit: bool,
+    ) -> Result<Self, ValidationError> {
         if values.len() > limits.context_collection_items() {
             return Err(ValidationError::new(
                 "condition_context",
                 ValidationReason::TooManyItems,
             ));
         }
-        let mut stats = ContextStats::default();
+        let mut stats = byte_limit.map_or_else(ContextStats::default, ContextStats::bounded);
         for (name, value) in &values {
-            stats.add_bytes(name.as_str().len(), limits)?;
-            validate_context_value(value, 1, limits, &mut stats)?;
+            stats.add_bytes(name.as_str().len())?;
+            validate_context_value(value, 1, limits, &mut stats, enforce_value_byte_limit)?;
         }
         let fingerprint = fingerprint_context(&values);
         Ok(Self {
@@ -566,6 +608,39 @@ impl ConditionContext {
     /// Returns [`ValidationError`] unless the root is an object with valid
     /// parameter names and the complete tree is within configured limits.
     pub fn try_from_json(value: Value, limits: &InputLimits) -> Result<Self, ValidationError> {
+        Self::try_from_json_with_policy(
+            value,
+            limits,
+            limits.context_string_bytes(),
+            Some(limits.context_bytes()),
+            true,
+        )
+    }
+
+    /// Converts a protobuf context for model-semantic validation before its encoded-size check.
+    ///
+    /// The caller must have already measured and bounded the containing wire message. Aggregate
+    /// and per-value byte enforcement is deferred so condition parameter errors retain protocol
+    /// precedence; depth, key, name, collection, and value-count ceilings remain enforced.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError`] unless the root and non-byte structural limits are valid.
+    pub fn try_from_json_for_wire_semantics(
+        value: Value,
+        limits: &InputLimits,
+        measured_wire_bytes: usize,
+    ) -> Result<Self, ValidationError> {
+        Self::try_from_json_with_policy(value, limits, measured_wire_bytes, None, false)
+    }
+
+    fn try_from_json_with_policy(
+        value: Value,
+        limits: &InputLimits,
+        value_byte_limit: usize,
+        aggregate_byte_limit: Option<usize>,
+        enforce_value_byte_limit: bool,
+    ) -> Result<Self, ValidationError> {
         let Value::Object(values) = value else {
             return Err(ValidationError::new(
                 "condition_context",
@@ -583,10 +658,15 @@ impl ConditionContext {
             let name = ParameterName::parse_with_limits(&name, limits).map_err(|_| {
                 ValidationError::new("context_parameter", ValidationReason::Inconsistent)
             })?;
-            let value = convert_json_value(value, limits, 1)?;
+            let value = convert_json_value(value, limits, 1, value_byte_limit)?;
             converted.insert(name, value);
         }
-        Self::new(converted, limits)
+        Self::new_with_policy(
+            converted,
+            limits,
+            aggregate_byte_limit,
+            enforce_value_byte_limit,
+        )
     }
 
     /// Creates an empty, valid context.

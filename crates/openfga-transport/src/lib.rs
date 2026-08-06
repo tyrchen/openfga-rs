@@ -10,6 +10,7 @@ mod error;
 mod grpc;
 mod http;
 mod pagination;
+mod validation;
 
 pub use admission::{AdmissionPolicy, AdmissionPolicyBuilder, EndpointClass};
 pub use api::OpenFgaApi;

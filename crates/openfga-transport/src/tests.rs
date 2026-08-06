@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     error::Error,
     num::NonZeroU32,
     sync::Arc,
@@ -11,14 +11,19 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode},
 };
-use openfga_auth::{AuthenticationService, AuthorizationPolicy, PresharedKey};
+use openfga_auth::{
+    Action, AuthenticationService, AuthorizationPolicy, PolicyBinding, PresharedKey, StoreScope,
+};
 use openfga_check::CheckBudget;
 use openfga_domain::{
     AuthorizationModelId, FingerprintBuilder, InputLimits, Principal, PrincipalId, PrincipalKind,
     RequestTimeout, StoreId, TokenCodec, TokenKey, TokenKeyId, TokenOperation,
 };
 use openfga_model::ModelCompiler;
-use openfga_proto::openfga::{v1 as pb, v1::open_fga_service_server::OpenFgaService};
+use openfga_proto::openfga::{
+    v1 as pb,
+    v1::{open_fga_service_client::OpenFgaServiceClient, open_fga_service_server::OpenFgaService},
+};
 use openfga_service::{
     AssertionService, ChangeService, CheckService, IdentifierSource, IdentifierSourceError,
     ModelPublication, ModelService, ServiceClock, ServiceError, StoreService, TupleService,
@@ -31,9 +36,12 @@ use openfga_storage::{
 use openfga_storage_memory::{MemoryStorage, MemoryStorageConfig};
 use prost::Message;
 use secrecy::SecretString;
+use tokio::sync::oneshot;
+use tokio_stream::wrappers::TcpListenerStream;
+use tonic::transport::Server;
 use tower::ServiceExt;
 
-use crate::{ApiError, OpenFgaApi, OpenFgaServices, TransportConfig};
+use crate::{AdmissionPolicy, ApiError, OpenFgaApi, OpenFgaServices, TransportConfig};
 
 const STORE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 const MODEL_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAW";
@@ -70,8 +78,85 @@ impl ServiceClock for FixedClock {
     }
 }
 
+#[derive(Debug)]
+struct TestRuntime {
+    storage: Arc<MemoryStorage>,
+    api: OpenFgaApi,
+    principal: Principal,
+    authentication: AuthenticationService,
+}
+
+fn test_runtime(maximum_message_bytes: usize) -> Result<TestRuntime, Box<dyn Error>> {
+    let storage = Arc::new(MemoryStorage::start(MemoryStorageConfig::default())?);
+    let stores: Arc<dyn StoreReader> = storage.clone();
+    let store_writes: Arc<dyn StoreWriter> = storage.clone();
+    let models: Arc<dyn ModelReader> = storage.clone();
+    let model_writes: Arc<dyn ModelWriter> = storage.clone();
+    let tuples: Arc<dyn TupleReader> = storage.clone();
+    let tuple_writes: Arc<dyn TupleWriter> = storage.clone();
+    let assertion_reads: Arc<dyn AssertionReader> = storage.clone();
+    let assertion_writes: Arc<dyn AssertionWriter> = storage.clone();
+    let changes: Arc<dyn ChangeReader> = storage.clone();
+    let identifiers: Arc<dyn IdentifierSource> = Arc::new(FixedIdentifiers {
+        store_id: STORE_ID.parse()?,
+        model_id: MODEL_ID.parse()?,
+    });
+    let limits = InputLimits::default();
+    let principal_id = "transport-test".parse::<PrincipalId>()?;
+    let principal = Principal::new(PrincipalKind::Development, principal_id.clone());
+    let authentication = AuthenticationService::development(principal_id.clone());
+    let api = OpenFgaApi::new(
+        OpenFgaServices::builder()
+            .stores(StoreService::new(
+                stores.clone(),
+                store_writes,
+                identifiers.clone(),
+            ))
+            .models(ModelService::new(
+                stores.clone(),
+                models.clone(),
+                model_writes,
+                ModelPublication::new(identifiers, Arc::new(FixedClock), ModelCompiler::default()),
+            ))
+            .assertions(AssertionService::new(
+                stores.clone(),
+                models.clone(),
+                assertion_reads,
+                assertion_writes,
+                limits.clone(),
+            ))
+            .tuples(TupleService::new(
+                stores.clone(),
+                models.clone(),
+                tuples.clone(),
+                tuple_writes,
+                limits.clone(),
+            ))
+            .changes(ChangeService::new(stores, changes))
+            .checks(CheckService::direct(models, tuples, CheckBudget::default()))
+            .build(),
+        TransportConfig::builder()
+            .limits(limits)
+            .authorization_policy(Arc::new(AuthorizationPolicy::development(principal_id)))
+            .token_codec(Arc::new(TokenCodec::new(
+                TokenKey::new("active".parse::<TokenKeyId>()?, vec![7; 32])?,
+                Vec::new(),
+                &InputLimits::default(),
+            )?))
+            .request_timeout(RequestTimeout::new(Duration::from_secs(5))?)
+            .maximum_message_bytes(maximum_message_bytes)
+            .build(),
+    )?;
+    Ok(TestRuntime {
+        storage,
+        api,
+        principal,
+        authentication,
+    })
+}
+
 #[test]
-fn test_should_match_protocol_json_golden_and_reject_unknown_fields() -> Result<(), Box<dyn Error>>
+fn test_should_match_protocol_json_golden_and_ignore_unknown_fields() -> Result<(), Box<dyn Error>>
 {
     let request = pb::CheckRequest {
         store_id: STORE_ID.to_owned(),
@@ -100,7 +185,10 @@ fn test_should_match_protocol_json_golden_and_reject_unknown_fields() -> Result<
         b"\x0a\x1a01ARZ3NDEKTSV4RRFFQ69G5FAV\x12\x25\x0a\x09user:anne\x12\x06viewer\x1a\x10document:roadmap\x22\x1a01ARZ3NDEKTSV4RRFFQ69G5FAW\x38\xc8\x01"
             .to_vec(),
     );
-    assert!(serde_json::from_str::<pb::CheckRequest>("{\"unknown\":true}").is_err());
+    assert_eq!(
+        serde_json::from_str::<pb::CheckRequest>("{\"unknown\":true}")?,
+        pb::CheckRequest::default(),
+    );
     Ok(())
 }
 
@@ -109,10 +197,7 @@ fn test_should_map_errors_without_exposing_internal_diagnostics() {
     let error = ApiError::internal();
     let status = tonic::Status::from(error);
     assert_eq!(status.code(), tonic::Code::Internal);
-    assert_eq!(
-        status.message(),
-        "internal_error: an internal error occurred"
-    );
+    assert_eq!(status.message(), "an internal error occurred");
 
     for (kind, http, grpc) in [
         (
@@ -128,7 +213,7 @@ fn test_should_map_errors_without_exposing_internal_diagnostics() {
         (
             StorageErrorKind::InvalidContinuation,
             StatusCode::BAD_REQUEST,
-            tonic::Code::InvalidArgument,
+            tonic::Code::Unknown,
         ),
         (
             StorageErrorKind::ResourceExhausted,
@@ -252,7 +337,7 @@ fn test_should_preserve_field_specific_tuple_validation_reasons() {
 
     let user_error =
         super::convert::tuple_key("document:roadmap", "viewer", "invalid-user", &limits).err();
-    assert!(matches!(user_error, Some(error) if error.code() == "invalid_user"));
+    assert!(matches!(user_error, Some(error) if error.code() == "validation_error"));
 }
 
 #[test]
@@ -264,6 +349,852 @@ fn test_should_cancel_in_flight_work_when_request_guard_drops() {
 }
 
 #[tokio::test]
+async fn test_should_match_pinned_model_and_write_error_semantics() -> Result<(), Box<dyn Error>> {
+    let TestRuntime {
+        storage,
+        api,
+        principal,
+        authentication,
+    } = test_runtime(300_000)?;
+
+    let mut expired = authenticated_request(
+        &principal,
+        pb::WriteAuthorizationModelRequest {
+            store_id: STORE_ID.to_owned(),
+            schema_version: String::new(),
+            type_definitions: Vec::new(),
+            conditions: HashMap::new(),
+        },
+    );
+    expired.set_timeout(Duration::ZERO);
+    let deadline = OpenFgaService::write_authorization_model(&api, expired)
+        .await
+        .err()
+        .ok_or("expired invalid gRPC request unexpectedly succeeded")?;
+    assert_eq!(deadline.code(), tonic::Code::DeadlineExceeded);
+
+    assert_missing_model_precedence(&api, &principal).await?;
+    assert_invalid_model_diagnostics(&api, &principal).await?;
+    assert_model_size_limit(&api, &principal).await?;
+
+    api.write_authorization_model(&principal, conditioned_model_request())
+        .await?;
+    assert_tuple_context_and_conflicts(&api, &principal).await?;
+    assert_assertion_size_limit(&api, &principal).await?;
+
+    drop(authentication);
+    drop(api);
+    let mut storage = Arc::try_unwrap(storage).map_err(|_| "storage references remain")?;
+    storage.stop().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_should_authorize_before_admission_and_validation_on_both_transports()
+-> Result<(), Box<dyn Error>> {
+    let TestRuntime {
+        storage,
+        mut api,
+        principal,
+        authentication,
+    } = test_runtime(1_024)?;
+    api.config.authorization_policy = Arc::new(AuthorizationPolicy::new(vec![PolicyBinding::new(
+        principal.id().clone(),
+        BTreeSet::from([Action::WriteAuthorizationModel]),
+        StoreScope::Stores(BTreeSet::from([MODEL_ID.parse()?])),
+    )]));
+    api.admission = crate::admission::AdmissionControl::new(
+        AdmissionPolicy::builder()
+            .administration(NonZeroU32::MIN)
+            .reads(NonZeroU32::MIN)
+            .writes(NonZeroU32::MIN)
+            .checks(NonZeroU32::MIN)
+            .enumeration(NonZeroU32::MIN)
+            .build(),
+    )?;
+
+    let router = crate::http_router(api.clone(), authentication.clone());
+    let mut saturated = Vec::with_capacity(api.config.maximum_concurrency);
+    for _ in 0..api.config.maximum_concurrency {
+        saturated.push(api.acquire_endpoint_permit()?);
+    }
+    for _ in 0..2 {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::post(format!("/stores/{STORE_ID}/authorization-models"))
+                    .header("content-type", "application/json")
+                    .body(Body::from("not-json"))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+    let malformed_store = router
+        .oneshot(
+            Request::post("/stores/short/authorization-models")
+                .header("content-type", "application/json")
+                .body(Body::from("not-json"))?,
+        )
+        .await?;
+    assert_eq!(malformed_store.status(), StatusCode::FORBIDDEN);
+
+    for _ in 0..2 {
+        let error = OpenFgaService::write_authorization_model(
+            &api,
+            authenticated_request(
+                &principal,
+                pb::WriteAuthorizationModelRequest {
+                    store_id: STORE_ID.to_owned(),
+                    schema_version: String::new(),
+                    type_definitions: Vec::new(),
+                    conditions: HashMap::new(),
+                },
+            ),
+        )
+        .await
+        .err()
+        .ok_or("forbidden gRPC request unexpectedly succeeded")?;
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+    }
+
+    drop(saturated);
+    drop(authentication);
+    drop(api);
+    let mut storage = Arc::try_unwrap(storage).map_err(|_| "storage references remain")?;
+    storage.stop().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_should_load_shed_only_after_authorization_on_both_transports()
+-> Result<(), Box<dyn Error>> {
+    let TestRuntime {
+        storage,
+        api,
+        principal,
+        authentication,
+    } = test_runtime(1_024)?;
+    let mut saturated = Vec::with_capacity(api.config.maximum_concurrency);
+    for _ in 0..api.config.maximum_concurrency {
+        saturated.push(api.acquire_endpoint_permit()?);
+    }
+
+    let router = crate::http_router(api.clone(), authentication.clone());
+    let response = router
+        .oneshot(
+            Request::post(format!("/stores/{STORE_ID}/authorization-models"))
+                .header("content-type", "application/json")
+                .body(Body::from("not-json"))?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    let error = OpenFgaService::write_authorization_model(
+        &api,
+        authenticated_request(
+            &principal,
+            pb::WriteAuthorizationModelRequest {
+                store_id: STORE_ID.to_owned(),
+                schema_version: String::new(),
+                type_definitions: Vec::new(),
+                conditions: HashMap::new(),
+            },
+        ),
+    )
+    .await
+    .err()
+    .ok_or("saturated authorized gRPC request unexpectedly succeeded")?;
+    assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+
+    drop(saturated);
+    drop(authentication);
+    drop(api);
+    let mut storage = Arc::try_unwrap(storage).map_err(|_| "storage references remain")?;
+    storage.stop().await?;
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the cross-operation precedence matrix is kept together so its ordered failures \
+              remain auditable"
+)]
+async fn assert_missing_model_precedence(
+    api: &OpenFgaApi,
+    principal: &Principal,
+) -> Result<(), Box<dyn Error>> {
+    let latest = api
+        .write(
+            principal,
+            pb::WriteRequest {
+                store_id: STORE_ID.to_owned(),
+                writes: Some(pb::WriteRequestWrites {
+                    tuple_keys: vec![relationship_tuple()],
+                    on_duplicate: String::new(),
+                }),
+                deletes: None,
+                authorization_model_id: String::new(),
+            },
+        )
+        .await
+        .err()
+        .ok_or("write without a model unexpectedly succeeded")?;
+    assert_eq!(latest.code(), "latest_authorization_model_not_found");
+    assert_eq!(
+        latest.to_string(),
+        format!("No authorization models found for store '{STORE_ID}'"),
+    );
+
+    let explicit = api
+        .write(
+            principal,
+            pb::WriteRequest {
+                store_id: STORE_ID.to_owned(),
+                writes: None,
+                deletes: Some(pb::WriteRequestDeletes {
+                    tuple_keys: vec![pb::TupleKeyWithoutCondition {
+                        user: "user:anne".to_owned(),
+                        relation: "viewer".to_owned(),
+                        object: "document:roadmap".to_owned(),
+                    }],
+                    on_missing: String::new(),
+                }),
+                authorization_model_id: MODEL_ID.to_owned(),
+            },
+        )
+        .await
+        .err()
+        .ok_or("delete without a model unexpectedly succeeded")?;
+    assert_eq!(explicit.code(), "authorization_model_not_found");
+    assert_eq!(
+        explicit.to_string(),
+        format!("Authorization Model '{MODEL_ID}' not found"),
+    );
+
+    for request in [
+        pb::WriteRequest {
+            store_id: STORE_ID.to_owned(),
+            writes: Some(pb::WriteRequestWrites {
+                tuple_keys: vec![pb::TupleKey {
+                    user: "bad".to_owned(),
+                    relation: "viewer".to_owned(),
+                    object: "document:roadmap".to_owned(),
+                    condition: None,
+                }],
+                on_duplicate: String::new(),
+            }),
+            deletes: None,
+            authorization_model_id: MODEL_ID.to_owned(),
+        },
+        pb::WriteRequest {
+            store_id: STORE_ID.to_owned(),
+            writes: None,
+            deletes: None,
+            authorization_model_id: MODEL_ID.to_owned(),
+        },
+    ] {
+        let error = api
+            .write(principal, request)
+            .await
+            .err()
+            .ok_or("write with a missing model unexpectedly succeeded")?;
+        assert_eq!(error.code(), "authorization_model_not_found");
+        assert_eq!(
+            error.to_string(),
+            format!("Authorization Model '{MODEL_ID}' not found"),
+        );
+    }
+    let invalid_tuple = pb::CheckRequestTupleKey {
+        user: "xx".to_owned(),
+        relation: "viewer".to_owned(),
+        object: "xx".to_owned(),
+    };
+    let check_error = api
+        .check(
+            principal,
+            pb::CheckRequest {
+                store_id: STORE_ID.to_owned(),
+                tuple_key: Some(invalid_tuple.clone()),
+                contextual_tuples: None,
+                authorization_model_id: MODEL_ID.to_owned(),
+                trace: false,
+                context: None,
+                consistency: 0,
+            },
+        )
+        .await
+        .err()
+        .ok_or("invalid Check with a missing model unexpectedly succeeded")?;
+    assert_eq!(check_error.code(), "authorization_model_not_found");
+    let batch_error = api
+        .batch_check(
+            principal,
+            pb::BatchCheckRequest {
+                store_id: STORE_ID.to_owned(),
+                checks: vec![pb::BatchCheckItem {
+                    tuple_key: Some(invalid_tuple),
+                    contextual_tuples: None,
+                    context: None,
+                    correlation_id: "missing-model".to_owned(),
+                }],
+                authorization_model_id: MODEL_ID.to_owned(),
+                consistency: 0,
+            },
+        )
+        .await
+        .err()
+        .ok_or("invalid BatchCheck with a missing model unexpectedly succeeded")?;
+    assert_eq!(batch_error.code(), "authorization_model_not_found");
+    let assertion_error = api
+        .write_assertions(
+            principal,
+            pb::WriteAssertionsRequest {
+                store_id: STORE_ID.to_owned(),
+                authorization_model_id: MODEL_ID.to_owned(),
+                assertions: vec![pb::Assertion {
+                    tuple_key: Some(pb::AssertionTupleKey {
+                        user: "xx".to_owned(),
+                        relation: "viewer".to_owned(),
+                        object: "xx".to_owned(),
+                    }),
+                    expectation: true,
+                    contextual_tuples: Vec::new(),
+                    context: None,
+                }],
+            },
+        )
+        .await
+        .err()
+        .ok_or("invalid assertions with a missing model unexpectedly succeeded")?;
+    assert_eq!(assertion_error.code(), "authorization_model_not_found");
+    Ok(())
+}
+
+async fn assert_invalid_model_diagnostics(
+    api: &OpenFgaApi,
+    principal: &Principal,
+) -> Result<(), Box<dyn Error>> {
+    for (request, expected) in invalid_model_cases() {
+        let error = api
+            .write_authorization_model(principal, request)
+            .await
+            .err()
+            .ok_or("invalid model unexpectedly succeeded")?;
+        assert_eq!(error.code(), "invalid_authorization_model");
+        assert_eq!(error.to_string(), expected);
+    }
+    Ok(())
+}
+
+async fn assert_model_size_limit(
+    api: &OpenFgaApi,
+    principal: &Principal,
+) -> Result<(), Box<dyn Error>> {
+    let mut request = model_request();
+    let relations = (0..20_000)
+        .map(|index| {
+            (
+                format!("relation{index}"),
+                pb::Userset {
+                    userset: Some(pb::userset::Userset::This(pb::DirectUserset {})),
+                },
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    request.type_definitions.push(pb::TypeDefinition {
+        r#type: "oversized".to_owned(),
+        relations,
+        metadata: None,
+    });
+    let actual = request.encoded_len();
+    let error = api
+        .write_authorization_model(principal, request)
+        .await
+        .err()
+        .ok_or("oversized model unexpectedly succeeded")?;
+    assert_eq!(error.code(), "exceeded_entity_limit");
+    assert_eq!(
+        error.to_string(),
+        format!("model exceeds size limit: {actual} bytes vs 262144 bytes"),
+    );
+
+    let mut too_many = model_request();
+    too_many.type_definitions = (0..101)
+        .map(|index| pb::TypeDefinition {
+            r#type: format!("type{index}"),
+            relations: HashMap::new(),
+            metadata: None,
+        })
+        .collect();
+    let error = api
+        .write_authorization_model(principal, too_many)
+        .await
+        .err()
+        .ok_or("authorization model type limit unexpectedly succeeded")?;
+    assert_eq!(error.code(), "exceeded_entity_limit");
+    assert_eq!(
+        error.to_string(),
+        "number of type definitions in an authorization model exceeds the allowed limit of 100",
+    );
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the pinned tuple compatibility scenario preserves request-ordered state across size \
+              and conflict cases"
+)]
+async fn assert_tuple_context_and_conflicts(
+    api: &OpenFgaApi,
+    principal: &Principal,
+) -> Result<(), Box<dyn Error>> {
+    let mut large_check = check_request();
+    large_check.context = Some(json_struct(serde_json::json!({
+        "x": "a".repeat(40_000),
+    }))?);
+    api.check(principal, large_check).await?;
+
+    let batch = api
+        .batch_check(
+            principal,
+            pb::BatchCheckRequest {
+                store_id: STORE_ID.to_owned(),
+                checks: vec![
+                    pb::BatchCheckItem {
+                        tuple_key: check_request().tuple_key,
+                        contextual_tuples: None,
+                        context: None,
+                        correlation_id: "valid".to_owned(),
+                    },
+                    pb::BatchCheckItem {
+                        tuple_key: Some(pb::CheckRequestTupleKey {
+                            user: "xx".to_owned(),
+                            relation: "viewer".to_owned(),
+                            object: "xx".to_owned(),
+                        }),
+                        contextual_tuples: None,
+                        context: None,
+                        correlation_id: "invalid".to_owned(),
+                    },
+                    pb::BatchCheckItem {
+                        tuple_key: check_request().tuple_key,
+                        contextual_tuples: Some(pb::ContextualTupleKeys {
+                            tuple_keys: vec![pb::TupleKey {
+                                user: "user:anne".to_owned(),
+                                relation: "viewer".to_owned(),
+                                object: "document:contextual".to_owned(),
+                                condition: Some(pb::RelationshipCondition {
+                                    name: "::".to_owned(),
+                                    context: None,
+                                }),
+                            }],
+                        }),
+                        context: None,
+                        correlation_id: "invalid-condition".to_owned(),
+                    },
+                ],
+                authorization_model_id: MODEL_ID.to_owned(),
+                consistency: 0,
+            },
+        )
+        .await?;
+    assert!(matches!(
+        batch
+            .result
+            .get("valid")
+            .and_then(|result| result.check_result.as_ref()),
+        Some(pb::batch_check_single_result::CheckResult::Allowed(_)),
+    ));
+    let invalid = batch
+        .result
+        .get("invalid")
+        .and_then(|result| result.check_result.as_ref())
+        .and_then(|result| match result {
+            pb::batch_check_single_result::CheckResult::Error(error) => Some(error),
+            pb::batch_check_single_result::CheckResult::Allowed(_) => None,
+        })
+        .ok_or("invalid BatchCheck item did not return an item-local error")?;
+    assert_eq!(
+        invalid.message,
+        "invalid tuple: the 'user' field is malformed"
+    );
+    assert!(matches!(
+        invalid.code,
+        Some(pb::check_error::Code::InputError(code))
+            if code == pb::ErrorCode::InvalidTuple as i32
+    ));
+    let invalid_condition = batch
+        .result
+        .get("invalid-condition")
+        .and_then(|result| result.check_result.as_ref())
+        .and_then(|result| match result {
+            pb::batch_check_single_result::CheckResult::Error(error) => Some(error),
+            pb::batch_check_single_result::CheckResult::Allowed(_) => None,
+        })
+        .ok_or("invalid contextual condition did not return an item-local error")?;
+    assert_eq!(
+        invalid_condition.message,
+        "invalid tuple: Invalid tuple 'document:contextual#viewer@user:anne (condition ::)'. \
+         Reason: undefined condition",
+    );
+    assert!(matches!(
+        invalid_condition.code,
+        Some(pb::check_error::Code::InputError(code))
+            if code == pb::ErrorCode::InvalidTuple as i32
+    ));
+
+    let combined_context = json_struct(serde_json::json!({"x": "a".repeat(32_766)}))?;
+    let mut semantically_invalid = relationship_tuple();
+    semantically_invalid.condition = Some(pb::RelationshipCondition {
+        name: "c2".to_owned(),
+        context: Some(combined_context),
+    });
+    let error = api
+        .write(
+            principal,
+            write_request(semantically_invalid, String::new()),
+        )
+        .await
+        .err()
+        .ok_or("invalid oversized condition context unexpectedly succeeded")?;
+    assert_eq!(error.code(), "validation_error");
+    assert_eq!(
+        error.to_string(),
+        "Invalid tuple 'document:roadmap#viewer@user:anne (condition c2)'. Reason: parameter type \
+         error on condition 'c2' - no parameters defined for the condition",
+    );
+
+    let mut unknown_parameter = relationship_tuple();
+    unknown_parameter.condition = Some(pb::RelationshipCondition {
+        name: "c1".to_owned(),
+        context: Some(json_struct(serde_json::json!({"unknownparam": "bad"}))?),
+    });
+    let error = api
+        .write(principal, write_request(unknown_parameter, String::new()))
+        .await
+        .err()
+        .ok_or("unknown condition context parameter unexpectedly succeeded")?;
+    assert_eq!(error.code(), "validation_error");
+    assert_eq!(
+        error.to_string(),
+        "Invalid tuple 'document:roadmap#viewer@user:anne (condition c1)'. Reason: found invalid \
+         context parameter: unknownparam",
+    );
+
+    let mut oversized = relationship_tuple();
+    let context = json_struct(serde_json::json!({"x": "a".repeat(32_766)}))?;
+    let context_size = context.encoded_len();
+    oversized.condition = Some(pb::RelationshipCondition {
+        name: "c1".to_owned(),
+        context: Some(context),
+    });
+    let error = api
+        .write(principal, write_request(oversized, String::new()))
+        .await
+        .err()
+        .ok_or("oversized tuple condition context unexpectedly succeeded")?;
+    assert_eq!(error.code(), "validation_error");
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "Invalid tuple 'document:roadmap#viewer@user:anne (condition c1)'. Reason: condition \
+             context size limit exceeded: {context_size} bytes exceeds 32768 bytes"
+        ),
+    );
+
+    api.write(principal, write_request(conditioned_tuple(), String::new()))
+        .await?;
+    let duplicate = api
+        .write(principal, write_request(conditioned_tuple(), String::new()))
+        .await
+        .err()
+        .ok_or("duplicate persisted tuple unexpectedly succeeded")?;
+    assert_eq!(duplicate.code(), "write_failed_due_to_invalid_input");
+    assert_eq!(
+        duplicate.to_string(),
+        "cannot write a tuple which already exists: user: 'user:anne', relation: 'viewer', \
+         object: 'document:roadmap': tuple to be written already existed or the tuple to be \
+         deleted did not exist",
+    );
+
+    let missing = api
+        .write(principal, delete_request("document:missing", String::new()))
+        .await
+        .err()
+        .ok_or("missing tuple delete unexpectedly succeeded")?;
+    assert_eq!(missing.code(), "write_failed_due_to_invalid_input");
+    assert_eq!(
+        missing.to_string(),
+        "cannot delete a tuple which does not exist: user: 'user:anne', relation: 'viewer', \
+         object: 'document:missing': tuple to be written already existed or the tuple to be \
+         deleted did not exist",
+    );
+
+    let strict_delete = api
+        .write(
+            principal,
+            pb::WriteRequest {
+                store_id: STORE_ID.to_owned(),
+                writes: None,
+                deletes: Some(pb::WriteRequestDeletes {
+                    tuple_keys: vec![pb::TupleKeyWithoutCondition {
+                        user: "user:anne".to_owned(),
+                        relation: String::new(),
+                        object: "bad".to_owned(),
+                    }],
+                    on_missing: "ignore".to_owned(),
+                }),
+                authorization_model_id: MODEL_ID.to_owned(),
+            },
+        )
+        .await
+        .err()
+        .ok_or("security-normalized malformed delete unexpectedly succeeded")?;
+    assert_eq!(strict_delete.code(), "object_invalid_pattern");
+    assert_eq!(strict_delete.to_string(), "object has an invalid format");
+
+    let ordered_missing = api
+        .write(
+            principal,
+            pb::WriteRequest {
+                store_id: STORE_ID.to_owned(),
+                writes: None,
+                deletes: Some(pb::WriteRequestDeletes {
+                    tuple_keys: vec![delete_tuple("document:z"), delete_tuple("document:a")],
+                    on_missing: String::new(),
+                }),
+                authorization_model_id: MODEL_ID.to_owned(),
+            },
+        )
+        .await
+        .err()
+        .ok_or("ordered missing deletes unexpectedly succeeded")?;
+    assert!(ordered_missing.to_string().contains("object: 'document:z'"));
+
+    let ordered_writes = vec![
+        conditioned_tuple_for("document:z"),
+        conditioned_tuple_for("document:a"),
+    ];
+    api.write(
+        principal,
+        pb::WriteRequest {
+            store_id: STORE_ID.to_owned(),
+            writes: Some(pb::WriteRequestWrites {
+                tuple_keys: ordered_writes.clone(),
+                on_duplicate: String::new(),
+            }),
+            deletes: None,
+            authorization_model_id: MODEL_ID.to_owned(),
+        },
+    )
+    .await?;
+    let ordered_duplicate = api
+        .write(
+            principal,
+            pb::WriteRequest {
+                store_id: STORE_ID.to_owned(),
+                writes: Some(pb::WriteRequestWrites {
+                    tuple_keys: ordered_writes,
+                    on_duplicate: String::new(),
+                }),
+                deletes: None,
+                authorization_model_id: MODEL_ID.to_owned(),
+            },
+        )
+        .await
+        .err()
+        .ok_or("ordered duplicate writes unexpectedly succeeded")?;
+    assert!(
+        ordered_duplicate
+            .to_string()
+            .contains("object: 'document:z'"),
+    );
+
+    api.write(
+        principal,
+        write_request(conditioned_tuple(), "ignore".to_owned()),
+    )
+    .await?;
+    let mut conflicting_condition = conditioned_tuple();
+    conflicting_condition.condition = Some(pb::RelationshipCondition {
+        name: "c2".to_owned(),
+        context: None,
+    });
+    let conflict = api
+        .write(
+            principal,
+            write_request(conflicting_condition, "ignore".to_owned()),
+        )
+        .await
+        .err()
+        .ok_or("ignore accepted a different persisted tuple condition")?;
+    assert_eq!(conflict.code(), "Aborted");
+    assert_eq!(
+        conflict.to_string(),
+        "transactional write failed due to conflict",
+    );
+    let mut conflicting_context = conditioned_tuple();
+    conflicting_context.condition = Some(pb::RelationshipCondition {
+        name: "c1".to_owned(),
+        context: Some(json_struct(serde_json::json!({"x": "different"}))?),
+    });
+    let conflict = api
+        .write(
+            principal,
+            write_request(conflicting_context, "ignore".to_owned()),
+        )
+        .await
+        .err()
+        .ok_or("ignore accepted different persisted tuple condition context")?;
+    assert_eq!(conflict.code(), "Aborted");
+    assert_eq!(
+        conflict.to_string(),
+        "transactional write failed due to conflict",
+    );
+    api.write(
+        principal,
+        delete_request("document:missing", "ignore".to_owned()),
+    )
+    .await?;
+
+    let hostile_option = "x".repeat(257);
+    let normalized = api
+        .write(
+            principal,
+            write_request(conditioned_tuple(), hostile_option.clone()),
+        )
+        .await
+        .err()
+        .ok_or("oversized conflict option unexpectedly succeeded")?;
+    assert_eq!(normalized.code(), "validation_error");
+    assert_eq!(normalized.to_string(), "the request is invalid");
+    assert!(!normalized.to_string().contains(&hostile_option));
+
+    let option_order = api
+        .write(
+            principal,
+            pb::WriteRequest {
+                store_id: STORE_ID.to_owned(),
+                writes: Some(pb::WriteRequestWrites {
+                    tuple_keys: vec![conditioned_tuple()],
+                    on_duplicate: "invalid-first".to_owned(),
+                }),
+                deletes: Some(pb::WriteRequestDeletes {
+                    tuple_keys: vec![pb::TupleKeyWithoutCondition {
+                        user: "user:anne".to_owned(),
+                        relation: "viewer".to_owned(),
+                        object: "document:missing".to_owned(),
+                    }],
+                    on_missing: "invalid-second".to_owned(),
+                }),
+                authorization_model_id: MODEL_ID.to_owned(),
+            },
+        )
+        .await
+        .err()
+        .ok_or("invalid conflict options unexpectedly succeeded")?;
+    assert_eq!(option_order.code(), "validation_error");
+    assert_eq!(
+        option_order.to_string(),
+        "invalid on_duplicate option: invalid-first",
+    );
+    Ok(())
+}
+
+async fn assert_assertion_size_limit(
+    api: &OpenFgaApi,
+    principal: &Principal,
+) -> Result<(), Box<dyn Error>> {
+    let large_context = json_struct(serde_json::json!({"x": "a".repeat(40_000)}))?;
+    let accepted = pb::Assertion {
+        tuple_key: Some(pb::AssertionTupleKey {
+            object: "document:roadmap".to_owned(),
+            relation: "viewer".to_owned(),
+            user: "user:anne".to_owned(),
+        }),
+        expectation: true,
+        contextual_tuples: Vec::new(),
+        context: Some(large_context),
+    };
+    assert!(accepted.encoded_len() > 32_768);
+    assert!(accepted.encoded_len() < 64_000);
+    api.write_assertions(
+        principal,
+        pb::WriteAssertionsRequest {
+            store_id: STORE_ID.to_owned(),
+            authorization_model_id: MODEL_ID.to_owned(),
+            assertions: vec![accepted],
+        },
+    )
+    .await?;
+
+    let mut invalid_contextual_tuple = relationship_tuple();
+    invalid_contextual_tuple.condition = Some(pb::RelationshipCondition {
+        name: "c2".to_owned(),
+        context: Some(json_struct(serde_json::json!({"x": "bad"}))?),
+    });
+    let error = api
+        .write_assertions(
+            principal,
+            pb::WriteAssertionsRequest {
+                store_id: STORE_ID.to_owned(),
+                authorization_model_id: MODEL_ID.to_owned(),
+                assertions: vec![pb::Assertion {
+                    tuple_key: Some(pb::AssertionTupleKey {
+                        object: "document:roadmap".to_owned(),
+                        relation: "viewer".to_owned(),
+                        user: "user:anne".to_owned(),
+                    }),
+                    expectation: true,
+                    contextual_tuples: vec![invalid_contextual_tuple],
+                    context: None,
+                }],
+            },
+        )
+        .await
+        .err()
+        .ok_or("invalid zero-parameter assertion context unexpectedly succeeded")?;
+    assert_eq!(error.code(), "validation_error");
+    assert_eq!(
+        error.to_string(),
+        "Invalid tuple 'document:roadmap#viewer@user:anne (condition c2)'. Reason: parameter type \
+         error on condition 'c2' - no parameters defined for the condition",
+    );
+
+    let context = json_struct(serde_json::json!({"x": "a".repeat(1_000)}))?;
+    let assertion = pb::Assertion {
+        tuple_key: Some(pb::AssertionTupleKey {
+            object: "document:roadmap".to_owned(),
+            relation: "viewer".to_owned(),
+            user: "user:anne".to_owned(),
+        }),
+        expectation: true,
+        contextual_tuples: Vec::new(),
+        context: Some(context),
+    };
+    let assertions = vec![assertion; 70];
+    assert!(assertions.iter().map(Message::encoded_len).sum::<usize>() > 64_000,);
+    let error = api
+        .write_assertions(
+            principal,
+            pb::WriteAssertionsRequest {
+                store_id: STORE_ID.to_owned(),
+                authorization_model_id: MODEL_ID.to_owned(),
+                assertions,
+            },
+        )
+        .await
+        .err()
+        .ok_or("oversized assertions unexpectedly succeeded")?;
+    assert_eq!(error.code(), "exceeded_entity_limit");
+    assert_eq!(
+        error.to_string(),
+        "The number of bytes exceeds the allowed limit of 64000",
+    );
+    Ok(())
+}
+
+#[tokio::test]
 #[allow(
     clippy::too_many_lines,
     reason = "the end-to-end protocol flow intentionally keeps ordered cross-endpoint state \
@@ -271,73 +1202,14 @@ fn test_should_cancel_in_flight_work_when_request_guard_drops() {
 )]
 async fn test_should_execute_every_m2_use_case_through_shared_wire_adapter()
 -> Result<(), Box<dyn Error>> {
-    let storage = Arc::new(MemoryStorage::start(MemoryStorageConfig::default())?);
-    let stores: Arc<dyn StoreReader> = storage.clone();
-    let store_writes: Arc<dyn StoreWriter> = storage.clone();
-    let models: Arc<dyn ModelReader> = storage.clone();
-    let model_writes: Arc<dyn ModelWriter> = storage.clone();
-    let tuples: Arc<dyn TupleReader> = storage.clone();
-    let tuple_writes: Arc<dyn TupleWriter> = storage.clone();
-    let assertion_reads: Arc<dyn AssertionReader> = storage.clone();
-    let assertion_writes: Arc<dyn AssertionWriter> = storage.clone();
-    let changes: Arc<dyn ChangeReader> = storage.clone();
-    let identifiers: Arc<dyn IdentifierSource> = Arc::new(FixedIdentifiers {
-        store_id: STORE_ID.parse()?,
-        model_id: MODEL_ID.parse()?,
-    });
-    let limits = InputLimits::default();
-    let principal_id = "transport-test".parse::<PrincipalId>()?;
-    let principal = Principal::new(PrincipalKind::Development, principal_id.clone());
-    let authentication = AuthenticationService::development(principal_id.clone());
+    let TestRuntime {
+        storage,
+        api,
+        principal,
+        authentication,
+    } = test_runtime(1_024)?;
 
-    let api = OpenFgaApi::new(
-        OpenFgaServices::builder()
-            .stores(StoreService::new(
-                stores.clone(),
-                store_writes.clone(),
-                identifiers.clone(),
-            ))
-            .models(ModelService::new(
-                stores.clone(),
-                models.clone(),
-                model_writes.clone(),
-                ModelPublication::new(identifiers, Arc::new(FixedClock), ModelCompiler::default()),
-            ))
-            .assertions(AssertionService::new(
-                stores.clone(),
-                models.clone(),
-                assertion_reads.clone(),
-                assertion_writes.clone(),
-                limits.clone(),
-            ))
-            .tuples(TupleService::new(
-                stores.clone(),
-                models.clone(),
-                tuples.clone(),
-                tuple_writes.clone(),
-                limits.clone(),
-            ))
-            .changes(ChangeService::new(stores.clone(), changes.clone()))
-            .checks(CheckService::direct(
-                models.clone(),
-                tuples.clone(),
-                CheckBudget::default(),
-            ))
-            .build(),
-        TransportConfig::builder()
-            .limits(limits)
-            .authorization_policy(Arc::new(AuthorizationPolicy::development(principal_id)))
-            .token_codec(Arc::new(TokenCodec::new(
-                TokenKey::new("active".parse::<TokenKeyId>()?, vec![7; 32])?,
-                Vec::new(),
-                &InputLimits::default(),
-            )?))
-            .request_timeout(RequestTimeout::new(Duration::from_secs(5))?)
-            .maximum_message_bytes(1_024)
-            .build(),
-    )?;
-
-    let router = crate::http_router(api.clone(), authentication);
+    let router = crate::http_router(api.clone(), authentication.clone());
     let response = router
         .clone()
         .oneshot(
@@ -379,20 +1251,9 @@ async fn test_should_execute_every_m2_use_case_through_shared_wire_adapter()
     .await;
     assert!(matches!(update, Err(status) if status.code() == tonic::Code::Unimplemented));
 
-    let invalid = router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/stores")
-                .header("content-type", "application/json")
-                .body(Body::from(r#"{"name":"valid","unknown":true}"#))?,
-        )
-        .await?;
-    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
     for (uri, expected_code) in [
         ("/stores?page_size=0".to_owned(), "page_size_invalid"),
-        ("/stores/short".to_owned(), "store_id_invalid_length"),
+        ("/stores/short".to_owned(), "validation_error"),
     ] {
         let response = router
             .clone()
@@ -422,6 +1283,170 @@ async fn test_should_execute_every_m2_use_case_through_shared_wire_adapter()
     assert_eq!(
         body.get("code").and_then(serde_json::Value::as_str),
         Some("tuple_key_value_not_specified"),
+    );
+
+    for (payload, expected_message) in [
+        (
+            r#"{"schema_version":"1.1","schema_version":"1.1","type_definitions":[{"type":"user"}]}"#,
+            "(line 1:25): duplicate field \"schema_version\"",
+        ),
+        (
+            r#"{"schema_version":"1.1","type_definitions":[{"type":"user"}],"conditions":{"c":{"name":"c","expression":"true","parameters":{}},"c":{"name":"c","expression":"true","parameters":{}}}}"#,
+            "(line 1:129): duplicate map key \"c\"",
+        ),
+        (
+            r#"{"schema_version":"1.1","type_definitions":[{"type":"user"}]"#,
+            "malformed JSON",
+        ),
+    ] {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::post(format!("/stores/{STORE_ID}/authorization-models"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = serde_json::from_slice::<serde_json::Value>(
+            &to_bytes(response.into_body(), 1_024).await?,
+        )?;
+        assert_eq!(
+            body.get("code"),
+            Some(&serde_json::json!("validation_error"))
+        );
+        assert_eq!(
+            body.get("message"),
+            Some(&serde_json::json!(expected_message)),
+        );
+    }
+    let alias_duplicate = router
+        .clone()
+        .oneshot(
+            Request::post(format!("/stores/{STORE_ID}/authorization-models"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"schema_version":"1.1","type_definitions":[{"type":"document","relations":{"viewer":{"computed_userset":{},"computedUserset":{}}}}]}"#,
+                ))?,
+        )
+        .await?;
+    let alias_duplicate_body = serde_json::from_slice::<serde_json::Value>(
+        &to_bytes(alias_duplicate.into_body(), 1_024).await?,
+    )?;
+    assert!(
+        alias_duplicate_body
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|message| message.contains("duplicate field \"computedUserset\"")),
+    );
+    let unknown_enum = router
+        .clone()
+        .oneshot(
+            Request::post(format!("/stores/{STORE_ID}/authorization-models"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"schema_version":"1.1","type_definitions":[{"type":"user"}],"conditions":{"c":{"name":"c","expression":"true","parameters":{"p":{"type_name":"TYPE_NAME_BOGUS"}}}}}"#,
+                ))?,
+        )
+        .await?;
+    assert_eq!(unknown_enum.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(
+            &to_bytes(unknown_enum.into_body(), 1_024).await?,
+        )?,
+        serde_json::json!({
+            "code": "invalid_authorization_model",
+            "message": "failed to compile expression on condition 'c' - failed to decode parameter type for parameter 'p': unknown condition parameter type `TYPE_NAME_UNSPECIFIED`"
+        }),
+    );
+
+    for (payload, expected_message) in [
+        (
+            format!(
+                r#"{{"tuple_key":{{"user":"user:anne","relation":"viewer","object":"document:roadmap"}},"authorization_model_id":"{MODEL_ID}","context":{{"x":1,"x":2}}}}"#,
+            ),
+            "duplicate map key \"x\"",
+        ),
+        (
+            format!(
+                r#"{{"tuple_key":null,"tuple_key":{{"user":"user:anne","relation":"viewer","object":"document:roadmap"}},"authorization_model_id":"{MODEL_ID}"}}"#,
+            ),
+            "duplicate field \"tuple_key\"",
+        ),
+    ] {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::post(format!("/stores/{STORE_ID}/check"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = serde_json::from_slice::<serde_json::Value>(
+            &to_bytes(response.into_body(), 1_024).await?,
+        )?;
+        assert!(
+            body.get("message")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|message| message.contains(expected_message)),
+            "unexpected duplicate diagnostic: {body}",
+        );
+    }
+
+    let numeric_enum = router
+        .clone()
+        .oneshot(
+            Request::post(format!("/stores/{STORE_ID}/check"))
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"tuple_key":{{"user":"user:anne","relation":"viewer","object":"document:roadmap"}},"authorization_model_id":"{MODEL_ID}","consistency":99}}"#,
+                )))?,
+        )
+        .await?;
+    assert_eq!(numeric_enum.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(
+            &to_bytes(numeric_enum.into_body(), 1_024).await?,
+        )?,
+        serde_json::json!({
+            "code": "validation_error",
+            "message": "invalid CheckRequest.Consistency: value must be one of the defined enum values",
+        }),
+    );
+
+    let duplicate_unknown = router
+        .clone()
+        .oneshot(
+            Request::post(format!("/stores/{STORE_ID}/check"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"unknown":1,"unknown":2}"#))?,
+        )
+        .await?;
+    let duplicate_unknown_body = serde_json::from_slice::<serde_json::Value>(
+        &to_bytes(duplicate_unknown.into_body(), 1_024).await?,
+    )?;
+    assert_eq!(
+        duplicate_unknown_body.get("code"),
+        Some(&serde_json::json!("tuple_key_value_not_specified")),
+    );
+
+    let null_relation = router
+        .clone()
+        .oneshot(
+            Request::post(format!("/stores/{STORE_ID}/check"))
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"tuple_key":{{"user":"user:anne","relation":null,"object":"document:roadmap"}},"authorization_model_id":"{MODEL_ID}"}}"#,
+                )))?,
+        )
+        .await?;
+    let null_relation_body = serde_json::from_slice::<serde_json::Value>(
+        &to_bytes(null_relation.into_body(), 1_024).await?,
+    )?;
+    assert_eq!(
+        null_relation_body.get("code"),
+        Some(&serde_json::json!("validation_error")),
     );
 
     let protected_router = crate::http_router(
@@ -520,7 +1545,7 @@ async fn test_should_execute_every_m2_use_case_through_shared_wire_adapter()
                 .method("POST")
                 .uri(format!("/stores/{STORE_ID}/expand"))
                 .header("content-type", "application/json")
-                .body(Body::from("{}"))?,
+                .body(Body::from(r#"{"tuple_key":{"object":"document:roadmap"}}"#))?,
         )
         .await?;
     assert_eq!(deferred.status(), StatusCode::NOT_FOUND);
@@ -538,7 +1563,10 @@ async fn test_should_execute_every_m2_use_case_through_shared_wire_adapter()
             &principal,
             pb::ExpandRequest {
                 store_id: STORE_ID.to_owned(),
-                tuple_key: None,
+                tuple_key: Some(pb::ExpandRequestTupleKey {
+                    relation: String::new(),
+                    object: "document:roadmap".to_owned(),
+                }),
                 contextual_tuples: None,
                 authorization_model_id: String::new(),
                 consistency: 0,
@@ -737,6 +1765,43 @@ async fn test_should_execute_every_m2_use_case_through_shared_wire_adapter()
         1
     );
 
+    assert_grpc_endpoint_admission(api.clone(), authentication.clone()).await?;
+
+    api.delete_store(
+        &principal,
+        pb::DeleteStoreRequest {
+            store_id: STORE_ID.to_owned(),
+        },
+    )
+    .await?;
+    assert!(
+        api.read_authorization_model(
+            &principal,
+            pb::ReadAuthorizationModelRequest {
+                store_id: STORE_ID.to_owned(),
+                id: MODEL_ID.to_owned(),
+            },
+        )
+        .await?
+        .authorization_model
+        .is_some(),
+    );
+    assert_eq!(
+        api.read(
+            &principal,
+            pb::ReadRequest {
+                store_id: STORE_ID.to_owned(),
+                tuple_key: None,
+                page_size: None,
+                continuation_token: String::new(),
+                consistency: 0,
+            },
+        )
+        .await?
+        .tuples
+        .len(),
+        1,
+    );
     api.delete_store(
         &principal,
         pb::DeleteStoreRequest {
@@ -746,18 +1811,126 @@ async fn test_should_execute_every_m2_use_case_through_shared_wire_adapter()
     .await?;
     drop(router);
     drop(api);
-    drop(changes);
-    drop(assertion_writes);
-    drop(assertion_reads);
-    drop(tuple_writes);
-    drop(tuples);
-    drop(model_writes);
-    drop(models);
-    drop(store_writes);
-    drop(stores);
     let mut storage = Arc::try_unwrap(storage).map_err(|_| "storage references remain")?;
     storage.stop().await?;
     Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the real TCP endpoint-class matrix keeps shared server state and ordered assertions \
+              visible"
+)]
+async fn assert_grpc_endpoint_admission(
+    mut api: OpenFgaApi,
+    authentication: AuthenticationService,
+) -> Result<(), Box<dyn Error>> {
+    let one = NonZeroU32::MIN;
+    api.admission = crate::admission::AdmissionControl::new(
+        AdmissionPolicy::builder()
+            .administration(one)
+            .reads(one)
+            .writes(one)
+            .checks(one)
+            .enumeration(one)
+            .build(),
+    )?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let (shutdown_sender, shutdown_receiver) = oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        Server::builder()
+            .add_service(crate::grpc_service(api, authentication))
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                let _shutdown = shutdown_receiver.await;
+            })
+            .await
+    });
+
+    let scenario = async {
+        let mut client = OpenFgaServiceClient::connect(format!("http://{address}")).await?;
+
+        let administration = pb::GetStoreRequest {
+            store_id: STORE_ID.to_owned(),
+        };
+        client.get_store(administration.clone()).await?;
+        let error = client
+            .get_store(administration)
+            .await
+            .err()
+            .ok_or("administration class was not limited")?;
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+
+        let read = pb::ReadRequest {
+            store_id: STORE_ID.to_owned(),
+            tuple_key: None,
+            page_size: None,
+            continuation_token: String::new(),
+            consistency: 0,
+        };
+        client.read(read.clone()).await?;
+        let error = client
+            .read(read)
+            .await
+            .err()
+            .ok_or("read class was not limited")?;
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+
+        let write = pb::WriteRequest {
+            store_id: STORE_ID.to_owned(),
+            writes: Some(pb::WriteRequestWrites {
+                tuple_keys: vec![relationship_tuple()],
+                on_duplicate: "ignore".to_owned(),
+            }),
+            deletes: None,
+            authorization_model_id: MODEL_ID.to_owned(),
+        };
+        client.write(write.clone()).await?;
+        let error = client
+            .write(write)
+            .await
+            .err()
+            .ok_or("write class was not limited")?;
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+
+        let check = check_request();
+        client.check(check.clone()).await?;
+        let error = client
+            .check(check)
+            .await
+            .err()
+            .ok_or("check class was not limited")?;
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+
+        let expand = pb::ExpandRequest {
+            store_id: STORE_ID.to_owned(),
+            tuple_key: Some(pb::ExpandRequestTupleKey {
+                relation: String::new(),
+                object: "document:roadmap".to_owned(),
+            }),
+            authorization_model_id: MODEL_ID.to_owned(),
+            consistency: 0,
+            contextual_tuples: None,
+        };
+        let error = client
+            .expand(expand.clone())
+            .await
+            .err()
+            .ok_or("enumeration placeholder unexpectedly succeeded")?;
+        assert_eq!(error.code(), tonic::Code::Unimplemented);
+        let error = client
+            .expand(expand)
+            .await
+            .err()
+            .ok_or("enumeration class was not limited")?;
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+        Ok::<(), Box<dyn Error>>(())
+    }
+    .await;
+
+    let _shutdown_result = shutdown_sender.send(());
+    server.await??;
+    scenario
 }
 
 fn authenticated_request<T>(principal: &Principal, message: T) -> tonic::Request<T> {
@@ -766,12 +1939,302 @@ fn authenticated_request<T>(principal: &Principal, message: T) -> tonic::Request
     request
 }
 
+fn invalid_model_cases() -> Vec<(pb::WriteAuthorizationModelRequest, &'static str)> {
+    vec![
+        (
+            model_with_viewer(pb::Userset { userset: None }),
+            "the definition of relation 'viewer' in object type 'document' is invalid",
+        ),
+        (
+            model_with_viewer(pb::Userset {
+                userset: Some(pb::userset::Userset::Union(pb::Usersets {
+                    child: Vec::new(),
+                })),
+            }),
+            "invalid relation: 'document#viewer' as union has less than 2 children",
+        ),
+        (
+            model_with_viewer(pb::Userset {
+                userset: Some(pb::userset::Userset::Intersection(pb::Usersets {
+                    child: vec![direct_userset()],
+                })),
+            }),
+            "invalid relation: 'document#viewer' as intersection has less than 2 children",
+        ),
+        (
+            potential_loop_model(),
+            "the definition of relation 'action1' in object type 'document' is invalid: potential \
+             loop",
+        ),
+        (
+            potential_loop_set_model(false),
+            "the definition of relation 'action1' in object type 'document' is invalid: potential \
+             loop",
+        ),
+        (
+            potential_loop_set_model(true),
+            "the definition of relation 'action1' in object type 'document' is invalid: potential \
+             loop",
+        ),
+        (
+            model_with_condition("1", HashMap::new()),
+            "failed to compile expression on condition 'c' - expected a bool condition expression \
+             output, but got 'int'",
+        ),
+        (
+            model_with_condition("1 + \"x\"", HashMap::new()),
+            "failed to compile expression on condition 'c' - found no matching overload for '_+_' \
+             applied to '(int, string)'",
+        ),
+        (
+            model_with_condition("x", HashMap::new()),
+            "failed to compile expression on condition 'c' - undeclared reference to 'x'",
+        ),
+        (
+            model_with_condition("ipaddress()", HashMap::new()),
+            "failed to compile expression on condition 'c' - found no matching overload for \
+             'ipaddress' applied to '()'",
+        ),
+        (
+            model_with_condition(
+                "x",
+                HashMap::from([(
+                    "x".to_owned(),
+                    pb::ConditionParamTypeRef {
+                        type_name: pb::condition_param_type_ref::TypeName::Map as i32,
+                        generic_types: Vec::new(),
+                    },
+                )]),
+            ),
+            "failed to compile expression on condition 'c' - failed to decode parameter type for \
+             parameter 'x': condition parameter type `TYPE_NAME_MAP` requires 1 generic types; \
+             found 0",
+        ),
+        (
+            model_with_condition(
+                "x",
+                HashMap::from([(
+                    "x".to_owned(),
+                    pb::ConditionParamTypeRef {
+                        type_name: 0,
+                        generic_types: Vec::new(),
+                    },
+                )]),
+            ),
+            "failed to compile expression on condition 'c' - failed to decode parameter type for \
+             parameter 'x': unknown condition parameter type `TYPE_NAME_UNSPECIFIED`",
+        ),
+    ]
+}
+
+fn model_with_viewer(rewrite: pb::Userset) -> pb::WriteAuthorizationModelRequest {
+    let mut request = model_request();
+    if let Some(document) = request
+        .type_definitions
+        .iter_mut()
+        .find(|definition| definition.r#type == "document")
+    {
+        document.relations.insert("viewer".to_owned(), rewrite);
+    }
+    request
+}
+
+fn potential_loop_model() -> pb::WriteAuthorizationModelRequest {
+    let computed = |relation: &str| pb::Userset {
+        userset: Some(pb::userset::Userset::ComputedUserset(pb::ObjectRelation {
+            object: String::new(),
+            relation: relation.to_owned(),
+        })),
+    };
+    pb::WriteAuthorizationModelRequest {
+        store_id: STORE_ID.to_owned(),
+        schema_version: "1.1".to_owned(),
+        type_definitions: vec![pb::TypeDefinition {
+            r#type: "document".to_owned(),
+            relations: HashMap::from([
+                ("action1".to_owned(), computed("action2")),
+                ("action2".to_owned(), computed("action1")),
+            ]),
+            metadata: Some(pb::Metadata {
+                relations: HashMap::new(),
+                module: String::new(),
+                source_info: None,
+            }),
+        }],
+        conditions: HashMap::new(),
+    }
+}
+
+fn potential_loop_set_model(exclusion: bool) -> pb::WriteAuthorizationModelRequest {
+    let computed = |relation: &str| pb::Userset {
+        userset: Some(pb::userset::Userset::ComputedUserset(pb::ObjectRelation {
+            object: String::new(),
+            relation: relation.to_owned(),
+        })),
+    };
+    let rewrite = |next: &str, third: &str| {
+        if exclusion {
+            pb::Userset {
+                userset: Some(pb::userset::Userset::Difference(Box::new(pb::Difference {
+                    base: Some(Box::new(computed("admin"))),
+                    subtract: Some(Box::new(computed(next))),
+                }))),
+            }
+        } else {
+            pb::Userset {
+                userset: Some(pb::userset::Userset::Intersection(pb::Usersets {
+                    child: vec![computed("admin"), computed(next), computed(third)],
+                })),
+            }
+        }
+    };
+    let mut request = model_request();
+    let Some(document) = request
+        .type_definitions
+        .iter_mut()
+        .find(|definition| definition.r#type == "document")
+    else {
+        return request;
+    };
+    document.relations = HashMap::from([
+        ("admin".to_owned(), direct_userset()),
+        ("action1".to_owned(), rewrite("action2", "action3")),
+        ("action2".to_owned(), rewrite("action3", "action1")),
+        ("action3".to_owned(), rewrite("action1", "action2")),
+    ]);
+    if let Some(metadata) = document.metadata.as_mut()
+        && let Some(viewer) = metadata.relations.remove("viewer")
+    {
+        metadata.relations.insert("admin".to_owned(), viewer);
+    }
+    request
+}
+
+fn model_with_condition(
+    expression: &str,
+    parameters: HashMap<String, pb::ConditionParamTypeRef>,
+) -> pb::WriteAuthorizationModelRequest {
+    let mut request = model_request();
+    request.conditions.insert(
+        "c".to_owned(),
+        pb::Condition {
+            name: "c".to_owned(),
+            expression: expression.to_owned(),
+            parameters,
+            metadata: None,
+        },
+    );
+    request
+}
+
+fn direct_userset() -> pb::Userset {
+    pb::Userset {
+        userset: Some(pb::userset::Userset::This(pb::DirectUserset {})),
+    }
+}
+
+fn conditioned_model_request() -> pb::WriteAuthorizationModelRequest {
+    let mut request = model_request();
+    request.conditions.insert(
+        "c1".to_owned(),
+        pb::Condition {
+            name: "c1".to_owned(),
+            expression: "true".to_owned(),
+            parameters: HashMap::from([(
+                "x".to_owned(),
+                pb::ConditionParamTypeRef {
+                    type_name: pb::condition_param_type_ref::TypeName::String as i32,
+                    generic_types: Vec::new(),
+                },
+            )]),
+            metadata: None,
+        },
+    );
+    request.conditions.insert(
+        "c2".to_owned(),
+        pb::Condition {
+            name: "c2".to_owned(),
+            expression: "true".to_owned(),
+            parameters: HashMap::new(),
+            metadata: None,
+        },
+    );
+    if let Some(document) = request
+        .type_definitions
+        .iter_mut()
+        .find(|definition| definition.r#type == "document")
+        && let Some(metadata) = document.metadata.as_mut()
+        && let Some(viewer) = metadata.relations.get_mut("viewer")
+        && let Some(restriction) = viewer.directly_related_user_types.first_mut()
+    {
+        restriction.condition = "c1".to_owned();
+        let mut alternate = restriction.clone();
+        alternate.condition = "c2".to_owned();
+        viewer.directly_related_user_types.push(alternate);
+    }
+    request
+}
+
+fn write_request(tuple: pb::TupleKey, on_duplicate: String) -> pb::WriteRequest {
+    pb::WriteRequest {
+        store_id: STORE_ID.to_owned(),
+        writes: Some(pb::WriteRequestWrites {
+            tuple_keys: vec![tuple],
+            on_duplicate,
+        }),
+        deletes: None,
+        authorization_model_id: MODEL_ID.to_owned(),
+    }
+}
+
+fn delete_request(object: &str, on_missing: String) -> pb::WriteRequest {
+    pb::WriteRequest {
+        store_id: STORE_ID.to_owned(),
+        writes: None,
+        deletes: Some(pb::WriteRequestDeletes {
+            tuple_keys: vec![pb::TupleKeyWithoutCondition {
+                user: "user:anne".to_owned(),
+                relation: "viewer".to_owned(),
+                object: object.to_owned(),
+            }],
+            on_missing,
+        }),
+        authorization_model_id: MODEL_ID.to_owned(),
+    }
+}
+
+fn json_struct(value: serde_json::Value) -> Result<pbjson_types::Struct, serde_json::Error> {
+    serde_json::from_value(value)
+}
+
 fn relationship_tuple() -> pb::TupleKey {
     pb::TupleKey {
         user: "user:anne".to_owned(),
         relation: "viewer".to_owned(),
         object: "document:roadmap".to_owned(),
         condition: None,
+    }
+}
+
+fn conditioned_tuple() -> pb::TupleKey {
+    conditioned_tuple_for("document:roadmap")
+}
+
+fn conditioned_tuple_for(object: &str) -> pb::TupleKey {
+    let mut tuple = relationship_tuple();
+    tuple.object = object.to_owned();
+    tuple.condition = Some(pb::RelationshipCondition {
+        name: "c1".to_owned(),
+        context: None,
+    });
+    tuple
+}
+
+fn delete_tuple(object: &str) -> pb::TupleKeyWithoutCondition {
+    pb::TupleKeyWithoutCondition {
+        user: "user:anne".to_owned(),
+        relation: "viewer".to_owned(),
+        object: object.to_owned(),
     }
 }
 

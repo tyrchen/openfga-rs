@@ -52,6 +52,12 @@ Query-plan fixtures verify hot queries use intended indexes at representative ca
 
 No backend returns database-specific errors across the storage boundary. `StorageError` distinguishes not found, already exists, conflict, invalid continuation, timeout, unavailable, integrity, and internal failures, preserving a redacted source.
 
+A canonical store ID also acts as a data namespace independently of the store-directory record.
+Models, assertions, tuples, and changes can be persisted and read without a prior CreateStore.
+DeleteStore is idempotent and removes or hides only the directory record; namespace data remains
+available, matching the pinned OpenFGA lifecycle contract. Backends therefore do not foreign-key
+namespace tables to the store-directory table.
+
 ## Pagination and consistency
 
 Pagination uses stable canonical sort keys plus versioned integrity-protected tokens. Tokens bind store, operation, normalized filter fingerprint, backend-independent cursor, and expiry. Decoded bytes and field sizes are bounded before allocation. Invalid, expired, cross-store, or cross-filter tokens are errors.

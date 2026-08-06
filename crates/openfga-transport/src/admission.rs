@@ -4,6 +4,7 @@ use std::{
     collections::hash_map::RandomState,
     fmt,
     hash::{BuildHasher, Hash},
+    net::IpAddr,
     num::NonZeroU32,
     sync::{
         Arc,
@@ -42,12 +43,18 @@ pub struct AdmissionPolicy {
     /// Fixed-window duration.
     #[builder(default = Duration::from_mins(1))]
     pub(crate) window: Duration,
-    /// Global authentication attempts per window.
+    /// Authentication attempts per socket peer IP and window.
     #[builder(default = nonzero(20_000))]
     pub(crate) authentication_attempts: NonZeroU32,
-    /// Global failed authentications per window.
+    /// Failed authentications per socket peer IP and window.
     #[builder(default = nonzero(2_000))]
     pub(crate) authentication_failures: NonZeroU32,
+    /// Global emergency ceiling for authentication attempts per window.
+    #[builder(default = nonzero(200_000))]
+    pub(crate) global_authentication_attempts: NonZeroU32,
+    /// Global emergency ceiling for failed authentications per window.
+    #[builder(default = nonzero(20_000))]
+    pub(crate) global_authentication_failures: NonZeroU32,
     /// Administrative requests per principal and window.
     #[builder(default = nonzero(1_000))]
     pub(crate) administration: NonZeroU32,
@@ -80,6 +87,8 @@ impl AdmissionPolicy {
         if [
             self.authentication_attempts,
             self.authentication_failures,
+            self.global_authentication_attempts,
+            self.global_authentication_failures,
             self.administration,
             self.reads,
             self.writes,
@@ -178,12 +187,14 @@ impl AdmissionControl {
         })
     }
 
-    pub(crate) fn admit_authentication(&self) -> Result<(), ApiError> {
-        self.admit_key(0_u8, self.policy.authentication_attempts)
+    pub(crate) fn admit_authentication(&self, peer_ip: IpAddr) -> Result<(), ApiError> {
+        self.admit_key((0_u8, "global"), self.policy.global_authentication_attempts)?;
+        self.admit_key((1_u8, peer_ip), self.policy.authentication_attempts)
     }
 
-    pub(crate) fn record_authentication_failure(&self) -> Result<(), ApiError> {
-        self.admit_key(1_u8, self.policy.authentication_failures)
+    pub(crate) fn record_authentication_failure(&self, peer_ip: IpAddr) -> Result<(), ApiError> {
+        self.admit_key((2_u8, "global"), self.policy.global_authentication_failures)?;
+        self.admit_key((3_u8, peer_ip), self.policy.authentication_failures)
     }
 
     pub(crate) fn admit_principal(
@@ -222,9 +233,12 @@ impl fmt::Debug for AdmissionControl {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
+    use std::{
+        net::{IpAddr, Ipv4Addr},
+        sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        },
     };
 
     use openfga_domain::{Principal, PrincipalKind};
@@ -249,12 +263,34 @@ mod tests {
                 .build(),
         )?;
         control.clock = clock.clone();
+        let peer = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
-        assert!(control.admit_authentication().is_ok());
-        assert!(control.admit_authentication().is_ok());
-        assert!(control.admit_authentication().is_err());
+        assert!(control.admit_authentication(peer).is_ok());
+        assert!(control.admit_authentication(peer).is_ok());
+        assert!(control.admit_authentication(peer).is_err());
         clock.0.store(180, Ordering::SeqCst);
-        assert!(control.admit_authentication().is_ok());
+        assert!(control.admit_authentication(peer).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_isolate_peer_ips_but_enforce_global_emergency_ceiling()
+    -> Result<(), &'static str> {
+        let mut control = AdmissionControl::new(
+            AdmissionPolicy::builder()
+                .authentication_attempts(super::nonzero(1))
+                .global_authentication_attempts(super::nonzero(3))
+                .build(),
+        )?;
+        control.clock = Arc::new(ManualClock(AtomicU64::new(120)));
+        let first = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let second = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2));
+        let third = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 3));
+
+        assert!(control.admit_authentication(first).is_ok());
+        assert!(control.admit_authentication(first).is_err());
+        assert!(control.admit_authentication(second).is_ok());
+        assert!(control.admit_authentication(third).is_err());
         Ok(())
     }
 

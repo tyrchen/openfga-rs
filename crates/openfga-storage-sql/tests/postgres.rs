@@ -8,8 +8,9 @@ use std::{
 };
 
 use openfga_domain::{
-    AuthorizationModelId, ConditionContext, ConsistencyPreference, ContextualTuples, Deadline,
-    InputLimits, ObjectRef, RelationshipTuple, RequestTimeout, StoreId, TupleKey,
+    AuthorizationModelId, ConditionBinding, ConditionContext, ConditionName, ConditionReference,
+    ConsistencyPreference, ContextualTuples, Deadline, InputLimits, ObjectRef, RelationshipTuple,
+    RequestTimeout, StoreId, TupleKey,
 };
 use openfga_model::{
     AuthorizationModelSource, DirectRestrictionSource, ModelCompiler, RelationSource,
@@ -40,12 +41,13 @@ async fn test_should_satisfy_postgres_contract_fault_and_plan_gates() -> Result<
 {
     let url = std::env::var(TEST_URL_ENV)?;
     let storage = Arc::new(PostgresStorage::connect(config(&url)).await?);
-    sqlx::query("TRUNCATE stores CASCADE")
+    sqlx::query("TRUNCATE assertions, authorization_models, tuple_changes, tuples, stores CASCADE")
         .execute(storage.primary_pool())
         .await?;
     let context = operation_context(ConsistencyPreference::HigherConsistency)?;
 
     verify_management_and_shared_contract(&storage, &context).await?;
+    verify_request_ordered_conflicts(&storage, &context).await?;
     verify_primary_replica_policy(&url, &context).await?;
     verify_atomic_faults(&url, &context).await?;
     verify_concurrent_mutations(&storage, &context).await?;
@@ -66,6 +68,7 @@ async fn verify_management_and_shared_contract(
     storage: &PostgresStorage,
     context: &OperationContext,
 ) -> Result<(), Box<dyn Error>> {
+    verify_namespace_data_without_store_record(storage, context).await?;
     let store_id = store_id(1);
     let created = storage
         .create_store(
@@ -217,6 +220,63 @@ async fn verify_management_and_shared_contract(
             .await?
             .as_ref(),
         &[assertion]
+    );
+    Ok(())
+}
+
+async fn verify_namespace_data_without_store_record(
+    storage: &PostgresStorage,
+    context: &OperationContext,
+) -> Result<(), Box<dyn Error>> {
+    let store_id = store_id(99);
+    let model_id = model_id(99);
+    storage
+        .write_model(context, stored_model(store_id, model_id)?)
+        .await?;
+
+    let relationship = tuple("document:orphan#viewer@user:anne")?;
+    storage
+        .write_tuples(
+            context,
+            store_id,
+            Vec::new(),
+            vec![relationship.clone()],
+            TupleWriteOptions::default(),
+        )
+        .await?;
+    assert_eq!(
+        storage
+            .read_tuples(
+                context,
+                store_id,
+                &TupleReadFilter::all(),
+                &page_options(10)?,
+            )
+            .await?
+            .items()
+            .len(),
+        1,
+    );
+    storage
+        .write_tuples(
+            context,
+            store_id,
+            vec![relationship.key().clone()],
+            Vec::new(),
+            TupleWriteOptions::default(),
+        )
+        .await?;
+    assert!(
+        storage
+            .read_tuples(
+                context,
+                store_id,
+                &TupleReadFilter::all(),
+                &page_options(10)?,
+            )
+            .await?
+            .items()
+            .is_empty(),
     );
     Ok(())
 }
@@ -385,10 +445,83 @@ async fn verify_concurrent_mutations(
     Ok(())
 }
 
+async fn verify_request_ordered_conflicts(
+    storage: &PostgresStorage,
+    context: &OperationContext,
+) -> Result<(), Box<dyn Error>> {
+    let store_id = store_id(501);
+    let z = tuple("document:z#viewer@user:anne")?;
+    let a = tuple("document:a#viewer@user:anne")?;
+    let missing = storage
+        .write_tuples(
+            context,
+            store_id,
+            vec![z.key().clone(), a.key().clone()],
+            Vec::new(),
+            TupleWriteOptions::default(),
+        )
+        .await
+        .err()
+        .ok_or("missing ordered deletes unexpectedly succeeded")?;
+    assert_eq!(
+        missing.tuple().map(ToString::to_string).as_deref(),
+        Some("document:z#viewer@user:anne"),
+    );
+
+    storage
+        .write_tuples(
+            context,
+            store_id,
+            Vec::new(),
+            vec![z.clone(), a.clone()],
+            TupleWriteOptions::default(),
+        )
+        .await?;
+    let duplicate = storage
+        .write_tuples(
+            context,
+            store_id,
+            Vec::new(),
+            vec![z, a],
+            TupleWriteOptions::default(),
+        )
+        .await
+        .err()
+        .ok_or("ordered duplicate writes unexpectedly succeeded")?;
+    assert_eq!(
+        duplicate.tuple().map(ToString::to_string).as_deref(),
+        Some("document:z#viewer@user:anne"),
+    );
+    let condition_conflict = RelationshipTuple::new(
+        duplicate
+            .tuple()
+            .cloned()
+            .ok_or("ordered conflict did not retain its tuple")?,
+        ConditionReference::Conditional(ConditionBinding::new(
+            ConditionName::parse_with_limits("alternate", &InputLimits::default())?,
+            ConditionContext::empty(),
+        )),
+    );
+    let conflict = storage
+        .write_tuples(
+            context,
+            store_id,
+            Vec::new(),
+            vec![condition_conflict],
+            TupleWriteOptions::new(WriteConflictPolicy::Error, WriteConflictPolicy::Ignore),
+        )
+        .await
+        .err()
+        .ok_or("ignore accepted a different condition on an existing tuple")?;
+    assert_eq!(conflict.code(), "tuple_condition_conflict");
+    Ok(())
+}
+
 async fn verify_cancellation_releases_pool(
     storage: &PostgresStorage,
 ) -> Result<(), Box<dyn Error>> {
     let context = operation_context(ConsistencyPreference::HigherConsistency)?;
+    let other_store_id = store_id(701);
     let store_id = store_id(700);
     storage
         .create_store(
@@ -399,9 +532,20 @@ async fn verify_cancellation_releases_pool(
         .await?;
     let relationship = tuple("document:blocked#viewer@user:anne")?;
     let mut blocker = storage.primary_pool().begin().await?;
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($2, hashtextextended($1, 0)))")
+        .bind(store_id.to_string())
         .bind(relationship.key().to_string())
         .execute(&mut *blocker)
+        .await?;
+
+    storage
+        .write_tuples(
+            &context,
+            other_store_id,
+            Vec::new(),
+            vec![relationship.clone()],
+            TupleWriteOptions::default(),
+        )
         .await?;
 
     let timed_context = OperationContext::new(

@@ -1,6 +1,49 @@
 //! Stable, source-ordered, non-sensitive model diagnostics.
 
+use openfga_condition::{CompileErrorDetail, CompileErrorKind};
+use openfga_domain::ParameterName;
 use thiserror::Error;
+
+/// Safe detail for one malformed condition parameter type.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ConditionParameterTypeError {
+    /// The protobuf enum value is not a supported parameter type.
+    Unknown {
+        /// Parameter whose declaration is malformed.
+        parameter: ParameterName,
+        /// Bounded protobuf enum spelling or decimal numeric value.
+        type_name: Box<str>,
+    },
+    /// The parameter type declares the wrong number of generic arguments.
+    GenericArity {
+        /// Parameter whose declaration is malformed.
+        parameter: ParameterName,
+        /// Bounded protobuf enum spelling or decimal numeric value.
+        type_name: Box<str>,
+        /// Required number of generic arguments.
+        expected: usize,
+        /// Supplied number of generic arguments.
+        found: usize,
+    },
+}
+
+/// Safe structured detail attached to a model diagnostic.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ModelErrorDetail {
+    /// A malformed condition parameter type.
+    ConditionParameterType(ConditionParameterTypeError),
+    /// A redacted condition compiler category.
+    ConditionCompile {
+        /// Stable compiler category.
+        kind: CompileErrorKind,
+        /// Safe static result type for a non-Boolean expression.
+        found_type: Option<&'static str>,
+        /// Bounded structured compiler detail.
+        diagnostic: Option<CompileErrorDetail>,
+    },
+}
 
 /// A stable declaration location that never copies hostile source text.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -114,6 +157,8 @@ pub enum ModelErrorCode {
     InvalidTupleToUsersetTarget,
     /// A relation has no path to a concrete entrypoint.
     NoEntrypoints,
+    /// A relation has no concrete entrypoint because a dependency path loops.
+    PotentialLoop,
     /// Computed-userset rewrites form a forbidden cycle.
     ForbiddenComputedCycle,
     /// A condition parameter type is malformed or unsupported.
@@ -131,13 +176,18 @@ pub enum ModelErrorCode {
 pub struct ModelError {
     code: ModelErrorCode,
     path: DeclarationPath,
+    detail: Option<ModelErrorDetail>,
 }
 
 impl ModelError {
     /// Creates a diagnostic from a stable code and declaration path.
     #[must_use]
     pub const fn new(code: ModelErrorCode, path: DeclarationPath) -> Self {
-        Self { code, path }
+        Self {
+            code,
+            path,
+            detail: None,
+        }
     }
 
     /// Returns the stable failure code.
@@ -150,6 +200,24 @@ impl ModelError {
     #[must_use]
     pub const fn path(&self) -> DeclarationPath {
         self.path
+    }
+
+    /// Returns safely bounded structured diagnostic detail, when available.
+    #[must_use]
+    pub const fn detail(&self) -> Option<&ModelErrorDetail> {
+        self.detail.as_ref()
+    }
+
+    pub(crate) const fn with_detail(
+        code: ModelErrorCode,
+        path: DeclarationPath,
+        detail: ModelErrorDetail,
+    ) -> Self {
+        Self {
+            code,
+            path,
+            detail: Some(detail),
+        }
     }
 }
 
@@ -213,6 +281,20 @@ impl ErrorCollector {
     pub(crate) fn push(&mut self, code: ModelErrorCode, path: DeclarationPath) {
         if self.errors.len() < self.maximum {
             self.errors.push(ModelError::new(code, path));
+        } else {
+            self.truncated = true;
+        }
+    }
+
+    pub(crate) fn push_detail(
+        &mut self,
+        code: ModelErrorCode,
+        path: DeclarationPath,
+        detail: ModelErrorDetail,
+    ) {
+        if self.errors.len() < self.maximum {
+            self.errors
+                .push(ModelError::with_detail(code, path, detail));
         } else {
             self.truncated = true;
         }

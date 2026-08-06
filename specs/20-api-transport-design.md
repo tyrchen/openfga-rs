@@ -25,7 +25,10 @@ Client deadlines are clamped to endpoint maxima. Server timeout/cancellation pro
 ## Wire behavior
 
 - Protobuf presence/default semantics and JSON field names match the pinned API; project-owned JSON uses `camelCase` but generated protobuf rules prevail on protocol messages.
-- Unknown JSON fields, malformed enums, oversized strings/collections, duplicate ambiguous inputs, and invalid UTF-8 are rejected at the boundary as baseline-compatible errors.
+- Generated protobuf JSON follows the pinned Go decoder: unknown fields are ignored and unknown
+  enum strings decode as the unspecified variant before semantic validation. Duplicate ordinary
+  fields and map keys, malformed JSON, oversized strings/collections, and invalid UTF-8 are
+  rejected at the boundary with baseline-compatible diagnostics.
 - BatchCheck validates the outer request and reports per-item results/errors with stable correlation exactly as baseline behavior requires.
 - ListObjects unary and streaming share one domain engine; streaming observes backpressure and emits baseline-compatible terminal errors.
 - Response ordering is deterministic where promised; otherwise tests compare semantic sets while retaining stable project behavior for operability.
@@ -35,6 +38,18 @@ Client deadlines are clamped to endpoint maxima. Server timeout/cancellation pro
 One explicit table maps every domain error variant to gRPC status, OpenFGA error code/message shape, HTTP status, and retry classification. Validation/model errors are safe and actionable; storage/internal errors are redacted and carry a request ID. `NotFound`, `AlreadyExists`, `Unauthenticated`, and `PermissionDenied` remain distinct. Deadline, client cancellation, server overload, and budget exhaustion are not converted to deny or empty lists.
 
 The mapping table is generated/tested or exhaustively matched so adding an error variant fails compilation or tests until mapping is supplied. Error bodies never include SQL, token content, CEL context, preshared keys, authorization headers, or raw hostile values.
+
+Compatibility diagnostics may echo bounded protocol identifiers and ordinary option values when
+the pinned server does. Deliberate security normalizations take precedence: conflict-option values
+over 256 bytes map to a generic validation error; condition syntax failures never echo the
+submitted CEL source; and semantic CEL diagnostics retain the exact non-secret type/arity or
+identifier detail while omitting CEL-Go's source-location/container wrapper and source caret.
+These normalizations are regression-tested and form part of the preview compatibility statement.
+Rust also fully validates delete-tuple object and relation grammar before storage; the pinned Go
+command currently validates only the delete subject and carries an upstream TODO for the other two
+fields. Malformed delete keys therefore receive a field validation error instead of being treated
+as a missing persisted tuple. This deliberate boundary hardening is tested as a named differential
+until the upstream TODO is resolved.
 
 ## Pagination and tokens
 

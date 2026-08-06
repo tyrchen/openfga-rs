@@ -36,7 +36,7 @@ use openfga_transport::{
     AuthenticatedGrpcService, OpenFgaApi, OpenFgaServices, TransportConfig, grpc_service,
     http_router,
 };
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use serde::Serialize;
 use tokio::{
     io::AsyncReadExt,
@@ -48,7 +48,7 @@ use tokio_rustls::{TlsAcceptor, server::TlsStream};
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::transport::Server;
 use tonic_health::{ServingStatus, server::HealthReporter};
-use tower::limit::{ConcurrencyLimitLayer, GlobalConcurrencyLimitLayer};
+use tower::limit::ConcurrencyLimitLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 
 use crate::config::{AuthMode, DEVELOPMENT_PRINCIPAL_ID, ServerConfig, StorageBackend};
@@ -475,9 +475,9 @@ fn check_budget(config: &ServerConfig) -> Result<CheckBudget> {
 }
 
 fn load_token_keys(config: &ServerConfig) -> Result<(TokenKey, Vec<TokenKey>)> {
-    let encoded = load_secret_string(&config.transport.token_key_env)?;
+    let encoded = load_secret(&config.transport.token_key_env)?;
     let bytes = BASE64_STANDARD
-        .decode(encoded.as_bytes())
+        .decode(encoded.expose_secret().as_bytes())
         .context("continuation token key must be standard base64")?;
     let signing_key = TokenKey::new(config.transport.token_key_id.parse()?, bytes)
         .context("continuation token signing key must decode to 32 through 64 bytes")?;
@@ -486,9 +486,9 @@ fn load_token_keys(config: &ServerConfig) -> Result<(TokenKey, Vec<TokenKey>)> {
         .token_verification_keys
         .iter()
         .map(|key| {
-            let encoded = load_secret_string(&key.key_env)?;
+            let encoded = load_secret(&key.key_env)?;
             let bytes = BASE64_STANDARD
-                .decode(encoded.as_bytes())
+                .decode(encoded.expose_secret().as_bytes())
                 .context("continuation token verification key must be standard base64")?;
             TokenKey::new(key.id.parse()?, bytes)
                 .context("continuation token verification key must decode to 32 through 64 bytes")
@@ -498,10 +498,6 @@ fn load_token_keys(config: &ServerConfig) -> Result<(TokenKey, Vec<TokenKey>)> {
 }
 
 fn load_secret(name: &str) -> Result<SecretString> {
-    load_secret_string(name).map(SecretString::from)
-}
-
-fn load_secret_string(name: &str) -> Result<String> {
     let value =
         env::var(name).with_context(|| format!("required secret environment {name} is unset"))?;
     if value.is_empty()
@@ -510,7 +506,7 @@ fn load_secret_string(name: &str) -> Result<String> {
     {
         bail!("secret environment {name} is empty, oversized, or contains control characters");
     }
-    Ok(value)
+    Ok(SecretString::from(value))
 }
 
 pub(crate) fn install_crypto_provider() -> Result<()> {
@@ -686,7 +682,7 @@ fn spawn_http(
             let serve = axum_server::from_tcp_rustls(listener, rustls)
                 .context("failed to configure HTTP TLS listener")?
                 .handle(handle)
-                .serve(router.into_make_service());
+                .serve(router.into_make_service_with_connect_info::<SocketAddr>());
             tokio::pin!(serve);
             tokio::pin!(shutdown);
             tokio::select! {
@@ -700,7 +696,7 @@ fn spawn_http(
             let serve = axum_server::from_tcp(listener)
                 .context("failed to configure HTTP listener")?
                 .handle(handle)
-                .serve(router.into_make_service());
+                .serve(router.into_make_service_with_connect_info::<SocketAddr>());
             tokio::pin!(serve);
             tokio::pin!(shutdown);
             tokio::select! {
@@ -734,13 +730,7 @@ where
         + 'static,
     H::Future: Send + 'static,
 {
-    let mut server = Server::builder()
-        .layer(GlobalConcurrencyLimitLayer::new(
-            config.transport.maximum_concurrency,
-        ))
-        .timeout(config.request_timeout()?.duration())
-        .concurrency_limit_per_connection(config.transport.maximum_concurrency)
-        .load_shed(true);
+    let mut server = Server::builder().timeout(config.request_timeout()?.duration());
     if let Some(tls) = tls {
         let incoming = spawn_grpc_tls_incoming(
             tasks,
@@ -982,16 +972,39 @@ async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {
 mod tests {
     use std::{
         path::PathBuf,
-        sync::{Arc, atomic::Ordering},
-        time::Duration,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::{Duration, SystemTime},
     };
 
     use anyhow::Context as _;
+    use async_trait::async_trait;
     use axum::{
         body::Body,
         http::{Request, StatusCode},
         routing::get,
     };
+    use openfga_auth::{AuthenticationService, AuthorizationPolicy};
+    use openfga_check::CheckBudget;
+    use openfga_domain::{
+        AuthorizationModelId, InputLimits, PrincipalId, RequestTimeout, StoreId, TokenCodec,
+        TokenKey, TokenKeyId,
+    };
+    use openfga_model::ModelCompiler;
+    use openfga_proto::openfga::v1::{self as pb, open_fga_service_client::OpenFgaServiceClient};
+    use openfga_service::{
+        AssertionService, ChangeService, CheckService, IdentifierSource, IdentifierSourceError,
+        ModelPublication, ModelService, ServiceClock, StoreService, TupleService,
+    };
+    use openfga_storage::{
+        AssertionReader, AssertionWriter, ChangeReader, ModelReader, ModelWriter, OperationContext,
+        Page, PageOptions, StorageCancellationToken, StorageError, StorageErrorKind, StoreReader,
+        StoreWriter, StoredAuthorizationModel, TupleReader, TupleWriter,
+    };
+    use openfga_storage_memory::{MemoryStorage, MemoryStorageConfig};
+    use openfga_transport::{OpenFgaApi, OpenFgaServices, TransportConfig};
     use rustls::server::ResolvesServerCertUsingSni;
     use tokio::{
         io::{AsyncReadExt as _, AsyncWriteExt as _},
@@ -1001,7 +1014,199 @@ mod tests {
     };
     use tower::ServiceExt;
 
-    use super::{HealthState, TlsMaterial, drain_tasks, health_router, spawn_http};
+    use super::{
+        HealthState, TlsMaterial, TransportRuntime, drain_tasks, health_router, spawn_grpc,
+        spawn_http,
+    };
+
+    const STORE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    const MODEL_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAW";
+
+    #[derive(Debug)]
+    struct FixedIdentifiers {
+        store_id: StoreId,
+        model_id: AuthorizationModelId,
+    }
+
+    #[async_trait]
+    impl IdentifierSource for FixedIdentifiers {
+        async fn next_store_id(
+            &self,
+            _context: &OperationContext,
+        ) -> Result<StoreId, IdentifierSourceError> {
+            Ok(self.store_id)
+        }
+
+        async fn next_model_id(
+            &self,
+            _context: &OperationContext,
+        ) -> Result<AuthorizationModelId, IdentifierSourceError> {
+            Ok(self.model_id)
+        }
+    }
+
+    #[derive(Debug)]
+    struct FixedClock;
+
+    impl ServiceClock for FixedClock {
+        fn now(&self) -> SystemTime {
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)
+        }
+    }
+
+    #[derive(Debug)]
+    struct ActiveWorkGuard(Arc<AtomicUsize>);
+
+    impl Drop for ActiveWorkGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    #[derive(Debug)]
+    struct BlockingModelReader {
+        active: Arc<AtomicUsize>,
+        entered: mpsc::Sender<StorageCancellationToken>,
+    }
+
+    impl BlockingModelReader {
+        async fn block<T>(&self, context: &OperationContext) -> Result<T, StorageError> {
+            self.active.fetch_add(1, Ordering::AcqRel);
+            let _guard = ActiveWorkGuard(Arc::clone(&self.active));
+            self.entered
+                .send(context.cancellation().clone())
+                .await
+                .map_err(|_| {
+                    StorageError::new(
+                        StorageErrorKind::Unavailable,
+                        "runtime_cancellation_probe_unavailable",
+                    )
+                })?;
+            context.cancellation().cancelled().await;
+            Err(StorageError::new(
+                StorageErrorKind::Cancelled,
+                "runtime_cancellation_probe_cancelled",
+            ))
+        }
+    }
+
+    #[async_trait]
+    impl ModelReader for BlockingModelReader {
+        async fn read_model(
+            &self,
+            context: &OperationContext,
+            _store_id: StoreId,
+            _model_id: AuthorizationModelId,
+        ) -> Result<Arc<StoredAuthorizationModel>, StorageError> {
+            self.block(context).await
+        }
+
+        async fn read_latest_model(
+            &self,
+            context: &OperationContext,
+            _store_id: StoreId,
+        ) -> Result<Arc<StoredAuthorizationModel>, StorageError> {
+            self.block(context).await
+        }
+
+        async fn list_models(
+            &self,
+            _context: &OperationContext,
+            _store_id: StoreId,
+            _options: &PageOptions,
+        ) -> Result<Page<Arc<StoredAuthorizationModel>>, StorageError> {
+            Err(StorageError::new(
+                StorageErrorKind::Unavailable,
+                "runtime_cancellation_probe_list_unsupported",
+            ))
+        }
+    }
+
+    fn cancellation_api(
+        entered: mpsc::Sender<StorageCancellationToken>,
+        active: Arc<AtomicUsize>,
+    ) -> anyhow::Result<(OpenFgaApi, AuthenticationService, Arc<MemoryStorage>)> {
+        let storage = Arc::new(MemoryStorage::start(MemoryStorageConfig::default())?);
+        let stores: Arc<dyn StoreReader> = storage.clone();
+        let store_writes: Arc<dyn StoreWriter> = storage.clone();
+        let models: Arc<dyn ModelReader> = storage.clone();
+        let model_writes: Arc<dyn ModelWriter> = storage.clone();
+        let tuples: Arc<dyn TupleReader> = storage.clone();
+        let tuple_writes: Arc<dyn TupleWriter> = storage.clone();
+        let assertion_reads: Arc<dyn AssertionReader> = storage.clone();
+        let assertion_writes: Arc<dyn AssertionWriter> = storage.clone();
+        let changes: Arc<dyn ChangeReader> = storage.clone();
+        let blocking_models: Arc<dyn ModelReader> =
+            Arc::new(BlockingModelReader { active, entered });
+        let identifiers: Arc<dyn IdentifierSource> = Arc::new(FixedIdentifiers {
+            store_id: STORE_ID.parse()?,
+            model_id: MODEL_ID.parse()?,
+        });
+        let limits = InputLimits::default();
+        let principal_id = "runtime-cancellation".parse::<PrincipalId>()?;
+        let authentication = AuthenticationService::development(principal_id.clone());
+        let services = OpenFgaServices::builder()
+            .stores(StoreService::new(
+                stores.clone(),
+                store_writes,
+                identifiers.clone(),
+            ))
+            .models(ModelService::new(
+                stores.clone(),
+                models.clone(),
+                model_writes,
+                ModelPublication::new(identifiers, Arc::new(FixedClock), ModelCompiler::default()),
+            ))
+            .assertions(AssertionService::new(
+                stores.clone(),
+                models,
+                assertion_reads,
+                assertion_writes,
+                limits.clone(),
+            ))
+            .tuples(TupleService::new(
+                stores.clone(),
+                blocking_models.clone(),
+                tuples.clone(),
+                tuple_writes,
+                limits.clone(),
+            ))
+            .changes(ChangeService::new(stores, changes))
+            .checks(CheckService::direct(
+                blocking_models,
+                tuples,
+                CheckBudget::default(),
+            ))
+            .build();
+        let api = OpenFgaApi::new(
+            services,
+            TransportConfig::builder()
+                .limits(limits.clone())
+                .authorization_policy(Arc::new(AuthorizationPolicy::development(principal_id)))
+                .token_codec(Arc::new(TokenCodec::new(
+                    TokenKey::new("runtime".parse::<TokenKeyId>()?, vec![11; 32])?,
+                    Vec::new(),
+                    &limits,
+                )?))
+                .request_timeout(RequestTimeout::new(Duration::from_secs(5))?)
+                .build(),
+        )
+        .map_err(anyhow::Error::msg)?;
+        Ok((api, authentication, storage))
+    }
+
+    async fn wait_for_request_cancellation(
+        cancellation: StorageCancellationToken,
+        active: &AtomicUsize,
+    ) -> anyhow::Result<()> {
+        timeout(Duration::from_secs(1), async {
+            while !cancellation.is_cancelled() || active.load(Ordering::Acquire) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_should_report_readiness_transitions() -> anyhow::Result<()> {
@@ -1090,6 +1295,100 @@ mod tests {
         let mut byte = [0_u8; 1];
         let closed = timeout(Duration::from_secs(1), client.read(&mut byte)).await?;
         assert!(matches!(closed, Ok(0) | Err(_)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_should_cancel_http_and_grpc_storage_work_on_client_disconnect()
+    -> anyhow::Result<()> {
+        let (entered_tx, mut entered_rx) = mpsc::channel(2);
+        let active = Arc::new(AtomicUsize::new(0));
+        let (api, authentication, storage) = cancellation_api(entered_tx, Arc::clone(&active))?;
+        let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let http_address = http_listener.local_addr()?;
+        let grpc_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let grpc_address = grpc_listener.local_addr()?;
+        let config_path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config/openfga-development.yaml");
+        let config = super::ServerConfig::load(&config_path).await?;
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut tasks = JoinSet::new();
+        spawn_http(
+            &mut tasks,
+            http_listener,
+            super::http_router(api.clone(), authentication.clone()),
+            None,
+            shutdown_rx.clone(),
+            Duration::from_secs(1),
+        )?;
+        let (_health_reporter, health_service) = tonic_health::server::health_reporter();
+        spawn_grpc(
+            &mut tasks,
+            grpc_listener,
+            TransportRuntime {
+                api: api.clone(),
+                authentication,
+            },
+            health_service,
+            None,
+            shutdown_rx,
+            &config,
+        )?;
+        drop(api);
+
+        let body = serde_json::to_vec(&serde_json::json!({
+            "tuple_key": {
+                "user": "user:anne",
+                "relation": "viewer",
+                "object": "document:roadmap"
+            },
+            "authorization_model_id": MODEL_ID
+        }))?;
+        let head = format!(
+            "POST /stores/{STORE_ID}/check HTTP/1.1\r\nHost: localhost\r\nContent-Type: \
+             application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len(),
+        );
+        let mut http_client = tokio::net::TcpStream::connect(http_address).await?;
+        http_client.write_all(head.as_bytes()).await?;
+        http_client.write_all(&body).await?;
+        let http_cancellation = timeout(Duration::from_secs(1), entered_rx.recv())
+            .await?
+            .context("HTTP request did not reach storage")?;
+        drop(http_client);
+        wait_for_request_cancellation(http_cancellation, active.as_ref()).await?;
+
+        let mut grpc_client =
+            OpenFgaServiceClient::connect(format!("http://{grpc_address}")).await?;
+        let grpc_request = pb::CheckRequest {
+            store_id: STORE_ID.to_owned(),
+            tuple_key: Some(pb::CheckRequestTupleKey {
+                user: "user:anne".to_owned(),
+                relation: "viewer".to_owned(),
+                object: "document:roadmap".to_owned(),
+            }),
+            contextual_tuples: None,
+            authorization_model_id: MODEL_ID.to_owned(),
+            trace: false,
+            context: None,
+            consistency: 0,
+        };
+        let grpc_request_task = tokio::spawn(async move { grpc_client.check(grpc_request).await });
+        let grpc_cancellation = timeout(Duration::from_secs(1), entered_rx.recv())
+            .await?
+            .context("gRPC request did not reach storage")?;
+        grpc_request_task.abort();
+        let request_result = grpc_request_task.await;
+        assert!(request_result.is_err_and(|error| error.is_cancelled()));
+        wait_for_request_cancellation(grpc_cancellation, active.as_ref()).await?;
+
+        shutdown_tx.send(true)?;
+        drain_tasks(&mut tasks, Duration::from_secs(2)).await?;
+        assert!(tasks.is_empty());
+        assert_eq!(active.load(Ordering::Acquire), 0);
+        let mut storage = Arc::try_unwrap(storage)
+            .map_err(|_| anyhow::anyhow!("runtime cancellation storage references remain"))?;
+        storage.stop().await?;
         Ok(())
     }
 

@@ -13,15 +13,14 @@ use crate::ServiceError;
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct ChangeService {
-    stores: Arc<dyn StoreReader>,
     changes: Arc<dyn ChangeReader>,
 }
 
 impl ChangeService {
     /// Creates a service from narrow store and changelog capabilities.
     #[must_use]
-    pub const fn new(stores: Arc<dyn StoreReader>, changes: Arc<dyn ChangeReader>) -> Self {
-        Self { stores, changes }
+    pub fn new(_stores: Arc<dyn StoreReader>, changes: Arc<dyn ChangeReader>) -> Self {
+        Self { changes }
     }
 
     /// Reads a stable oldest-first changelog page.
@@ -37,7 +36,6 @@ impl ChangeService {
         filter: &ChangeFilter,
         options: &PageOptions,
     ) -> Result<Page<TupleChange>, ServiceError> {
-        crate::common::require_store(self.stores.as_ref(), context, store_id).await?;
         let page = self
             .changes
             .read_changes(context, store_id, filter, options)
@@ -52,7 +50,6 @@ impl fmt::Debug for ChangeService {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ChangeService")
-            .field("stores", &"dyn StoreReader")
             .field("changes", &"dyn ChangeReader")
             .finish_non_exhaustive()
     }

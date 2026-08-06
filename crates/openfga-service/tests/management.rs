@@ -246,7 +246,7 @@ async fn exercise_tuples_assertions_and_changes(
     assert_eq!(invalid.kind(), ServiceErrorKind::InvalidRequest);
 
     let nonexistent_model = "01ARZ3NDEKTSV4RRFFQ69G5FAX".parse()?;
-    let deleted = tuples
+    let missing_model = tuples
         .write(
             context,
             store_id,
@@ -255,8 +255,10 @@ async fn exercise_tuples_assertions_and_changes(
             Vec::new(),
             TupleWriteOptions::default(),
         )
-        .await?;
-    assert_eq!(deleted.change_ids().len(), 1);
+        .await
+        .err()
+        .ok_or("delete-only write unexpectedly skipped model resolution")?;
+    assert_eq!(missing_model.kind(), ServiceErrorKind::ModelNotFound);
     Ok(())
 }
 
@@ -279,6 +281,8 @@ async fn exercise_assertions(
             store_id,
             ModelSelection::Latest,
             vec![assertion.clone()],
+            0,
+            64_000,
         )
         .await?;
     assert_eq!(resolved_id, model_id);
@@ -302,6 +306,8 @@ async fn exercise_assertions(
             store_id,
             ModelSelection::Latest,
             vec![invalid_assertion],
+            0,
+            64_000,
         )
         .await
         .err()
@@ -384,6 +390,7 @@ async fn exercise_delete(
         .err()
         .ok_or("deleted store unexpectedly remained readable")?;
     assert_eq!(missing.kind(), ServiceErrorKind::StoreNotFound);
+    service.delete(context, store_id).await?;
     Ok(())
 }
 

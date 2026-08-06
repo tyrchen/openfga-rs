@@ -13,7 +13,10 @@ use openfga_domain::{
 };
 
 use crate::{
-    error::{DeclarationPath, ErrorCollector, ModelErrorCode, ModelErrors, ModelLookupError},
+    error::{
+        DeclarationPath, ErrorCollector, ModelErrorCode, ModelErrorDetail, ModelErrors,
+        ModelLookupError,
+    },
     graph::{GraphMetadata, build_graph_metadata, computed_cycle_relations},
     ir::{
         CompiledConditionEntry, CompiledRelation, CompiledType, ConditionId, ConditionRequirement,
@@ -344,11 +347,10 @@ impl<'a> Compiler<'a> {
         if !self.errors.is_empty() {
             return Err(self.errors.finish());
         }
-        let entrypoints = self.validate_entrypoints(&symbols, &relations, &nodes);
-        for relation in computed_cycle_relations(&relations, &nodes) {
-            if !entrypoints.get(relation.index()).copied().unwrap_or(false)
-                && let Some(origin) = symbols.relation_origins.get(relation.index())
-            {
+        let cycle_relations = computed_cycle_relations(&relations, &nodes);
+        let _ = self.validate_entrypoints(&symbols, &relations, &nodes, &cycle_relations);
+        for relation in cycle_relations {
+            if let Some(origin) = symbols.relation_origins.get(relation.index()) {
                 self.errors.push(
                     ModelErrorCode::ForbiddenComputedCycle,
                     relation_path(origin),
@@ -438,13 +440,17 @@ impl<'a> Compiler<'a> {
                 if !seen_relations.insert(relation.name.clone()) {
                     self.errors.push(ModelErrorCode::DuplicateRelation, path);
                 }
-                validate_rewrite_shape(
-                    &relation.rewrite,
-                    type_index,
-                    relation_index,
-                    self.limits,
-                    &mut self.errors,
-                );
+                if relation.rewrite_valid {
+                    validate_rewrite_shape(
+                        &relation.rewrite,
+                        type_index,
+                        relation_index,
+                        self.limits,
+                        &mut self.errors,
+                    );
+                } else {
+                    self.errors.push(ModelErrorCode::InvalidRewrite, path);
+                }
             }
         }
         if total_relations > self.limits.input().relations() {
@@ -463,6 +469,16 @@ impl<'a> Compiler<'a> {
             if condition.key != *condition.definition.name() {
                 self.errors
                     .push(ModelErrorCode::ConditionNameMismatch, path);
+            }
+            for (parameter_index, error) in &condition.parameter_type_errors {
+                self.errors.push_detail(
+                    ModelErrorCode::InvalidConditionParameterType,
+                    DeclarationPath::Parameter {
+                        condition_index: to_u32(index),
+                        parameter_index: *parameter_index,
+                    },
+                    ModelErrorDetail::ConditionParameterType(error.clone()),
+                );
             }
         }
     }
@@ -533,10 +549,15 @@ impl<'a> Compiler<'a> {
                         condition: Arc::new(condition),
                     });
                 }
-                Err(_) => self.errors.push(
+                Err(error) => self.errors.push_detail(
                     ModelErrorCode::InvalidCondition,
                     DeclarationPath::Condition {
                         index: to_u32(index),
+                    },
+                    ModelErrorDetail::ConditionCompile {
+                        kind: error.kind(),
+                        found_type: error.found_type(),
+                        diagnostic: error.detail().cloned(),
                     },
                 ),
             }
@@ -673,6 +694,7 @@ impl<'a> Compiler<'a> {
         symbols: &Symbols<'_>,
         relations: &[CompiledRelation],
         nodes: &[RewriteNode],
+        cycle_relations: &BTreeSet<RelationId>,
     ) -> Vec<bool> {
         let mut entrypoints = vec![false; relations.len()];
         let mut remaining = relations.len().saturating_add(1);
@@ -705,8 +727,12 @@ impl<'a> Compiler<'a> {
                 .unwrap_or(false)
                 && let Some(origin) = symbols.relation_origins.get(relation.id().index())
             {
-                self.errors
-                    .push(ModelErrorCode::NoEntrypoints, relation_path(origin));
+                let code = if cycle_relations.contains(&relation.id()) {
+                    ModelErrorCode::PotentialLoop
+                } else {
+                    ModelErrorCode::NoEntrypoints
+                };
+                self.errors.push(code, relation_path(origin));
             }
         }
         entrypoints
@@ -742,81 +768,81 @@ fn lower_rewrite(
 ) -> Option<NodeId> {
     let mut frames = vec![LowerFrame::Visit(root, 1)];
     let mut values = Vec::new();
+    let mut source_nodes = 0_usize;
     while let Some(frame) = frames.pop() {
         match frame {
-            LowerFrame::Visit(source, depth) => match source {
-                RewriteSource::Direct => values.push(intern_node(
-                    RewriteNode::Direct(context.origin.id),
-                    nodes,
-                    node_lookup,
-                    limits,
-                    errors,
-                )?),
-                RewriteSource::Computed(name) => {
-                    let type_name = context
-                        .symbols
-                        .types
-                        .get(context.origin.object_type.index())
-                        .map(|compiled_type| compiled_type.name.clone())?;
-                    let Some(target) = context
-                        .symbols
-                        .relation_lookup
-                        .get(&(type_name, name.clone()))
-                        .copied()
-                    else {
-                        errors.push(
-                            ModelErrorCode::UndefinedRelation,
-                            relation_path(context.origin),
-                        );
-                        return None;
-                    };
-                    if target == context.origin.id {
-                        errors.push(
-                            ModelErrorCode::IllegalSelfReference,
-                            relation_path(context.origin),
-                        );
-                        return None;
+            LowerFrame::Visit(source, depth) => {
+                let path = rewrite_path(context.origin, source_nodes);
+                source_nodes = source_nodes.saturating_add(1);
+                match source {
+                    RewriteSource::Direct => values.push(intern_node(
+                        RewriteNode::Direct(context.origin.id),
+                        nodes,
+                        node_lookup,
+                        limits,
+                        errors,
+                    )?),
+                    RewriteSource::Computed(name) => {
+                        let type_name = context
+                            .symbols
+                            .types
+                            .get(context.origin.object_type.index())
+                            .map(|compiled_type| compiled_type.name.clone())?;
+                        let Some(target) = context
+                            .symbols
+                            .relation_lookup
+                            .get(&(type_name, name.clone()))
+                            .copied()
+                        else {
+                            errors.push(ModelErrorCode::UndefinedRelation, path);
+                            return None;
+                        };
+                        if target == context.origin.id {
+                            errors.push(ModelErrorCode::IllegalSelfReference, path);
+                            return None;
+                        }
+                        values.push(intern_node(
+                            RewriteNode::Computed(target),
+                            nodes,
+                            node_lookup,
+                            limits,
+                            errors,
+                        )?);
                     }
-                    values.push(intern_node(
-                        RewriteNode::Computed(target),
-                        nodes,
-                        node_lookup,
-                        limits,
-                        errors,
-                    )?);
+                    RewriteSource::TupleToUserset { tupleset, computed } => {
+                        let (tupleset_id, targets) =
+                            resolve_ttu(tupleset, computed, context, path, errors)?;
+                        values.push(intern_node(
+                            RewriteNode::TupleToUserset {
+                                tupleset: tupleset_id,
+                                computed: computed.clone(),
+                                targets: targets.into_boxed_slice(),
+                            },
+                            nodes,
+                            node_lookup,
+                            limits,
+                            errors,
+                        )?);
+                    }
+                    RewriteSource::Union(children) => {
+                        push_lower_children(&mut frames, children, depth, LowerFrame::FinishUnion);
+                    }
+                    RewriteSource::Intersection(children) => {
+                        push_lower_children(
+                            &mut frames,
+                            children,
+                            depth,
+                            LowerFrame::FinishIntersection,
+                        );
+                    }
+                    RewriteSource::Difference { base, subtract } => {
+                        let next_depth = depth.checked_add(1)?;
+                        frames.push(LowerFrame::FinishDifference);
+                        frames.push(LowerFrame::Visit(subtract, next_depth));
+                        frames.push(LowerFrame::Visit(base, next_depth));
+                    }
                 }
-                RewriteSource::TupleToUserset { tupleset, computed } => {
-                    let (tupleset_id, targets) = resolve_ttu(tupleset, computed, context, errors)?;
-                    values.push(intern_node(
-                        RewriteNode::TupleToUserset {
-                            tupleset: tupleset_id,
-                            computed: computed.clone(),
-                            targets: targets.into_boxed_slice(),
-                        },
-                        nodes,
-                        node_lookup,
-                        limits,
-                        errors,
-                    )?);
-                }
-                RewriteSource::Union(children) => {
-                    push_lower_children(&mut frames, children, depth, LowerFrame::FinishUnion);
-                }
-                RewriteSource::Intersection(children) => {
-                    push_lower_children(
-                        &mut frames,
-                        children,
-                        depth,
-                        LowerFrame::FinishIntersection,
-                    );
-                }
-                RewriteSource::Difference { base, subtract } => {
-                    let next_depth = depth.checked_add(1)?;
-                    frames.push(LowerFrame::FinishDifference);
-                    frames.push(LowerFrame::Visit(subtract, next_depth));
-                    frames.push(LowerFrame::Visit(base, next_depth));
-                }
-            },
+            }
             LowerFrame::FinishUnion(count) => {
                 let children = take_node_tail(&mut values, count)?;
                 values.push(intern_node(
@@ -865,6 +891,7 @@ fn resolve_ttu(
     tupleset: &RelationName,
     computed: &RelationName,
     context: LowerContext<'_>,
+    path: DeclarationPath,
     errors: &mut ErrorCollector,
 ) -> Option<(RelationId, Vec<RelationId>)> {
     let type_name = context
@@ -879,34 +906,22 @@ fn resolve_ttu(
         .get(&(type_name, tupleset.clone()))
         .copied()
     else {
-        errors.push(
-            ModelErrorCode::UndefinedRelation,
-            relation_path(context.origin),
-        );
+        errors.push(ModelErrorCode::UndefinedRelation, path);
         return None;
     };
     let Some(tupleset_origin) = context.symbols.relation_origins.get(tupleset_id.index()) else {
-        errors.push(
-            ModelErrorCode::InvalidTuplesetRelation,
-            relation_path(context.origin),
-        );
+        errors.push(ModelErrorCode::InvalidTuplesetRelation, path);
         return None;
     };
     if !matches!(tupleset_origin.source.rewrite, RewriteSource::Direct) {
-        errors.push(
-            ModelErrorCode::InvalidTuplesetRelation,
-            relation_path(context.origin),
-        );
+        errors.push(ModelErrorCode::InvalidTuplesetRelation, path);
         return None;
     }
     let restrictions = context.restrictions.get(tupleset_id.index())?;
     let mut targets = Vec::new();
     for restriction in restrictions {
         if restriction.kind() != RestrictionKind::Object {
-            errors.push(
-                ModelErrorCode::InvalidRestriction,
-                relation_path(context.origin),
-            );
+            errors.push(ModelErrorCode::InvalidRestriction, path);
             return None;
         }
         let Some(target_type) = context
@@ -922,10 +937,7 @@ fn resolve_ttu(
             .get(&(target_type.name.clone(), computed.clone()))
             .copied()
         else {
-            errors.push(
-                ModelErrorCode::InvalidTupleToUsersetTarget,
-                relation_path(context.origin),
-            );
+            errors.push(ModelErrorCode::InvalidTupleToUsersetTarget, path);
             return None;
         };
         targets.push(target);
@@ -933,10 +945,7 @@ fn resolve_ttu(
     targets.sort_unstable();
     targets.dedup();
     if targets.is_empty() {
-        errors.push(
-            ModelErrorCode::InvalidTupleToUsersetTarget,
-            relation_path(context.origin),
-        );
+        errors.push(ModelErrorCode::InvalidTupleToUsersetTarget, path);
         None
     } else {
         Some((tupleset_id, targets))
@@ -1214,5 +1223,13 @@ fn relation_path(origin: &RelationOrigin<'_>) -> DeclarationPath {
     DeclarationPath::Relation {
         type_index: to_u32(origin.type_index),
         relation_index: to_u32(origin.relation_index),
+    }
+}
+
+fn rewrite_path(origin: &RelationOrigin<'_>, node_index: usize) -> DeclarationPath {
+    DeclarationPath::Rewrite {
+        type_index: to_u32(origin.type_index),
+        relation_index: to_u32(origin.relation_index),
+        node_index: to_u32(node_index),
     }
 }

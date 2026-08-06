@@ -48,3 +48,6 @@ tracing-subscriber.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true

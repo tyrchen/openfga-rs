@@ -37,7 +37,7 @@ const STORE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 const MODEL_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAW";
 
 #[tokio::test]
-async fn test_should_resolve_all_rewrites_usersets_wildcards_and_cycles()
+async fn test_should_resolve_all_rewrites_usersets_wildcards_and_legal_recursion()
 -> Result<(), Box<dyn Error>> {
     let storage = memory_storage().await?;
     let model = ModelCompiler::default().compile(&complete_model()?)?;
@@ -56,7 +56,7 @@ async fn test_should_resolve_all_rewrites_usersets_wildcards_and_cycles()
             tuple("document:excluded#viewer@user:alice")?,
             tuple("document:excluded#banned@user:alice")?,
             tuple("document:included#viewer@user:alice")?,
-            tuple("document:cycle#cycle_b@user:alice")?,
+            tuple("folder:cycle#parent@folder:cycle")?,
         ],
     )
     .await?;
@@ -70,7 +70,6 @@ async fn test_should_resolve_all_rewrites_usersets_wildcards_and_cycles()
         "document:ttu#viewer@user:alice",
         "document:both#both@user:alice",
         "document:included#allowed@user:alice",
-        "document:cycle#cycle_a@user:alice",
     ] {
         let outcome = evaluate(
             query,
@@ -89,7 +88,7 @@ async fn test_should_resolve_all_rewrites_usersets_wildcards_and_cycles()
         "document:direct#viewer@user:bob",
         "document:both#both@user:bob",
         "document:excluded#allowed@user:alice",
-        "document:missing#cycle_a@user:alice",
+        "folder:cycle#viewer@user:alice",
     ] {
         let outcome = evaluate(
             query,
@@ -102,7 +101,7 @@ async fn test_should_resolve_all_rewrites_usersets_wildcards_and_cycles()
         )
         .await?;
         assert!(!outcome.allowed(), "expected deny for {query}");
-        if query.contains("cycle_a") {
+        if query.starts_with("folder:cycle#") {
             assert!(outcome.metadata().cycles() > 0);
         }
     }
@@ -652,11 +651,18 @@ fn complete_model() -> Result<AuthorizationModelSource, Box<dyn Error>> {
     )?;
     let folder = type_source(
         "folder",
-        vec![relation(
-            "viewer",
-            RewriteSource::Direct,
-            vec![object("user", None)?, wildcard("user")?],
-        )?],
+        vec![
+            relation(
+                "parent",
+                RewriteSource::Direct,
+                vec![object("folder", None)?],
+            )?,
+            relation(
+                "viewer",
+                RewriteSource::Union(vec![RewriteSource::Direct, ttu("parent", "viewer")?]),
+                vec![object("user", None)?, wildcard("user")?],
+            )?,
+        ],
     )?;
     let document = type_source(
         "document",
@@ -704,16 +710,6 @@ fn complete_model() -> Result<AuthorizationModelSource, Box<dyn Error>> {
                     subtract: Box::new(computed("banned")?),
                 },
                 Vec::new(),
-            )?,
-            relation(
-                "cycle_a",
-                RewriteSource::Union(vec![RewriteSource::Direct, computed("cycle_b")?]),
-                vec![object("user", None)?],
-            )?,
-            relation(
-                "cycle_b",
-                RewriteSource::Union(vec![RewriteSource::Direct, computed("cycle_a")?]),
-                vec![object("user", None)?],
             )?,
         ],
     )?;

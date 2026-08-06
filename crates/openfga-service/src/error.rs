@@ -3,6 +3,9 @@
 use std::fmt;
 
 use openfga_check::{CheckError, CheckErrorKind};
+use openfga_domain::{
+    AuthorizationModelId, ConditionName, RelationName, RelationshipTuple, TupleKey, TypeName,
+};
 use openfga_model::{ModelErrors, TupleValidationError, TupleValidationErrorKind};
 use openfga_storage::{StorageError, StorageErrorKind};
 use thiserror::Error;
@@ -38,6 +41,91 @@ pub enum ServiceErrorKind {
     Internal,
 }
 
+/// Safely bounded source context for exact model-compilation error rendering.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ModelSemanticContext {
+    /// A whole-model diagnostic with no source identifier.
+    Model,
+    /// A latest-model selection for one validated store namespace.
+    LatestSelection {
+        /// Store namespace used by the selection.
+        store_id: openfga_domain::StoreId,
+    },
+    /// One type declaration.
+    Type {
+        /// Declared object type.
+        object_type: TypeName,
+    },
+    /// One relation declaration.
+    Relation {
+        /// Enclosing object type.
+        object_type: TypeName,
+        /// Declared relation.
+        relation: RelationName,
+    },
+    /// One direct relation-type restriction.
+    Restriction {
+        /// Enclosing object type.
+        object_type: TypeName,
+        /// Enclosing relation.
+        relation: RelationName,
+        /// Referenced subject type.
+        subject_type: TypeName,
+        /// Referenced subject userset relation, when present.
+        subject_relation: Option<RelationName>,
+        /// Referenced condition, when present.
+        condition: Option<ConditionName>,
+    },
+    /// One relation rewrite and its safely bounded referenced declarations.
+    Rewrite {
+        /// Enclosing object type.
+        object_type: TypeName,
+        /// Enclosing relation.
+        relation: RelationName,
+        /// Missing or self-referenced computed relation, when present.
+        referenced_relation: Option<RelationName>,
+        /// Tuple-to-userset tupleset relation, when present.
+        tupleset: Option<RelationName>,
+        /// Tuple-to-userset computed relation, when present.
+        computed: Option<RelationName>,
+        /// Direct target types permitted by the tupleset relation.
+        target_types: Box<[ModelRelationType]>,
+        /// Set operator at this rewrite node, when applicable.
+        operator: Option<ModelSetOperator>,
+        /// Number of operands declared on the set operator.
+        child_count: Option<usize>,
+    },
+    /// One condition declaration.
+    Condition {
+        /// Condition map key.
+        key: ConditionName,
+        /// Name declared inside the condition.
+        name: ConditionName,
+    },
+}
+
+/// Safely renderable authorization-model set operator.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ModelSetOperator {
+    /// Set union.
+    Union,
+    /// Set intersection.
+    Intersection,
+}
+
+/// Safely bounded source form of one direct relation-type restriction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ModelRelationType {
+    /// A concrete object restriction.
+    Object(TypeName),
+    /// A userset restriction.
+    Userset(TypeName, RelationName),
+    /// A typed-wildcard restriction.
+    Wildcard(TypeName),
+}
+
 #[derive(Debug, Error)]
 enum ServiceErrorSource {
     #[error(transparent)]
@@ -59,7 +147,14 @@ pub struct ServiceError {
     kind: ServiceErrorKind,
     code: &'static str,
     #[source]
-    source: Option<ServiceErrorSource>,
+    source: Option<Box<ServiceErrorSource>>,
+    tuple: Option<Box<TupleKey>>,
+    condition: Option<Box<ConditionName>>,
+    condition_parameter_count: Option<usize>,
+    model_id: Option<Box<AuthorizationModelId>>,
+    model_context: Option<Box<ModelSemanticContext>>,
+    actual: Option<usize>,
+    limit: Option<usize>,
 }
 
 impl ServiceError {
@@ -75,11 +170,148 @@ impl ServiceError {
         self.code
     }
 
+    /// Returns safely bounded tuple context for public semantic error mapping.
+    #[must_use]
+    pub fn tuple(&self) -> Option<&TupleKey> {
+        self.tuple.as_deref()
+    }
+
+    /// Returns the validated condition identifier attached to a relationship tuple.
+    #[must_use]
+    pub fn condition(&self) -> Option<&ConditionName> {
+        self.condition.as_deref()
+    }
+
+    /// Returns the selected condition's declared parameter count when known.
+    #[must_use]
+    pub const fn condition_parameter_count(&self) -> Option<usize> {
+        self.condition_parameter_count
+    }
+
+    /// Returns the validated model identifier associated with a public failure.
+    #[must_use]
+    pub fn model_id(&self) -> Option<AuthorizationModelId> {
+        self.model_id.as_ref().map(|model_id| **model_id)
+    }
+
+    /// Returns safely bounded model source context for public error mapping.
+    #[must_use]
+    pub fn model_context(&self) -> Option<&ModelSemanticContext> {
+        self.model_context.as_deref()
+    }
+
+    /// Returns structured authorization-model diagnostics when compilation failed.
+    #[must_use]
+    pub fn model_errors(&self) -> Option<&ModelErrors> {
+        match self.source.as_deref() {
+            Some(ServiceErrorSource::Model(errors)) => Some(errors),
+            _ => None,
+        }
+    }
+
+    /// Returns the structured tuple diagnostic when semantic validation failed.
+    #[must_use]
+    pub fn tuple_validation_error(&self) -> Option<&TupleValidationError> {
+        match self.source.as_deref() {
+            Some(ServiceErrorSource::TupleValidation(error)) => Some(error),
+            _ => None,
+        }
+    }
+
+    /// Returns the configured finite limit associated with a resource failure.
+    #[must_use]
+    pub const fn limit(&self) -> Option<usize> {
+        self.limit
+    }
+
+    /// Returns the measured resource size associated with a bounded-input failure.
+    #[must_use]
+    pub const fn actual(&self) -> Option<usize> {
+        self.actual
+    }
+
+    /// Attaches a validated, byte-bounded tuple for exact public error rendering.
+    #[must_use]
+    pub fn with_tuple(mut self, tuple: TupleKey) -> Self {
+        self.tuple = Some(Box::new(tuple));
+        self
+    }
+
+    /// Attaches a validated tuple key and its optional condition name without condition values.
+    #[must_use]
+    pub fn with_relationship_tuple(mut self, tuple: &RelationshipTuple) -> Self {
+        self.tuple = Some(Box::new(tuple.key().clone()));
+        self.condition = tuple
+            .condition()
+            .binding()
+            .map(|binding| Box::new(binding.name().clone()));
+        self
+    }
+
+    /// Attaches the selected condition's declared parameter count.
+    #[must_use]
+    pub const fn with_condition_parameter_count(mut self, count: Option<usize>) -> Self {
+        self.condition_parameter_count = count;
+        self
+    }
+
+    /// Attaches a validated model identifier for exact public error rendering.
+    #[must_use]
+    pub fn with_model_id(mut self, model_id: AuthorizationModelId) -> Self {
+        self.model_id = Some(Box::new(model_id));
+        self
+    }
+
+    /// Attaches safely bounded model source context for exact public errors.
+    #[must_use]
+    pub fn with_model_context(mut self, context: ModelSemanticContext) -> Self {
+        self.model_context = Some(Box::new(context));
+        self
+    }
+
+    pub(crate) fn assertion_tuple(source: TupleValidationError, tuple: TupleKey) -> Self {
+        let code = match source.code() {
+            "query_object_type_missing" => "assertion_object_type_missing",
+            "query_relation_missing" => "assertion_relation_missing",
+            "query_subject_type_missing" => "assertion_subject_type_missing",
+            "query_userset_relation_missing" => "assertion_userset_relation_missing",
+            code => code,
+        };
+        Self::from_source(
+            ServiceErrorKind::InvalidRequest,
+            code,
+            ServiceErrorSource::TupleValidation(source),
+        )
+        .with_tuple(tuple)
+    }
+
+    pub(crate) const fn tuple_write_limit(limit: usize) -> Self {
+        Self {
+            kind: ServiceErrorKind::ResourceExhausted,
+            code: "tuple_write_item_limit",
+            source: None,
+            tuple: None,
+            condition: None,
+            condition_parameter_count: None,
+            model_id: None,
+            model_context: None,
+            actual: None,
+            limit: Some(limit),
+        }
+    }
+
     pub(crate) const fn unsupported_model_selection() -> Self {
         Self {
             kind: ServiceErrorKind::Internal,
             code: "unsupported_model_selection",
             source: None,
+            tuple: None,
+            condition: None,
+            condition_parameter_count: None,
+            model_id: None,
+            model_context: None,
+            actual: None,
+            limit: None,
         }
     }
 
@@ -112,6 +344,13 @@ impl ServiceError {
             kind: ServiceErrorKind::InvalidRequest,
             code,
             source: None,
+            tuple: None,
+            condition: None,
+            condition_parameter_count: None,
+            model_id: None,
+            model_context: None,
+            actual: None,
+            limit: None,
         }
     }
 
@@ -120,6 +359,50 @@ impl ServiceError {
             kind: ServiceErrorKind::ResourceExhausted,
             code,
             source: None,
+            tuple: None,
+            condition: None,
+            condition_parameter_count: None,
+            model_id: None,
+            model_context: None,
+            actual: None,
+            limit: None,
+        }
+    }
+
+    pub(crate) const fn resource_exhausted_with_limit(code: &'static str, limit: usize) -> Self {
+        Self {
+            kind: ServiceErrorKind::ResourceExhausted,
+            code,
+            source: None,
+            tuple: None,
+            condition: None,
+            condition_parameter_count: None,
+            model_id: None,
+            model_context: None,
+            actual: None,
+            limit: Some(limit),
+        }
+    }
+
+    pub(crate) fn condition_context_size(
+        tuple: &RelationshipTuple,
+        actual: usize,
+        limit: usize,
+    ) -> Self {
+        Self {
+            kind: ServiceErrorKind::InvalidRequest,
+            code: "relationship_condition_context_size",
+            source: None,
+            tuple: Some(Box::new(tuple.key().clone())),
+            condition: tuple
+                .condition()
+                .binding()
+                .map(|binding| Box::new(binding.name().clone())),
+            condition_parameter_count: None,
+            model_id: None,
+            model_context: None,
+            actual: Some(actual),
+            limit: Some(limit),
         }
     }
 
@@ -127,7 +410,14 @@ impl ServiceError {
         Self {
             kind,
             code,
-            source: Some(source),
+            source: Some(Box::new(source)),
+            tuple: None,
+            condition: None,
+            condition_parameter_count: None,
+            model_id: None,
+            model_context: None,
+            actual: None,
+            limit: None,
         }
     }
 }
@@ -153,30 +443,60 @@ impl From<CheckError> for ServiceError {
         Self {
             kind,
             code,
-            source: Some(ServiceErrorSource::Check(source)),
+            source: Some(Box::new(ServiceErrorSource::Check(source))),
+            tuple: None,
+            condition: None,
+            condition_parameter_count: None,
+            model_id: None,
+            model_context: None,
+            actual: None,
+            limit: None,
         }
     }
 }
 
 impl From<StorageError> for ServiceError {
     fn from(source: StorageError) -> Self {
-        let kind = match source.kind() {
-            StorageErrorKind::AlreadyExists => ServiceErrorKind::AlreadyExists,
-            StorageErrorKind::Conflict => ServiceErrorKind::Conflict,
-            StorageErrorKind::InvalidContinuation => ServiceErrorKind::InvalidContinuation,
-            StorageErrorKind::Timeout => ServiceErrorKind::Timeout,
-            StorageErrorKind::Cancelled => ServiceErrorKind::Cancelled,
-            StorageErrorKind::Unavailable => ServiceErrorKind::Unavailable,
-            StorageErrorKind::ResourceExhausted => ServiceErrorKind::ResourceExhausted,
-            StorageErrorKind::NotFound
-            | StorageErrorKind::Integrity
-            | StorageErrorKind::Internal => ServiceErrorKind::Internal,
+        let storage_code = source.code();
+        let tuple = source.tuple().cloned().map(Box::new);
+        let kind = match (source.kind(), storage_code) {
+            (
+                StorageErrorKind::Conflict,
+                "missing_tuple_delete"
+                | "tuple_delete_missing"
+                | "duplicate_tuple_write"
+                | "tuple_write_duplicate",
+            ) => ServiceErrorKind::InvalidRequest,
+            (StorageErrorKind::AlreadyExists, _) => ServiceErrorKind::AlreadyExists,
+            (StorageErrorKind::Conflict, _) => ServiceErrorKind::Conflict,
+            (StorageErrorKind::InvalidContinuation, _) => ServiceErrorKind::InvalidContinuation,
+            (StorageErrorKind::Timeout, _) => ServiceErrorKind::Timeout,
+            (StorageErrorKind::Cancelled, _) => ServiceErrorKind::Cancelled,
+            (StorageErrorKind::Unavailable, _) => ServiceErrorKind::Unavailable,
+            (StorageErrorKind::ResourceExhausted, _) => ServiceErrorKind::ResourceExhausted,
+            (
+                StorageErrorKind::NotFound
+                | StorageErrorKind::Integrity
+                | StorageErrorKind::Internal,
+                _,
+            ) => ServiceErrorKind::Internal,
         };
-        let code = source.code();
+        let code = match storage_code {
+            "missing_tuple_delete" | "tuple_delete_missing" => "missing_tuple_delete",
+            "duplicate_tuple_write" | "tuple_write_duplicate" => "duplicate_tuple_write",
+            code => code,
+        };
         Self {
             kind,
             code,
-            source: Some(ServiceErrorSource::Storage(source)),
+            source: Some(Box::new(ServiceErrorSource::Storage(source))),
+            tuple,
+            condition: None,
+            condition_parameter_count: None,
+            model_id: None,
+            model_context: None,
+            actual: None,
+            limit: None,
         }
     }
 }
@@ -227,7 +547,17 @@ impl fmt::Debug for ServiceError {
             .field("kind", &self.kind)
             .field("code", &self.code)
             .field("source", &"[REDACTED]")
-            .finish()
+            .field("tuple", &self.tuple.as_ref().map(|_| "[REDACTED]"))
+            .field("condition", &self.condition.as_ref().map(|_| "[REDACTED]"))
+            .field("condition_parameter_count", &self.condition_parameter_count)
+            .field("model_id", &self.model_id.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "model_context",
+                &self.model_context.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("limit", &self.limit)
+            .field("actual", &self.actual)
+            .finish_non_exhaustive()
     }
 }
 

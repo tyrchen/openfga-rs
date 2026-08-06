@@ -60,6 +60,8 @@ transport:
     windowSeconds: 60
     authenticationAttempts: 20000
     authenticationFailures: 2000
+    globalAuthenticationAttempts: 200000
+    globalAuthenticationFailures: 20000
     administration: 1000
     reads: 10000
     writes: 2000
