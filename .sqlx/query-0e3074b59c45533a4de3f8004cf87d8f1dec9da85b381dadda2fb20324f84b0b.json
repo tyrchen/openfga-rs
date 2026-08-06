@@ -1,0 +1,42 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT tuple_payload,\n                    (EXTRACT(EPOCH FROM inserted_at) * 1000)::BIGINT AS \"inserted_at_ms!\"\n                   FROM tuples\n                   WHERE store_id = $1 AND object_type = $2 AND object_id = $3\n                     AND relation = $4 AND subject_kind = $5 AND subject_type = $6\n                     AND subject_id = $7 AND subject_relation = $8",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "tuple_payload",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "tuples",
+            "name": "tuple_payload"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "inserted_at_ms!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Int2",
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      null
+    ]
+  },
+  "hash": "0e3074b59c45533a4de3f8004cf87d8f1dec9da85b381dadda2fb20324f84b0b"
+}

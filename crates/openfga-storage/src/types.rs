@@ -228,6 +228,12 @@ impl StoredTuple {
     pub const fn inserted_at(&self) -> SystemTime {
         self.inserted_at
     }
+
+    /// Consumes the stored record and returns its relationship tuple.
+    #[must_use]
+    pub fn into_tuple(self) -> RelationshipTuple {
+        self.tuple
+    }
 }
 
 /// One persisted assertion used to verify an immutable model.
@@ -473,6 +479,30 @@ impl ConditionFilter {
                 ConditionSelection::Named(names),
             ) => names.contains(binding.name()),
             _ => false,
+        }
+    }
+
+    /// Returns whether every condition state is accepted.
+    #[must_use]
+    pub const fn is_any(&self) -> bool {
+        matches!(self.0, ConditionSelection::Any)
+    }
+
+    /// Returns whether unconditional tuples are accepted.
+    #[must_use]
+    pub const fn accepts_unconditional(&self) -> bool {
+        matches!(
+            self.0,
+            ConditionSelection::Any | ConditionSelection::Unconditional
+        )
+    }
+
+    /// Returns the accepted condition names when the filter is name-restricted.
+    #[must_use]
+    pub const fn names(&self) -> Option<&BTreeSet<ConditionName>> {
+        match &self.0 {
+            ConditionSelection::Named(names) => Some(names),
+            ConditionSelection::Any | ConditionSelection::Unconditional => None,
         }
     }
 }

@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT EXISTS(\n                    SELECT 1 FROM tuples\n                    WHERE store_id = $1 AND object_type = $2 AND object_id = $3\n                      AND relation = $4 AND subject_kind = $5 AND subject_type = $6\n                      AND subject_id = $7 AND subject_relation = $8\n                ) AS \"exists!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "exists!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Int2",
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "fe0b3ea0f9bf8637b9b620e956ecf449c9337350251cf16e6bc66895d49f73f0"
+}

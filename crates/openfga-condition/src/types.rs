@@ -40,6 +40,35 @@ pub struct ParameterType {
     depth: u8,
 }
 
+/// Borrowed structural view of one validated condition parameter type.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ParameterTypeRef<'a> {
+    /// Dynamic CEL `any`.
+    Any,
+    /// Boolean.
+    Bool,
+    /// UTF-8 string.
+    String,
+    /// Signed 64-bit integer.
+    Int,
+    /// Unsigned 64-bit integer.
+    Uint,
+    /// Finite double.
+    Double,
+    /// Byte string.
+    Bytes,
+    /// Signed duration.
+    Duration,
+    /// Absolute timestamp.
+    Timestamp,
+    /// IP address.
+    IpAddress,
+    /// Homogeneous list.
+    List(&'a ParameterType),
+    /// String-keyed homogeneous map.
+    Map(&'a ParameterType),
+}
+
 macro_rules! scalar_parameter_type {
     ($name:ident, $kind:ident, $docs:literal) => {
         #[doc = $docs]
@@ -93,6 +122,25 @@ impl ParameterType {
             return Err(CompileError::new(CompileErrorKind::LimitExceeded, 0));
         }
         Ok(Self { kind, depth })
+    }
+
+    /// Returns a structural view suitable for validated wire or persistence conversion.
+    #[must_use]
+    pub const fn as_ref(&self) -> ParameterTypeRef<'_> {
+        match &self.kind {
+            ParameterTypeKind::Any => ParameterTypeRef::Any,
+            ParameterTypeKind::Bool => ParameterTypeRef::Bool,
+            ParameterTypeKind::String => ParameterTypeRef::String,
+            ParameterTypeKind::Int => ParameterTypeRef::Int,
+            ParameterTypeKind::Uint => ParameterTypeRef::Uint,
+            ParameterTypeKind::Double => ParameterTypeRef::Double,
+            ParameterTypeKind::Bytes => ParameterTypeRef::Bytes,
+            ParameterTypeKind::Duration => ParameterTypeRef::Duration,
+            ParameterTypeKind::Timestamp => ParameterTypeRef::Timestamp,
+            ParameterTypeKind::IpAddress => ParameterTypeRef::IpAddress,
+            ParameterTypeKind::List(child) => ParameterTypeRef::List(child),
+            ParameterTypeKind::Map(child) => ParameterTypeRef::Map(child),
+        }
     }
 }
 

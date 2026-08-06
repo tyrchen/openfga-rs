@@ -62,9 +62,41 @@ jobs:
       - name: Run differential and official SDK smoke
         run: make differential-smoke
 
+  postgres-storage:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18.4
+        env:
+          POSTGRES_DB: openfga
+          POSTGRES_PASSWORD: openfga
+          POSTGRES_USER: openfga
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U openfga -d openfga"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: recursive
+      - name: Install pinned Rust
+        run: rustup show
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Install SQLx CLI
+        uses: taiki-e/install-action@cb33e69fad06166ca28a42b2575e4dadabf62ee8 # v2.85.8
+        with:
+          tool: sqlx-cli@0.9.0
+      - name: Verify PostgreSQL storage contracts and plans
+        run: make postgres-storage sqlx-prepare-check POSTGRES_TEST_URL=postgres://openfga:openfga@127.0.0.1:5432/openfga
+
   release:
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [rust, phase0-compatibility]
+    needs: [rust, phase0-compatibility, postgres-storage]
     runs-on: ubuntu-latest
     permissions:
       contents: write

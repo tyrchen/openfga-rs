@@ -59,6 +59,6 @@ pub use identifier::{
 pub use limits::{InputLimits, InputLimitsBuilder, Limit, LimitError};
 pub use reference::{
     ConditionBinding, ConditionReference, ContextualTuples, ObjectRef, RelationshipTuple,
-    SubjectRef, TupleKey, UsersetRef,
+    SubjectKind, SubjectRef, TupleKey, UsersetRef,
 };
 pub use token::{ContinuationCursor, ContinuationScope, TokenCodec, TokenKey, TokenOperation};

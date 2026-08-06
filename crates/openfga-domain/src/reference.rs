@@ -313,6 +313,17 @@ pub enum SubjectRef {
     TypedWildcard(TypeName),
 }
 
+/// Stable structural kind of a validated relationship subject.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum SubjectKind {
+    /// One concrete object.
+    Object,
+    /// An object/relation userset.
+    Userset,
+    /// A typed wildcard.
+    TypedWildcard,
+}
+
 impl SubjectRef {
     /// Parses a subject under the configured limits.
     ///
@@ -362,6 +373,35 @@ impl SubjectRef {
     #[must_use]
     pub const fn is_typed_wildcard(&self) -> bool {
         matches!(self, Self::TypedWildcard(_))
+    }
+
+    /// Returns the stable structural kind.
+    #[must_use]
+    pub const fn kind(&self) -> SubjectKind {
+        match self {
+            Self::Object(_) => SubjectKind::Object,
+            Self::Userset(_) => SubjectKind::Userset,
+            Self::TypedWildcard(_) => SubjectKind::TypedWildcard,
+        }
+    }
+
+    /// Returns the canonical subject object ID, including `*` for a wildcard.
+    #[must_use]
+    pub fn object_id(&self) -> &str {
+        match self {
+            Self::Object(object) => object.object_id().as_str(),
+            Self::Userset(userset) => userset.object().object_id().as_str(),
+            Self::TypedWildcard(_) => "*",
+        }
+    }
+
+    /// Returns the userset relation, or `None` for concrete objects and wildcards.
+    #[must_use]
+    pub const fn relation(&self) -> Option<&RelationName> {
+        match self {
+            Self::Userset(userset) => Some(userset.relation()),
+            Self::Object(_) | Self::TypedWildcard(_) => None,
+        }
     }
 }
 
@@ -618,6 +658,17 @@ pub enum ConditionReference {
     Unconditional,
     /// The relationship is guarded by a named condition.
     Conditional(ConditionBinding),
+}
+
+impl ConditionReference {
+    /// Returns the condition binding, or `None` for an unconditional tuple.
+    #[must_use]
+    pub const fn binding(&self) -> Option<&ConditionBinding> {
+        match self {
+            Self::Unconditional => None,
+            Self::Conditional(binding) => Some(binding),
+        }
+    }
 }
 
 /// A tuple key plus optional condition metadata outside tuple identity.

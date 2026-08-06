@@ -8,6 +8,7 @@ GO_HTTP_ADDR ?= 127.0.0.1:18080
 GO_GRPC_ADDR ?= 127.0.0.1:18082
 RUST_PROBE_ADDR ?= 127.0.0.1:18081
 FUZZ_TIME ?= 15
+POSTGRES_TEST_URL ?=
 PROTO_OUTPUT := crates/openfga-proto/src/generated
 
 build:
@@ -136,6 +137,16 @@ model-spike: model-baseline
 
 storage-contract:
 	@$(CARGO) test -p openfga-storage-memory --test contracts
+
+postgres-storage:
+	@test -n "$(POSTGRES_TEST_URL)" || { echo "POSTGRES_TEST_URL is required" >&2; exit 1; }
+	@OPENFGA_POSTGRES_TEST_URL="$(POSTGRES_TEST_URL)" \
+		$(CARGO) test -p openfga-storage-sql --test postgres -- --ignored
+
+sqlx-prepare-check:
+	@test -n "$(POSTGRES_TEST_URL)" || { echo "POSTGRES_TEST_URL is required" >&2; exit 1; }
+	@DATABASE_URL="$(POSTGRES_TEST_URL)" \
+		$(CARGO) sqlx prepare --check --workspace -- --all-targets
 
 check-baseline: verify-go-tool verify-go-pin
 	@cd vendors/openfga && \
@@ -267,4 +278,4 @@ update-submodule:
 	check-oracle check-proto check-spike \
 	clippy clippy-strict \
 	conformance deny differential-smoke doc fmt fuzz-condition fuzz-domain fuzz-model go-baseline listobjects-spike model-baseline \
-	model-spike proto release storage-contract test update-submodule verify-go-pin verify-go-tool
+	model-spike postgres-storage proto release sqlx-prepare-check storage-contract test update-submodule verify-go-pin verify-go-tool

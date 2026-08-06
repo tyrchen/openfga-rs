@@ -333,6 +333,50 @@ pub enum RewriteSource {
     },
 }
 
+/// Borrowed structural view of an unresolved relation rewrite.
+#[derive(Clone, Copy, Debug)]
+pub enum RewriteSourceRef<'a> {
+    /// Direct tuple membership.
+    Direct,
+    /// Same-object computed relation.
+    Computed(&'a RelationName),
+    /// Tuple-to-userset relation pair.
+    TupleToUserset {
+        /// Tupleset relation.
+        tupleset: &'a RelationName,
+        /// Computed relation.
+        computed: &'a RelationName,
+    },
+    /// Set union.
+    Union(&'a [RewriteSource]),
+    /// Set intersection.
+    Intersection(&'a [RewriteSource]),
+    /// Set difference.
+    Difference {
+        /// Positive operand.
+        base: &'a RewriteSource,
+        /// Subtracted operand.
+        subtract: &'a RewriteSource,
+    },
+}
+
+impl RewriteSource {
+    /// Returns a structural view suitable for validated persistence conversion.
+    #[must_use]
+    pub fn as_ref(&self) -> RewriteSourceRef<'_> {
+        match self {
+            Self::Direct => RewriteSourceRef::Direct,
+            Self::Computed(relation) => RewriteSourceRef::Computed(relation),
+            Self::TupleToUserset { tupleset, computed } => {
+                RewriteSourceRef::TupleToUserset { tupleset, computed }
+            }
+            Self::Union(children) => RewriteSourceRef::Union(children),
+            Self::Intersection(children) => RewriteSourceRef::Intersection(children),
+            Self::Difference { base, subtract } => RewriteSourceRef::Difference { base, subtract },
+        }
+    }
+}
+
 impl Drop for RewriteSource {
     fn drop(&mut self) {
         let mut pending = Vec::new();
@@ -434,6 +478,29 @@ pub enum RestrictionKindSource {
     Userset(RelationName),
     /// Typed wildcard of the declared subject type.
     Wildcard,
+}
+
+/// Borrowed structural view of a direct subject restriction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RestrictionKindSourceRef<'a> {
+    /// Concrete object.
+    Object,
+    /// Userset with its relation.
+    Userset(&'a RelationName),
+    /// Typed wildcard.
+    Wildcard,
+}
+
+impl RestrictionKindSource {
+    /// Returns the stable restriction structure.
+    #[must_use]
+    pub const fn as_ref(&self) -> RestrictionKindSourceRef<'_> {
+        match self {
+            Self::Object => RestrictionKindSourceRef::Object,
+            Self::Userset(relation) => RestrictionKindSourceRef::Userset(relation),
+            Self::Wildcard => RestrictionKindSourceRef::Wildcard,
+        }
+    }
 }
 
 /// One condition map entry, retaining both key and declared name for validation.

@@ -64,7 +64,7 @@ pub use ir::{
 pub use limits::{ModelLimits, ModelLimitsBuilder};
 pub use source::{
     AuthorizationModelDefinition, AuthorizationModelSource, ConditionSource,
-    DirectRestrictionSource, RelationSource, RestrictionKindSource, RewriteSource,
-    TypeDefinitionSource,
+    DirectRestrictionSource, RelationSource, RestrictionKindSource, RestrictionKindSourceRef,
+    RewriteSource, RewriteSourceRef, TypeDefinitionSource,
 };
 pub use tuple_validation::{TupleValidationError, TupleValidationErrorKind};
