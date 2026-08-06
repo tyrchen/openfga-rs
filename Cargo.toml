@@ -15,8 +15,10 @@ rust-version = "1.97.1"
 anyhow = { version = "~1.0.104", default-features = false, features = ["std"] }
 async-trait = "~0.1.91"
 axum = { version = "~0.8.9", default-features = false, features = ["http1", "json", "query", "tokio"] }
+axum-server = { version = "~0.8.0", default-features = false, features = ["tls-rustls"] }
 base64 = { version = "~0.23.1", default-features = false, features = ["std"] }
 cel-parser = { version = "~0.10.1", default-features = false }
+config = { version = "~0.15.25", default-features = false, features = ["convert-case", "yaml"] }
 getrandom = { version = "~0.4.3", default-features = false, features = ["std"] }
 clap = { version = "~4.6.5", default-features = false, features = ["derive", "error-context", "help", "std", "usage"] }
 hmac = { version = "~0.13.0", default-features = false, features = ["zeroize"] }
@@ -24,24 +26,32 @@ jiff = { version = "~0.2.35", default-features = false, features = ["std"] }
 pbjson = { version = "~0.9.0", default-features = false }
 pbjson-build = { version = "~0.9.0", default-features = false }
 pbjson-types = { version = "~0.9.0", default-features = false }
+opentelemetry = { version = "~0.32.0", default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "~0.32.0", default-features = false, features = ["grpc-tonic", "tls-aws-lc", "tls-webpki-roots", "trace"] }
+opentelemetry_sdk = { version = "~0.32.1", default-features = false, features = ["rt-tokio", "trace"] }
 prost = { version = "~0.14.4", default-features = false, features = ["derive", "std"] }
 prost-types = { version = "~0.14.4", default-features = false }
 protoc-bin-vendored = "~3.2.0"
 proptest = { version = "~1.11.0", default-features = false, features = ["std"] }
 reqwest = { version = "~0.13.4", default-features = false, features = ["http2", "json", "rustls"] }
+rustls = { version = "~0.23.35", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 secrecy = { version = "~0.10.3", default-features = false }
 serde = { version = "~1.0.229", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "~1.0.151", default-features = false, features = ["std"] }
 sha2 = { version = "~0.11.0", default-features = false }
 sqlx = { version = "~0.9.0", default-features = false, features = ["derive", "macros", "migrate", "postgres", "runtime-tokio", "tls-rustls-aws-lc-rs"] }
 thiserror = { version = "~2.0.19", default-features = false, features = ["std"] }
-tokio = { version = "~1.53.1", default-features = false, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
-tonic = { version = "~0.14.6", default-features = false, features = ["channel", "codegen", "transport"] }
+tokio = { version = "~1.53.1", default-features = false, features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-stream = { version = "~0.1.19", default-features = false, features = ["net"] }
+tonic = { version = "~0.14.6", default-features = false, features = ["channel", "codegen", "router", "tls-aws-lc", "transport"] }
+tonic-health = { version = "~0.14.6", default-features = false }
 tonic-prost = { version = "~0.14.6", default-features = false }
 tonic-prost-build = { version = "~0.14.6", default-features = false, features = ["cleanup-markdown", "transport"] }
 tower = { version = "~0.5.3", default-features = false, features = ["limit", "util"] }
 tower-http = { version = "~0.7.0", default-features = false, features = ["catch-panic", "limit", "propagate-header", "request-id", "sensitive-headers", "timeout", "trace"] }
 tracing = { version = "~0.1.44", default-features = false, features = ["attributes", "std"] }
+tracing-opentelemetry = { version = "~0.33.0", default-features = false }
+tracing-subscriber = { version = "~0.3.23", default-features = false, features = ["ansi", "env-filter", "fmt", "json", "registry", "std"] }
 typed-builder = { version = "~0.23.2", default-features = false }
 ulid = { version = "~3.0.0", default-features = false }
 winnow = { version = "~1.0.4", default-features = false, features = ["ascii", "std"] }

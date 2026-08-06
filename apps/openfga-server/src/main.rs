@@ -5,7 +5,7 @@
 use std::{
     io::{self, Write},
     net::{IpAddr, SocketAddr},
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::Duration,
 };
 
@@ -20,6 +20,9 @@ use tower_http::{limit::RequestBodyLimitLayer, timeout::TimeoutLayer};
 
 mod check_corpus;
 mod check_probe;
+mod config;
+mod runtime;
+mod telemetry;
 
 const MAX_PROBE_URL_BYTES: usize = 1_024;
 const MAX_HEALTH_BODY_BYTES: u16 = 4_096;
@@ -36,6 +39,32 @@ struct Arguments {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Run the complete `OpenFGA` HTTP and gRPC service.
+    Run {
+        /// Canonical YAML configuration file.
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Validate configuration without opening storage or network listeners.
+    ValidateConfig {
+        /// Canonical YAML configuration file.
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Print merged environment-overridden configuration without secret values.
+    PrintEffectiveConfig {
+        /// Canonical YAML configuration file.
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Inspect or advance the `PostgreSQL` schema.
+    Migrate {
+        /// Canonical YAML configuration file.
+        #[arg(long)]
+        config: PathBuf,
+        #[command(subcommand)]
+        command: MigrationCommand,
+    },
     /// Serve the Phase 0 compatibility probe.
     ProbeServer {
         /// Loopback socket used by the probe server.
@@ -74,6 +103,22 @@ enum Command {
     },
 }
 
+#[derive(Clone, Copy, Debug, Subcommand)]
+enum MigrationCommand {
+    /// Apply every pending embedded migration under the database lock.
+    Up,
+    /// Verify checksums and report current/target schema versions without mutation.
+    Status,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MigrationReport {
+    current: Option<i64>,
+    target: i64,
+    state: &'static str,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct HealthResponse {
@@ -106,6 +151,16 @@ struct DifferentialReport {
 #[tokio::main]
 async fn main() -> Result<()> {
     match Arguments::parse().command {
+        Command::Run { config } => run(config.as_path()).await,
+        Command::ValidateConfig { config } => {
+            config::ServerConfig::load(config.as_path()).await?;
+            Ok(())
+        }
+        Command::PrintEffectiveConfig { config } => {
+            let config = config::ServerConfig::load(config.as_path()).await?;
+            write_value(&config)
+        }
+        Command::Migrate { config, command } => migrate(config.as_path(), command).await,
         Command::ProbeServer { address } => serve_probe(address).await,
         Command::CheckProbeServer { address } => check_probe::serve(address).await,
         Command::DifferentialSmoke { go_url, rust_url } => {
@@ -116,6 +171,53 @@ async fn main() -> Result<()> {
         }
         Command::DifferentialCheckCorpus { corpus } => check_corpus::run(corpus).await,
     }
+}
+
+async fn run(path: &Path) -> Result<()> {
+    let config = config::ServerConfig::load(path).await?;
+    runtime::install_crypto_provider()?;
+    let telemetry = telemetry::TelemetryGuard::install(&config.telemetry)?;
+    let result = runtime::run(config).await;
+    let shutdown = telemetry.shutdown();
+    match result {
+        Ok(()) => shutdown,
+        Err(error) => {
+            if let Err(flush_error) = shutdown {
+                tracing::error!(error = %flush_error, "telemetry flush failed after runtime failure");
+            }
+            Err(error)
+        }
+    }
+}
+
+async fn migrate(path: &Path, command: MigrationCommand) -> Result<()> {
+    let config = config::ServerConfig::load(path).await?;
+    runtime::install_crypto_provider()?;
+    let postgres = runtime::postgres_config(&config, false)?;
+    let status = match command {
+        MigrationCommand::Up => openfga_storage_sql::apply_migrations(&postgres)
+            .await
+            .context("failed to apply PostgreSQL migrations")?,
+        MigrationCommand::Status => openfga_storage_sql::migration_status(&postgres)
+            .await
+            .context("failed to read PostgreSQL migration status")?,
+    };
+    let state = match status.state() {
+        openfga_storage_sql::MigrationState::Fresh => "fresh",
+        openfga_storage_sql::MigrationState::Pending => "pending",
+        openfga_storage_sql::MigrationState::Current => "current",
+        openfga_storage_sql::MigrationState::TooNew => "tooNew",
+        _ => "unknown",
+    };
+    write_value(&MigrationReport {
+        current: status.current(),
+        target: status.target(),
+        state,
+    })?;
+    if matches!(command, MigrationCommand::Status) && state != "current" {
+        bail!("PostgreSQL schema is not current");
+    }
+    Ok(())
 }
 
 async fn serve_probe(address: SocketAddr) -> Result<()> {
@@ -134,7 +236,9 @@ async fn serve_probe(address: SocketAddr) -> Result<()> {
         .await
         .with_context(|| format!("failed to bind the Phase 0 probe to {address}"))?;
     axum::serve(listener, application)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async {
+            let _shutdown_result = shutdown_signal().await;
+        })
         .await
         .context("Phase 0 probe server failed")
 }
@@ -143,8 +247,23 @@ async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { status: "SERVING" })
 }
 
-async fn shutdown_signal() {
-    let _signal_result = tokio::signal::ctrl_c().await;
+pub(crate) async fn shutdown_signal() -> Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .context("failed to install SIGTERM handler")?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result.context("failed to listen for Ctrl-C"),
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c()
+            .await
+            .context("failed to listen for Ctrl-C")
+    }
 }
 
 async fn run_differential_smoke(go_url: &str, rust_url: &str) -> Result<()> {
@@ -266,11 +385,14 @@ fn compare_health(go: &NormalizedHealth, rust: &NormalizedHealth) -> Vec<Mismatc
 }
 
 fn write_report(report: &DifferentialReport) -> Result<()> {
+    write_value(report)
+}
+
+fn write_value(value: &impl Serialize) -> Result<()> {
     let stdout = io::stdout();
     let mut output = stdout.lock();
-    serde_json::to_writer_pretty(&mut output, report)
-        .context("failed to serialize the differential report")?;
-    writeln!(output).context("failed to terminate the differential report")
+    serde_json::to_writer_pretty(&mut output, value).context("failed to serialize output")?;
+    writeln!(output).context("failed to terminate output")
 }
 
 #[cfg(test)]

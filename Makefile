@@ -9,6 +9,7 @@ GO_GRPC_ADDR ?= 127.0.0.1:18082
 RUST_PROBE_ADDR ?= 127.0.0.1:18081
 FUZZ_TIME ?= 15
 POSTGRES_TEST_URL ?=
+CONFIG ?= config/openfga-development.yaml
 PROTO_OUTPUT := crates/openfga-proto/src/generated
 
 build:
@@ -33,6 +34,18 @@ doc:
 	@RUSTDOCFLAGS="-D warnings" $(CARGO) doc --workspace --no-deps
 
 check: check-proto check-docs build test fmt clippy doc
+
+validate-config:
+	@$(CARGO) run --quiet -p openfga-server -- validate-config --config "$(CONFIG)"
+
+print-effective-config:
+	@$(CARGO) run --quiet -p openfga-server -- print-effective-config --config "$(CONFIG)"
+
+migrate-up:
+	@$(CARGO) run --quiet -p openfga-server -- migrate --config "$(CONFIG)" up
+
+migrate-status:
+	@$(CARGO) run --quiet -p openfga-server -- migrate --config "$(CONFIG)" status
 
 check-docs:
 	@$(CARGO) run --quiet -p openfga-doc-check

@@ -42,7 +42,7 @@ use crate::{
     fault::NoPostgresMutationFaults,
 };
 
-const SCHEMA_VERSION: i64 = 202_608_050_001;
+pub(crate) const SCHEMA_VERSION: i64 = 202_608_050_001;
 const SUBJECT_OBJECT: i16 = 0;
 const SUBJECT_USERSET: i16 = 1;
 const SUBJECT_WILDCARD: i16 = 2;
@@ -50,7 +50,7 @@ const CHANGE_WRITE: i16 = 0;
 const CHANGE_DELETE: i16 = 1;
 const ULID_MAX_TIMESTAMP_MS: u64 = (1_u64 << 48) - 1;
 
-static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+pub(crate) static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 /// Durable `PostgreSQL` backend with strict primary/replica routing.
 pub struct PostgresStorage {
@@ -1149,7 +1149,10 @@ impl<'a> TupleParts<'a> {
     }
 }
 
-async fn connect_pool(config: &PostgresStorageConfig, url: &str) -> Result<PgPool, StorageError> {
+pub(crate) async fn connect_pool(
+    config: &PostgresStorageConfig,
+    url: &str,
+) -> Result<PgPool, StorageError> {
     let options =
         PgConnectOptions::from_str(url).map_err(|error| map_sqlx(error, "postgres_url_invalid"))?;
     let statement_timeout = format!("{}ms", config.statement_timeout.as_millis().max(1));

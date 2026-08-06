@@ -186,7 +186,9 @@ pub(crate) async fn serve(address: SocketAddr) -> Result<()> {
         .await
         .with_context(|| format!("failed to bind the Phase 1 Check probe to {address}"))?;
     let serve_result = axum::serve(listener, application)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async {
+            let _shutdown_result = shutdown_signal().await;
+        })
         .await
         .context("Phase 1 Check probe server failed");
     let mut owner = Arc::try_unwrap(storage)

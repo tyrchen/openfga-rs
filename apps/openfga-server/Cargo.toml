@@ -12,20 +12,37 @@ publish = false
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
+axum-server.workspace = true
+base64.workspace = true
 clap.workspace = true
+config.workspace = true
 openfga-check.workspace = true
 openfga-condition.workspace = true
 openfga-domain.workspace = true
 openfga-model.workspace = true
+openfga-proto.workspace = true
 openfga-service.workspace = true
 openfga-storage.workspace = true
 openfga-storage-memory.workspace = true
+openfga-storage-sql.workspace = true
+openfga-transport.workspace = true
+opentelemetry.workspace = true
+opentelemetry-otlp.workspace = true
+opentelemetry_sdk.workspace = true
 reqwest.workspace = true
+rustls.workspace = true
+secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
+tonic-health.workspace = true
 tower.workspace = true
 tower-http.workspace = true
+tracing.workspace = true
+tracing-opentelemetry.workspace = true
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

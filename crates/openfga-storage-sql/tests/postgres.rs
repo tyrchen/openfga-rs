@@ -24,7 +24,8 @@ use openfga_storage::{
     contract::{TupleContractFixture, verify_tuple_contract},
 };
 use openfga_storage_sql::{
-    PostgresMutationFaultInjector, PostgresMutationStage, PostgresStorage, PostgresStorageConfig,
+    MigrationState, PostgresMutationFaultInjector, PostgresMutationStage, PostgresStorage,
+    PostgresStorageConfig, apply_migrations, migration_status,
 };
 use secrecy::SecretString;
 use sqlx::{PgPool, Row};
@@ -565,6 +566,21 @@ async fn verify_schema_health(
     context: &OperationContext,
 ) -> Result<(), Box<dyn Error>> {
     assert!(storage.health(context).await?.is_ready());
+    assert_eq!(
+        migration_status(&config_without_migration(&std::env::var(TEST_URL_ENV)?))
+            .await?
+            .state(),
+        MigrationState::Current,
+    );
+    let url = std::env::var(TEST_URL_ENV)?;
+    let first_config = config_without_migration(&url);
+    let second_config = config_without_migration(&url);
+    let (first_migration, second_migration) = tokio::join!(
+        apply_migrations(&first_config),
+        apply_migrations(&second_config),
+    );
+    assert_eq!(first_migration?.state(), MigrationState::Current);
+    assert_eq!(second_migration?.state(), MigrationState::Current);
     let cancelled = StorageCancellationToken::new();
     cancelled.cancel();
     let cancelled_context = OperationContext::new(
@@ -579,7 +595,6 @@ async fn verify_schema_health(
         .ok_or("cancelled health succeeded")?;
     assert_eq!(error.kind(), StorageErrorKind::Cancelled);
 
-    let url = std::env::var(TEST_URL_ENV)?;
     sqlx::query("UPDATE openfga_schema_metadata SET schema_version = 202608050002")
         .execute(storage.primary_pool())
         .await?;
@@ -616,8 +631,37 @@ async fn verify_schema_health(
         .err()
         .ok_or("migration checksum mismatch was accepted")?;
     assert_eq!(checksum_error.kind(), StorageErrorKind::Integrity);
+    let checksum_status = migration_status(&config_without_migration(&url))
+        .await
+        .err()
+        .ok_or("status accepted a migration checksum mismatch")?;
+    assert_eq!(checksum_status.kind(), StorageErrorKind::Integrity);
     sqlx::query("UPDATE _sqlx_migrations SET checksum = $1 WHERE version = 202608050001")
         .bind(checksum)
+        .execute(storage.primary_pool())
+        .await?;
+
+    sqlx::query(
+        "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) \
+         VALUES (202608050002, 'future', TRUE, decode('00', 'hex'), 0)",
+    )
+    .execute(storage.primary_pool())
+    .await?;
+    assert_eq!(
+        migration_status(&config_without_migration(&url))
+            .await?
+            .state(),
+        MigrationState::TooNew,
+    );
+    sqlx::query("UPDATE _sqlx_migrations SET success = FALSE WHERE version = 202608050002")
+        .execute(storage.primary_pool())
+        .await?;
+    let interrupted = migration_status(&config_without_migration(&url))
+        .await
+        .err()
+        .ok_or("status accepted an interrupted migration")?;
+    assert_eq!(interrupted.kind(), StorageErrorKind::Integrity);
+    sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 202608050002")
         .execute(storage.primary_pool())
         .await?;
     Ok(())
