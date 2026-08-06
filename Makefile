@@ -134,13 +134,16 @@ model-baseline: verify-go-tool verify-go-pin
 model-spike: model-baseline
 	@$(CARGO) test -p openfga-model --test compiler
 
+storage-contract:
+	@$(CARGO) test -p openfga-storage-memory --test contracts
+
 listobjects-spike: verify-go-tool verify-go-pin
 	@cd vendors/openfga && \
 		GOTOOLCHAIN=local GOFLAGS=-mod=readonly ../../$(GO_TOOL) test \
 		./pkg/server/commands -run '^$$' -bench '^BenchmarkListObjects$$' \
 		-benchtime=1x -count=1
 
-conformance: cel-spike listobjects-spike model-spike
+conformance: cel-spike listobjects-spike model-spike storage-contract
 
 fuzz-domain:
 	@phase1_tmp=$$(mktemp -d); \
@@ -199,4 +202,4 @@ update-submodule:
 .PHONY: audit build cel-baseline cel-spike check check-agent-sync check-docs check-proto \
 	clippy clippy-strict \
 	conformance deny differential-smoke doc fmt fuzz-condition fuzz-domain fuzz-model go-baseline listobjects-spike model-baseline \
-	model-spike proto release test update-submodule verify-go-pin verify-go-tool
+	model-spike proto release storage-contract test update-submodule verify-go-pin verify-go-tool

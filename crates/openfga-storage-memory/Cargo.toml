@@ -10,3 +10,15 @@ rust-version.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+async-trait.workspace = true
+openfga-domain.workspace = true
+openfga-storage.workspace = true
+tokio.workspace = true
+ulid.workspace = true
+
+[dev-dependencies]
+openfga-condition.workspace = true
+openfga-model.workspace = true
+openfga-storage = { workspace = true, features = ["test-support"] }

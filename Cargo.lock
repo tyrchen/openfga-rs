@@ -1193,10 +1193,26 @@ version = "0.1.0"
 [[package]]
 name = "openfga-storage"
 version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "openfga-domain",
+ "openfga-model",
+ "thiserror",
+ "tokio",
+]
 
 [[package]]
 name = "openfga-storage-memory"
 version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "openfga-condition",
+ "openfga-domain",
+ "openfga-model",
+ "openfga-storage",
+ "tokio",
+ "ulid",
+]
 
 [[package]]
 name = "openfga-storage-sql"
