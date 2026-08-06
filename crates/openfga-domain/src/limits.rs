@@ -34,6 +34,9 @@ impl LimitError {
 pub struct Limit<const MAX: u32>(NonZeroU32);
 
 impl<const MAX: u32> Limit<MAX> {
+    /// The smallest valid limit.
+    pub const MIN: Self = Self(NonZeroU32::MIN);
+
     /// Creates a positive limit at or below `MAX`.
     ///
     /// # Errors

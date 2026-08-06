@@ -13,11 +13,19 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "~0.4.13"
 openfga-domain = { version = "0.1.0", path = "../crates/openfga-domain" }
+openfga-condition = { version = "0.1.0", path = "../crates/openfga-condition" }
 serde_json = { version = "~1.0.151", default-features = false, features = ["std"] }
 
 [[bin]]
 name = "domain_inputs"
 path = "fuzz_targets/domain_inputs.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "condition_inputs"
+path = "fuzz_targets/condition_inputs.rs"
 test = false
 doc = false
 bench = false

@@ -47,11 +47,11 @@ Phase 0 proved that `cel-interpreter` offers useful baseline value semantics but
 
 1. Define a project-owned `ConditionCompiler`/`CompiledCondition` boundary.
 2. Test the adapter against CEL conformance cases and vendored OpenFGA condition tests.
-3. Implement OpenFGA types/functions and a deterministic project cost meter in a project-owned evaluator over the parser AST.
+3. Implement OpenFGA types/functions and a deterministic project cost meter in a project-owned evaluator over validated project IR lowered from the parser AST.
 4. Reject model publication if compilation or Boolean output typing fails.
 5. Do not use the C++ FFI implementation by default: it conflicts with the repository's no-unsafe rule and increases build/supply-chain complexity.
 
-The compatibility gate is resolved: `cel-interpreter` is a test-only rejected candidate, while production depends on `cel-parser` and project-owned evaluation.
+The compatibility gate is resolved: `cel-interpreter` is retained only as historical research evidence and is no longer a dependency; production depends on `cel-parser` and project-owned evaluation.
 
 ## Authentication and authorization
 

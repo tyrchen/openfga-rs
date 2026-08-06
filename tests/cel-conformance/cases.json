@@ -4,67 +4,157 @@
       "name": "boolean_short_circuit",
       "expression": "true && !false",
       "expectedBaseline": { "kind": "bool", "value": true },
-      "expectedCandidate": { "kind": "bool", "value": true }
+      "expectedRust": { "kind": "bool", "value": true }
     },
     {
       "name": "integer_comparison",
       "expression": "1 < 2",
       "expectedBaseline": { "kind": "bool", "value": true },
-      "expectedCandidate": { "kind": "bool", "value": true }
+      "expectedRust": { "kind": "bool", "value": true }
     },
     {
       "name": "double_comparison",
       "expression": "1.5 < 2.0",
       "expectedBaseline": { "kind": "bool", "value": true },
-      "expectedCandidate": { "kind": "bool", "value": true }
+      "expectedRust": { "kind": "bool", "value": true }
     },
     {
       "name": "bytes_equality",
       "expression": "b'abc' == b'abc'",
       "expectedBaseline": { "kind": "bool", "value": true },
-      "expectedCandidate": { "kind": "bool", "value": true }
+      "expectedRust": { "kind": "bool", "value": true }
     },
     {
       "name": "duration_comparison",
       "expression": "duration('1h') < duration('2h')",
       "expectedBaseline": { "kind": "bool", "value": true },
-      "expectedCandidate": { "kind": "bool", "value": true }
+      "expectedRust": { "kind": "bool", "value": true }
     },
     {
       "name": "timestamp_comparison",
       "expression": "timestamp('2024-01-01T00:00:00Z') < timestamp('2025-01-01T00:00:00Z')",
       "expectedBaseline": { "kind": "bool", "value": true },
-      "expectedCandidate": { "kind": "bool", "value": true }
+      "expectedRust": { "kind": "bool", "value": true }
     },
     {
       "name": "list_membership",
       "expression": "'a' in ['a', 'b']",
       "expectedBaseline": { "kind": "bool", "value": true },
-      "expectedCandidate": { "kind": "bool", "value": true }
+      "expectedRust": { "kind": "bool", "value": true }
     },
     {
       "name": "map_membership",
       "expression": "'key' in {'key': 1}",
       "expectedBaseline": { "kind": "bool", "value": true },
-      "expectedCandidate": { "kind": "bool", "value": true }
+      "expectedRust": { "kind": "bool", "value": true }
     },
     {
       "name": "null_equality",
       "expression": "null == null",
       "expectedBaseline": { "kind": "bool", "value": true },
-      "expectedCandidate": { "kind": "bool", "value": true }
+      "expectedRust": { "kind": "bool", "value": true }
     },
     {
       "name": "openfga_ip_address",
       "expression": "ipaddress('192.168.0.1').in_cidr('192.168.0.0/24')",
       "expectedBaseline": { "kind": "bool", "value": true },
-      "expectedCandidate": { "kind": "error" }
+      "expectedRust": { "kind": "bool", "value": true }
     },
     {
       "name": "boolean_result_requirement",
       "expression": "1",
       "expectedBaseline": { "kind": "error" },
-      "expectedCandidate": { "kind": "nonBoolean" }
+      "expectedRust": { "kind": "error" }
+    },
+    {
+      "name": "map_equality_is_order_independent",
+      "expression": "{'a': 1, 'b': 2} == {'b': 2, 'a': 1}",
+      "expectedBaseline": { "kind": "bool", "value": true },
+      "expectedRust": { "kind": "bool", "value": true }
+    },
+    {
+      "name": "list_structural_equality",
+      "expression": "[1, 2, 3] == [1, 2, 3]",
+      "expectedBaseline": { "kind": "bool", "value": true },
+      "expectedRust": { "kind": "bool", "value": true }
+    },
+    {
+      "name": "unicode_microsecond_duration",
+      "expression": "duration('10μs') == duration('10us')",
+      "expectedBaseline": { "kind": "bool", "value": true },
+      "expectedRust": { "kind": "bool", "value": true }
+    },
+    {
+      "name": "timestamp_offset_normalization",
+      "expression": "timestamp('2024-01-01T01:00:00+01:00') == timestamp('2024-01-01T00:00:00Z')",
+      "expectedBaseline": { "kind": "bool", "value": true },
+      "expectedRust": { "kind": "bool", "value": true }
+    },
+    {
+      "name": "literal_comprehension",
+      "expression": "[1, 2, 3].map(i, i * 2).size() == 3",
+      "expectedBaseline": { "kind": "bool", "value": true },
+      "expectedRust": { "kind": "bool", "value": true }
+    },
+    {
+      "name": "string_receiver_helpers",
+      "expression": "'openfga-rs'.startsWith('open') && 'openfga-rs'.endsWith('-rs') && 'openfga-rs'.contains('fga')",
+      "expectedBaseline": { "kind": "bool", "value": true },
+      "expectedRust": { "kind": "bool", "value": true }
+    },
+    {
+      "name": "global_size_helper",
+      "expression": "size([1, 2, 3]) == 3",
+      "expectedBaseline": { "kind": "bool", "value": true },
+      "expectedRust": { "kind": "bool", "value": true }
+    },
+    {
+      "name": "logical_or_suppresses_left_error",
+      "expression": "(1 / 0 == 0) || true",
+      "expectedBaseline": { "kind": "bool", "value": true },
+      "expectedRust": { "kind": "bool", "value": true }
+    },
+    {
+      "name": "logical_and_suppresses_left_error",
+      "expression": "(1 / 0 == 0) && false",
+      "expectedBaseline": { "kind": "bool", "value": false },
+      "expectedRust": { "kind": "bool", "value": false }
+    },
+    {
+      "name": "numeric_constructors",
+      "expression": "int('42') == 42 && uint(1.0) == 1u && double('1.5') == 1.5",
+      "expectedBaseline": { "kind": "bool", "value": true },
+      "expectedRust": { "kind": "bool", "value": true }
+    },
+    {
+      "name": "map_select_and_index",
+      "expression": "{'a': 1}.a == 1 && {'a': 1}['a'] == 1",
+      "expectedBaseline": { "kind": "bool", "value": true },
+      "expectedRust": { "kind": "bool", "value": true }
+    },
+    {
+      "name": "exists_comprehension",
+      "expression": "[1, 2, 3].exists(i, i == 2)",
+      "expectedBaseline": { "kind": "bool", "value": true },
+      "expectedRust": { "kind": "bool", "value": true }
+    },
+    {
+      "name": "logical_error_preserves_parent_values",
+      "expression": "true == ((1 / 0 == 0) || true)",
+      "expectedBaseline": { "kind": "bool", "value": true },
+      "expectedRust": { "kind": "bool", "value": true }
+    },
+    {
+      "name": "logical_error_unwinds_comprehension_scope",
+      "expression": "([1].map(i, 1 / 0).size() == 0) || true",
+      "expectedBaseline": { "kind": "bool", "value": true },
+      "expectedRust": { "kind": "bool", "value": true }
+    },
+    {
+      "name": "nested_logical_error_is_suppressed",
+      "expression": "(false || (1 / 0 == 0)) || true",
+      "expectedBaseline": { "kind": "bool", "value": true },
+      "expectedRust": { "kind": "bool", "value": true }
     }
   ]
 }

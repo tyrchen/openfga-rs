@@ -10,10 +10,13 @@ rust-version.workspace = true
 
 [dependencies]
 cel-parser.workspace = true
+jiff.workspace = true
+openfga-domain.workspace = true
 thiserror.workspace = true
+typed-builder.workspace = true
 
 [dev-dependencies]
-cel-interpreter.workspace = true
+proptest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 

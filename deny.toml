@@ -2,9 +2,6 @@
 all-features = true
 
 [advisories]
-ignore = [
-  { id = "RUSTSEC-2024-0436", reason = "unmaintained paste is reachable only through the rejected cel-interpreter Phase 0 test candidate; neither crate is a production dependency" },
-]
 
 [licenses]
 allow = [

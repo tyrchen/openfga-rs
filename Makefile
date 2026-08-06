@@ -125,7 +125,7 @@ cel-baseline: verify-go-tool verify-go-pin
 			../cel-conformance/cases.json
 
 cel-spike: cel-baseline
-	@$(CARGO) test -p openfga-condition --test phase0_candidate
+	@$(CARGO) test -p openfga-condition --test conformance
 
 listobjects-spike: verify-go-tool verify-go-pin
 	@cd vendors/openfga && \
@@ -140,6 +140,13 @@ fuzz-domain:
 	trap 'rm -rf "$$phase1_tmp"' EXIT; \
 	cp -R fuzz/corpus/domain_inputs "$$phase1_tmp/corpus"; \
 	$(CARGO) +$(RUSTFMT_TOOLCHAIN) fuzz run domain_inputs "$$phase1_tmp/corpus" -- \
+		-max_total_time=$(FUZZ_TIME) -max_len=8192
+
+fuzz-condition:
+	@phase1_tmp=$$(mktemp -d); \
+	trap 'rm -rf "$$phase1_tmp"' EXIT; \
+	cp -R fuzz/corpus/condition_inputs "$$phase1_tmp/corpus"; \
+	$(CARGO) +$(RUSTFMT_TOOLCHAIN) fuzz run condition_inputs "$$phase1_tmp/corpus" -- \
 		-max_total_time=$(FUZZ_TIME) -max_len=8192
 
 audit:
@@ -177,5 +184,5 @@ update-submodule:
 
 .PHONY: audit build cel-baseline cel-spike check check-agent-sync check-docs check-proto \
 	clippy clippy-strict \
-	conformance deny differential-smoke doc fmt fuzz-domain go-baseline listobjects-spike proto release test \
+	conformance deny differential-smoke doc fmt fuzz-condition fuzz-domain go-baseline listobjects-spike proto release test \
 	update-submodule verify-go-pin verify-go-tool
