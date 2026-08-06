@@ -9,15 +9,14 @@ use std::{
 };
 
 use async_trait::async_trait;
-use openfga_domain::{
-    AuthorizationModelId, ChangeId, RelationshipTuple, StoreId, TupleKey, TypeName,
-};
+use openfga_domain::{AuthorizationModelId, RelationshipTuple, StoreId, TupleKey};
 use openfga_storage::{
-    Assertion, AssertionReader, AssertionWriter, ChangeReader, HealthCheck, HealthStatus,
-    ModelReader, ModelWriter, MutationOutcome, ObjectRelationFilter, OperationContext, Page,
-    PageOptions, ReadOptions, ReverseTupleFilter, StorageError, StorageErrorKind, StoreName,
-    StoreReader, StoreRecord, StoreWriter, StoredAuthorizationModel, StoredTuple, TupleChange,
-    TupleReader, TupleStream, TupleWriteOptions, TupleWriter, UsersetTupleFilter,
+    Assertion, AssertionReader, AssertionWriter, ChangeFilter, ChangeReader, HealthCheck,
+    HealthStatus, ModelReader, ModelWriter, MutationOutcome, ObjectRelationFilter,
+    OperationContext, Page, PageOptions, ReadOptions, ReverseTupleFilter, StorageError,
+    StorageErrorKind, StoreName, StoreReader, StoreRecord, StoreWriter, StoredAuthorizationModel,
+    StoredTuple, TupleChange, TupleReadFilter, TupleReader, TupleStream, TupleWriteOptions,
+    TupleWriter, UsersetTupleFilter,
 };
 use tokio::{
     sync::{mpsc, oneshot},
@@ -203,10 +202,10 @@ impl MemoryStorage {
         context.check()?;
         let _guard = ActiveOperationGuard::new(Arc::clone(&self.diagnostics.0.active_operations));
         let (reply, received) = oneshot::channel();
-        let message = ActorMessage::Operation(Envelope {
+        let message = ActorMessage::Operation(Box::new(Envelope {
             context: context.clone(),
             command: build(reply),
-        });
+        }));
         let deadline = Instant::from_std(context.deadline().instant());
         tokio::select! {
             biased;
@@ -256,6 +255,22 @@ impl Drop for MemoryStorage {
 
 #[async_trait]
 impl TupleReader for MemoryStorage {
+    async fn read_tuples(
+        &self,
+        context: &OperationContext,
+        store_id: StoreId,
+        filter: &TupleReadFilter,
+        options: &PageOptions,
+    ) -> Result<Page<StoredTuple>, StorageError> {
+        self.dispatch(context, |reply| Command::ReadTuples {
+            store_id,
+            filter: filter.clone(),
+            options: options.clone(),
+            reply,
+        })
+        .await
+    }
+
     async fn read_exact_tuple(
         &self,
         context: &OperationContext,
@@ -532,15 +547,13 @@ impl ChangeReader for MemoryStorage {
         &self,
         context: &OperationContext,
         store_id: StoreId,
-        object_type: Option<&TypeName>,
-        after: Option<ChangeId>,
-        options: ReadOptions,
-    ) -> Result<Vec<TupleChange>, StorageError> {
+        filter: &ChangeFilter,
+        options: &PageOptions,
+    ) -> Result<Page<TupleChange>, StorageError> {
         self.dispatch(context, |reply| Command::ReadChanges {
             store_id,
-            object_type: object_type.cloned(),
-            after,
-            options,
+            filter: filter.clone(),
+            options: options.clone(),
             reply,
         })
         .await

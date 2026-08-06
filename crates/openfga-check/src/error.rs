@@ -3,13 +3,12 @@
 use std::fmt;
 
 use openfga_condition::EvaluationError;
-use openfga_model::ModelLookupError;
+use openfga_model::{ModelLookupError, TupleValidationError, TupleValidationErrorKind};
 use openfga_storage::{StorageError, StorageErrorKind};
 use thiserror::Error;
 
 /// Stable authorization-evaluator error category.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[non_exhaustive]
 pub enum CheckErrorKind {
     /// The supplied model does not own or describe the query.
     InvalidModel,
@@ -27,8 +26,8 @@ pub enum CheckErrorKind {
     ConditionCostExceeded,
     /// A relationship condition could not be evaluated.
     Condition,
-    /// A storage operation failed.
-    Storage,
+    /// The tuple backend is temporarily unavailable.
+    StorageUnavailable,
     /// The request deadline elapsed.
     Timeout,
     /// The request was cancelled.
@@ -45,6 +44,8 @@ enum CheckErrorSource {
     Condition(EvaluationError),
     #[error(transparent)]
     Model(ModelLookupError),
+    #[error(transparent)]
+    TupleValidation(TupleValidationError),
 }
 
 /// One redacted typed evaluator failure with an optional typed source chain.
@@ -100,12 +101,34 @@ impl From<StorageError> for CheckError {
         let kind = match source.kind() {
             StorageErrorKind::Cancelled => CheckErrorKind::Cancelled,
             StorageErrorKind::Timeout => CheckErrorKind::Timeout,
-            _ => CheckErrorKind::Storage,
+            StorageErrorKind::Unavailable => CheckErrorKind::StorageUnavailable,
+            StorageErrorKind::ResourceExhausted => CheckErrorKind::TupleItemExceeded,
+            StorageErrorKind::NotFound
+            | StorageErrorKind::AlreadyExists
+            | StorageErrorKind::Conflict
+            | StorageErrorKind::InvalidContinuation
+            | StorageErrorKind::Integrity
+            | StorageErrorKind::Internal => CheckErrorKind::Internal,
         };
         Self {
             kind,
             code: "tuple_storage_failed",
             source: Some(CheckErrorSource::Storage(source)),
+        }
+    }
+}
+
+impl From<TupleValidationError> for CheckError {
+    fn from(source: TupleValidationError) -> Self {
+        let kind = match source.kind() {
+            TupleValidationErrorKind::Query => CheckErrorKind::InvalidModel,
+            TupleValidationErrorKind::Relationship => CheckErrorKind::InvalidTuple,
+            TupleValidationErrorKind::CompiledModel => CheckErrorKind::Internal,
+        };
+        Self {
+            kind,
+            code: source.code(),
+            source: Some(CheckErrorSource::TupleValidation(source)),
         }
     }
 }
@@ -118,5 +141,41 @@ impl fmt::Debug for CheckError {
             .field("code", &self.code)
             .field("has_source", &self.source.is_some())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use openfga_storage::{StorageError, StorageErrorKind};
+
+    use super::{CheckError, CheckErrorKind};
+
+    #[test]
+    fn test_should_exhaustively_classify_known_storage_failures() {
+        let cases = [
+            (StorageErrorKind::NotFound, CheckErrorKind::Internal),
+            (StorageErrorKind::AlreadyExists, CheckErrorKind::Internal),
+            (StorageErrorKind::Conflict, CheckErrorKind::Internal),
+            (
+                StorageErrorKind::InvalidContinuation,
+                CheckErrorKind::Internal,
+            ),
+            (StorageErrorKind::Timeout, CheckErrorKind::Timeout),
+            (StorageErrorKind::Cancelled, CheckErrorKind::Cancelled),
+            (
+                StorageErrorKind::Unavailable,
+                CheckErrorKind::StorageUnavailable,
+            ),
+            (StorageErrorKind::Integrity, CheckErrorKind::Internal),
+            (
+                StorageErrorKind::ResourceExhausted,
+                CheckErrorKind::TupleItemExceeded,
+            ),
+            (StorageErrorKind::Internal, CheckErrorKind::Internal),
+        ];
+        for (storage, expected) in cases {
+            let mapped = CheckError::from(StorageError::new(storage, "test_storage_failure"));
+            assert_eq!(mapped.kind(), expected);
+        }
     }
 }

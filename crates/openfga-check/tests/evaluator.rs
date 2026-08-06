@@ -25,9 +25,9 @@ use openfga_model::{
     RelationSource, RestrictionKindSource, RewriteSource, TypeDefinitionSource,
 };
 use openfga_storage::{
-    ObjectRelationFilter, OperationContext, ReadOptions, ReverseTupleFilter,
+    ObjectRelationFilter, OperationContext, Page, PageOptions, ReadOptions, ReverseTupleFilter,
     StorageCancellationToken, StorageError, StorageErrorKind, StoreName, StoreWriter, StoredTuple,
-    TupleReader, TupleStream, TupleWriteOptions, TupleWriter, UsersetTupleFilter,
+    TupleReadFilter, TupleReader, TupleStream, TupleWriteOptions, TupleWriter, UsersetTupleFilter,
 };
 use openfga_storage_memory::{MemoryStorage, MemoryStorageConfig};
 use serde_json::json;
@@ -843,6 +843,16 @@ impl Drop for ActiveRead {
 
 #[async_trait]
 impl TupleReader for ShortCircuitReader {
+    async fn read_tuples(
+        &self,
+        _context: &OperationContext,
+        _store_id: StoreId,
+        _filter: &TupleReadFilter,
+        _options: &PageOptions,
+    ) -> Result<Page<StoredTuple>, StorageError> {
+        Err(unsupported())
+    }
+
     async fn read_exact_tuple(
         &self,
         _context: &OperationContext,

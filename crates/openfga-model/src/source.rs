@@ -8,6 +8,57 @@ use openfga_domain::{
     TypeName,
 };
 
+/// Authorization-model declarations before the service assigns store/model identity.
+#[non_exhaustive]
+pub struct AuthorizationModelDefinition {
+    schema_version: String,
+    type_definitions: Vec<TypeDefinitionSource>,
+    conditions: Vec<ConditionSource>,
+}
+
+impl AuthorizationModelDefinition {
+    /// Creates a bounded, project-owned model definition for semantic compilation.
+    #[must_use]
+    pub const fn new(
+        schema_version: String,
+        type_definitions: Vec<TypeDefinitionSource>,
+        conditions: Vec<ConditionSource>,
+    ) -> Self {
+        Self {
+            schema_version,
+            type_definitions,
+            conditions,
+        }
+    }
+
+    /// Assigns immutable identity and consumes the definition into compiler source.
+    #[must_use]
+    pub fn with_identity(
+        self,
+        store_id: StoreId,
+        model_id: AuthorizationModelId,
+    ) -> AuthorizationModelSource {
+        AuthorizationModelSource::new(
+            store_id,
+            model_id,
+            self.schema_version,
+            self.type_definitions,
+            self.conditions,
+        )
+    }
+}
+
+impl fmt::Debug for AuthorizationModelDefinition {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuthorizationModelDefinition")
+            .field("schema_version_bytes", &self.schema_version.len())
+            .field("type_definitions", &self.type_definitions.len())
+            .field("conditions", &self.conditions.len())
+            .finish_non_exhaustive()
+    }
+}
+
 /// One authorization model after bounded wire conversion and before semantic compilation.
 #[non_exhaustive]
 pub struct AuthorizationModelSource {
@@ -47,6 +98,24 @@ impl AuthorizationModelSource {
     #[must_use]
     pub const fn model_id(&self) -> &AuthorizationModelId {
         &self.model_id
+    }
+
+    /// Returns the declared schema version.
+    #[must_use]
+    pub fn schema_version(&self) -> &str {
+        &self.schema_version
+    }
+
+    /// Returns type declarations in source order.
+    #[must_use]
+    pub fn type_definitions(&self) -> &[TypeDefinitionSource] {
+        &self.type_definitions
+    }
+
+    /// Returns condition declarations in source order.
+    #[must_use]
+    pub fn conditions(&self) -> &[ConditionSource] {
+        &self.conditions
     }
 
     /// Returns a deterministic proof of this exact ordered source model.
@@ -166,6 +235,12 @@ impl TypeDefinitionSource {
     pub const fn name(&self) -> &TypeName {
         &self.name
     }
+
+    /// Returns relation declarations in source order.
+    #[must_use]
+    pub fn relations(&self) -> &[RelationSource] {
+        &self.relations
+    }
 }
 
 impl fmt::Debug for TypeDefinitionSource {
@@ -205,6 +280,18 @@ impl RelationSource {
     #[must_use]
     pub const fn name(&self) -> &RelationName {
         &self.name
+    }
+
+    /// Returns the unresolved relation rewrite.
+    #[must_use]
+    pub const fn rewrite(&self) -> &RewriteSource {
+        &self.rewrite
+    }
+
+    /// Returns direct subject restrictions in source order.
+    #[must_use]
+    pub fn restrictions(&self) -> &[DirectRestrictionSource] {
+        &self.restrictions
     }
 }
 
@@ -317,6 +404,24 @@ impl DirectRestrictionSource {
             condition,
         }
     }
+
+    /// Returns the permitted subject type.
+    #[must_use]
+    pub const fn subject_type(&self) -> &TypeName {
+        &self.subject_type
+    }
+
+    /// Returns the permitted direct subject shape.
+    #[must_use]
+    pub const fn kind(&self) -> &RestrictionKindSource {
+        &self.kind
+    }
+
+    /// Returns the optional required condition name.
+    #[must_use]
+    pub const fn condition(&self) -> Option<&ConditionName> {
+        self.condition.as_ref()
+    }
 }
 
 /// Unresolved direct restriction shape.
@@ -344,6 +449,18 @@ impl ConditionSource {
     #[must_use]
     pub const fn new(key: ConditionName, definition: ConditionDefinition) -> Self {
         Self { key, definition }
+    }
+
+    /// Returns the condition map key.
+    #[must_use]
+    pub const fn key(&self) -> &ConditionName {
+        &self.key
+    }
+
+    /// Returns the validated condition definition.
+    #[must_use]
+    pub const fn definition(&self) -> &ConditionDefinition {
+        &self.definition
     }
 }
 

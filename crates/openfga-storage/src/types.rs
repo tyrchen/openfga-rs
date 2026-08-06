@@ -12,7 +12,7 @@ use crate::{StorageError, StorageErrorKind};
 
 const MINIMUM_STORE_NAME_BYTES: usize = 3;
 const MAXIMUM_STORE_NAME_BYTES: usize = 64;
-const MAXIMUM_CURSOR_BYTES: usize = 512;
+const MAXIMUM_CURSOR_BYTES: usize = 1_024;
 
 /// A bounded store display name using the pinned API character allowlist.
 #[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -507,6 +507,132 @@ impl ReadOptions {
     }
 }
 
+/// Validated partial filter for the public tuple Read use case.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct TupleReadFilter {
+    object_type: Option<TypeName>,
+    object_id: Option<ObjectId>,
+    relation: Option<RelationName>,
+    subject: Option<SubjectRef>,
+}
+
+impl TupleReadFilter {
+    /// Creates a filter matching every tuple in a store.
+    #[must_use]
+    pub const fn all() -> Self {
+        Self {
+            object_type: None,
+            object_id: None,
+            relation: None,
+            subject: None,
+        }
+    }
+
+    /// Creates a validated OpenFGA-compatible partial tuple filter.
+    ///
+    /// The object type is mandatory whenever a tuple-key filter is supplied,
+    /// and at least an object ID or subject must narrow that filter.
+    ///
+    /// # Errors
+    ///
+    /// Returns an integrity error for the unsupported unbounded partial shape.
+    pub fn new(
+        object_type: TypeName,
+        object_id: Option<ObjectId>,
+        relation: Option<RelationName>,
+        subject: Option<SubjectRef>,
+    ) -> Result<Self, StorageError> {
+        if object_id.is_none() && subject.is_none() {
+            return Err(StorageError::new(
+                StorageErrorKind::Integrity,
+                "tuple_read_filter_insufficient",
+            ));
+        }
+        Ok(Self {
+            object_type: Some(object_type),
+            object_id,
+            relation,
+            subject,
+        })
+    }
+
+    /// Returns the optional target object type.
+    #[must_use]
+    pub const fn object_type(&self) -> Option<&TypeName> {
+        self.object_type.as_ref()
+    }
+
+    /// Returns the optional target object ID.
+    #[must_use]
+    pub const fn object_id(&self) -> Option<&ObjectId> {
+        self.object_id.as_ref()
+    }
+
+    /// Returns the optional target relation.
+    #[must_use]
+    pub const fn relation(&self) -> Option<&RelationName> {
+        self.relation.as_ref()
+    }
+
+    /// Returns the optional exact subject.
+    #[must_use]
+    pub const fn subject(&self) -> Option<&SubjectRef> {
+        self.subject.as_ref()
+    }
+
+    /// Returns whether a tuple key matches every supplied component.
+    #[must_use]
+    pub fn matches(&self, key: &TupleKey) -> bool {
+        self.object_type
+            .as_ref()
+            .is_none_or(|value| value == key.object().object_type())
+            && self
+                .object_id
+                .as_ref()
+                .is_none_or(|value| value == key.object().object_id())
+            && self
+                .relation
+                .as_ref()
+                .is_none_or(|value| value == key.relation())
+            && self
+                .subject
+                .as_ref()
+                .is_none_or(|value| value == key.subject())
+    }
+}
+
+/// Validated tuple-changelog filter.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct ChangeFilter {
+    object_type: Option<TypeName>,
+    start_time: Option<SystemTime>,
+}
+
+impl ChangeFilter {
+    /// Creates an optional object-type and inclusive start-time filter.
+    #[must_use]
+    pub const fn new(object_type: Option<TypeName>, start_time: Option<SystemTime>) -> Self {
+        Self {
+            object_type,
+            start_time,
+        }
+    }
+
+    /// Returns the optional changed object type.
+    #[must_use]
+    pub const fn object_type(&self) -> Option<&TypeName> {
+        self.object_type.as_ref()
+    }
+
+    /// Returns the optional inclusive transaction timestamp.
+    #[must_use]
+    pub const fn start_time(&self) -> Option<SystemTime> {
+        self.start_time
+    }
+}
+
 /// Bounded object/relation forward-read filter.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -786,6 +912,15 @@ pub struct PageOptions {
 }
 
 impl PageOptions {
+    /// Creates a first-page request from an already validated read ceiling.
+    #[must_use]
+    pub const fn from_read_options(options: ReadOptions) -> Self {
+        Self {
+            maximum_results: options.maximum_results,
+            after: None,
+        }
+    }
+
     /// Validates a page-size ceiling and optional verified cursor.
     ///
     /// # Errors

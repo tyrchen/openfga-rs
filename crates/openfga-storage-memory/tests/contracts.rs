@@ -19,11 +19,12 @@ use openfga_model::{
     RestrictionKindSource, RewriteSource, TypeDefinitionSource,
 };
 use openfga_storage::{
-    Assertion, AssertionReader, AssertionWriter, ChangeOperation, ChangeReader, ConditionFilter,
-    HealthCheck, ModelReader, ModelWriter, ObjectRelationFilter, OperationContext, PageOptions,
-    ReadOptions, ReverseTupleFilter, StorageCancellationToken, StorageError, StorageErrorKind,
-    StoreName, StoreReader, StoreWriter, StoredAuthorizationModel, TupleReader, TupleWriteOptions,
-    TupleWriter, UsersetRestrictionFilter, UsersetTupleFilter, WriteConflictPolicy,
+    Assertion, AssertionReader, AssertionWriter, ChangeFilter, ChangeOperation, ChangeReader,
+    ConditionFilter, HealthCheck, ModelReader, ModelWriter, ObjectRelationFilter, OperationContext,
+    PageOptions, ReadOptions, ReverseTupleFilter, StorageCancellationToken, StorageError,
+    StorageErrorKind, StoreName, StoreReader, StoreWriter, StoredAuthorizationModel,
+    TupleReadFilter, TupleReader, TupleWriteOptions, TupleWriter, UsersetRestrictionFilter,
+    UsersetTupleFilter, WriteConflictPolicy,
     contract::{TupleContractFixture, verify_tuple_contract},
 };
 use openfga_storage_memory::{
@@ -93,10 +94,15 @@ async fn test_should_update_all_tuple_indexes_and_changelog_atomically()
     )
     .await?;
     let changes = storage
-        .read_changes(&context, store_id, None, None, read_options(10)?)
+        .read_changes(
+            &context,
+            store_id,
+            &ChangeFilter::default(),
+            &page_options(10, None)?,
+        )
         .await?;
-    assert_eq!(changes.len(), 3);
-    assert!(changes.iter().all(|change| {
+    assert_eq!(changes.items().len(), 3);
+    assert!(changes.items().iter().all(|change| {
         change.operation() == ChangeOperation::Write && change.timestamp() == timestamp
     }));
 
@@ -121,12 +127,76 @@ async fn test_should_update_all_tuple_indexes_and_changelog_atomically()
         2,
     );
     let changes = storage
-        .read_changes(&context, store_id, None, None, read_options(10)?)
+        .read_changes(
+            &context,
+            store_id,
+            &ChangeFilter::default(),
+            &page_options(10, None)?,
+        )
         .await?;
     assert_eq!(
-        changes.last().map(openfga_storage::TupleChange::operation),
+        changes
+            .items()
+            .last()
+            .map(openfga_storage::TupleChange::operation),
         Some(ChangeOperation::Delete)
     );
+    storage.stop().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_should_page_partial_tuple_reads_without_duplicates_or_omissions()
+-> Result<(), Box<dyn Error>> {
+    let mut storage = MemoryStorage::start(MemoryStorageConfig::default())?;
+    let context = operation_context()?;
+    let store_id = create_store(&storage, &context).await?;
+    storage
+        .write_tuples(
+            &context,
+            store_id,
+            Vec::new(),
+            vec![
+                tuple("document:roadmap#viewer@user:anne")?,
+                tuple("document:roadmap#viewer@user:bob")?,
+                tuple("document:other#viewer@user:carol")?,
+            ],
+            TupleWriteOptions::default(),
+        )
+        .await?;
+    let filter = TupleReadFilter::new(
+        "document".parse()?,
+        Some("roadmap".parse()?),
+        Some("viewer".parse()?),
+        None,
+    )?;
+    let first = storage
+        .read_tuples(&context, store_id, &filter, &page_options(1, None)?)
+        .await?;
+    assert_eq!(first.items().len(), 1);
+    let cursor = first
+        .continuation()
+        .cloned()
+        .ok_or("missing tuple cursor")?;
+    let second = storage
+        .read_tuples(&context, store_id, &filter, &page_options(1, Some(cursor))?)
+        .await?;
+    assert_eq!(second.items().len(), 1);
+    assert!(second.continuation().is_none());
+    assert_ne!(first.items().first(), second.items().first());
+
+    let invalid_cursor = openfga_storage::StorageCursor::new(b"not-a-tuple".to_vec())?;
+    let invalid = storage
+        .read_tuples(
+            &context,
+            store_id,
+            &filter,
+            &page_options(1, Some(invalid_cursor))?,
+        )
+        .await
+        .err()
+        .ok_or("invalid tuple cursor unexpectedly accepted")?;
+    assert_eq!(invalid.kind(), StorageErrorKind::InvalidContinuation);
     storage.stop().await?;
     Ok(())
 }
@@ -164,8 +234,14 @@ async fn test_should_roll_back_every_injected_mutation_failure_stage() -> Result
         );
         assert!(
             storage
-                .read_changes(&context, store_id, None, None, read_options(10)?)
+                .read_changes(
+                    &context,
+                    store_id,
+                    &ChangeFilter::default(),
+                    &page_options(10, None)?,
+                )
                 .await?
+                .items()
                 .is_empty(),
         );
         storage.stop().await?;
@@ -216,8 +292,14 @@ async fn test_should_roll_back_cancellation_at_every_mutation_stage() -> Result<
         );
         assert!(
             storage
-                .read_changes(&setup_context, store_id, None, None, read_options(10)?,)
+                .read_changes(
+                    &setup_context,
+                    store_id,
+                    &ChangeFilter::default(),
+                    &page_options(10, None)?,
+                )
                 .await?
+                .items()
                 .is_empty(),
         );
         assert_eq!(storage.diagnostics().active_operations(), 0);
@@ -294,8 +376,14 @@ async fn test_should_enforce_conflict_ignore_and_concurrent_write_contracts()
     assert_eq!(both.kind(), StorageErrorKind::Conflict);
     assert_eq!(
         storage
-            .read_changes(&context, store_id, None, None, read_options(10)?)
+            .read_changes(
+                &context,
+                store_id,
+                &ChangeFilter::default(),
+                &page_options(10, None)?
+            )
             .await?
+            .items()
             .len(),
         1,
     );

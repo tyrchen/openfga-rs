@@ -53,6 +53,7 @@ mod graph;
 mod ir;
 mod limits;
 mod source;
+mod tuple_validation;
 
 pub use compiler::{CompiledModel, MODEL_COMPILER_FORMAT_VERSION, ModelCompiler};
 pub use error::{DeclarationPath, ModelError, ModelErrorCode, ModelErrors, ModelLookupError};
@@ -62,6 +63,8 @@ pub use ir::{
 };
 pub use limits::{ModelLimits, ModelLimitsBuilder};
 pub use source::{
-    AuthorizationModelSource, ConditionSource, DirectRestrictionSource, RelationSource,
-    RestrictionKindSource, RewriteSource, TypeDefinitionSource,
+    AuthorizationModelDefinition, AuthorizationModelSource, ConditionSource,
+    DirectRestrictionSource, RelationSource, RestrictionKindSource, RewriteSource,
+    TypeDefinitionSource,
 };
+pub use tuple_validation::{TupleValidationError, TupleValidationErrorKind};

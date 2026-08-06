@@ -5,13 +5,12 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use openfga_domain::{
-    AuthorizationModelId, ChangeId, RelationshipTuple, StoreId, TupleKey, TypeName,
-};
+use openfga_domain::{AuthorizationModelId, RelationshipTuple, StoreId, TupleKey};
 use openfga_storage::{
-    Assertion, HealthStatus, MutationOutcome, ObjectRelationFilter, OperationContext, Page,
-    PageOptions, ReadOptions, ReverseTupleFilter, StorageError, StoreName, StoreRecord,
-    StoredAuthorizationModel, StoredTuple, TupleChange, TupleWriteOptions, UsersetTupleFilter,
+    Assertion, ChangeFilter, HealthStatus, MutationOutcome, ObjectRelationFilter, OperationContext,
+    Page, PageOptions, ReadOptions, ReverseTupleFilter, StorageError, StoreName, StoreRecord,
+    StoredAuthorizationModel, StoredTuple, TupleChange, TupleReadFilter, TupleWriteOptions,
+    UsersetTupleFilter,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -21,7 +20,7 @@ pub(crate) type Reply<T> = oneshot::Sender<Result<T, StorageError>>;
 
 #[derive(Debug)]
 pub(crate) enum ActorMessage {
-    Operation(Envelope),
+    Operation(Box<Envelope>),
     Shutdown(oneshot::Sender<()>),
 }
 
@@ -33,6 +32,12 @@ pub(crate) struct Envelope {
 
 #[derive(Debug)]
 pub(crate) enum Command {
+    ReadTuples {
+        store_id: StoreId,
+        filter: TupleReadFilter,
+        options: PageOptions,
+        reply: Reply<Page<StoredTuple>>,
+    },
     ReadExact {
         store_id: StoreId,
         key: TupleKey,
@@ -126,10 +131,9 @@ pub(crate) enum Command {
     },
     ReadChanges {
         store_id: StoreId,
-        object_type: Option<TypeName>,
-        after: Option<ChangeId>,
-        options: ReadOptions,
-        reply: Reply<Vec<TupleChange>>,
+        filter: ChangeFilter,
+        options: PageOptions,
+        reply: Reply<Page<TupleChange>>,
     },
     Health {
         reply: Reply<HealthStatus>,
@@ -139,6 +143,7 @@ pub(crate) enum Command {
 impl Command {
     fn fail(self, error: StorageError) {
         match self {
+            Self::ReadTuples { reply, .. } => send(reply, Err(error)),
             Self::ReadExact { reply, .. } => send(reply, Err(error)),
             Self::ReadObjectRelation { reply, .. }
             | Self::ReadUserset { reply, .. }
@@ -173,7 +178,7 @@ pub(crate) async fn run_actor(
     running.store(true, Ordering::Release);
     while let Some(message) = receiver.recv().await {
         let envelope = match message {
-            ActorMessage::Operation(envelope) => envelope,
+            ActorMessage::Operation(envelope) => *envelope,
             ActorMessage::Shutdown(reply) => {
                 let _ = reply.send(());
                 break;
@@ -194,6 +199,12 @@ pub(crate) async fn run_actor(
 )]
 fn handle_command(state: &mut MemoryState, command: Command, context: &OperationContext) {
     match command {
+        Command::ReadTuples {
+            store_id,
+            filter,
+            options,
+            reply,
+        } => send(reply, state.read_tuples(store_id, &filter, &options)),
         Command::ReadExact {
             store_id,
             key,
@@ -283,14 +294,10 @@ fn handle_command(state: &mut MemoryState, command: Command, context: &Operation
         ),
         Command::ReadChanges {
             store_id,
-            object_type,
-            after,
+            filter,
             options,
             reply,
-        } => send(
-            reply,
-            state.read_changes(store_id, object_type.as_ref(), after, options),
-        ),
+        } => send(reply, state.read_changes(store_id, &filter, &options)),
         Command::Health { reply } => send(reply, Ok(HealthStatus::new(true, "ready"))),
     }
 }

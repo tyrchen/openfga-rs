@@ -3,18 +3,31 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use openfga_domain::{AuthorizationModelId, ChangeId, RelationshipTuple, StoreId, TupleKey};
+use openfga_domain::{AuthorizationModelId, RelationshipTuple, StoreId, TupleKey};
 
 use crate::{
-    Assertion, HealthStatus, MutationOutcome, ObjectRelationFilter, OperationContext, Page,
-    PageOptions, ReadOptions, ReverseTupleFilter, StorageError, StoreName, StoreRecord,
-    StoredAuthorizationModel, StoredTuple, TupleChange, TupleStream, TupleWriteOptions,
-    UsersetTupleFilter,
+    Assertion, ChangeFilter, HealthStatus, MutationOutcome, ObjectRelationFilter, OperationContext,
+    Page, PageOptions, ReadOptions, ReverseTupleFilter, StorageError, StoreName, StoreRecord,
+    StoredAuthorizationModel, StoredTuple, TupleChange, TupleReadFilter, TupleStream,
+    TupleWriteOptions, UsersetTupleFilter,
 };
 
 /// Exact, forward, userset, and reverse tuple-read capability.
 #[async_trait]
 pub trait TupleReader: Send + Sync {
+    /// Reads a stable bounded page matching a public partial tuple filter.
+    ///
+    /// # Errors
+    ///
+    /// Returns invalid continuation, cancellation, timeout, availability, or backend failures.
+    async fn read_tuples(
+        &self,
+        context: &OperationContext,
+        store_id: StoreId,
+        filter: &TupleReadFilter,
+        options: &PageOptions,
+    ) -> Result<Page<StoredTuple>, StorageError>;
+
     /// Reads one exact relationship tuple.
     ///
     /// # Errors
@@ -274,10 +287,9 @@ pub trait ChangeReader: Send + Sync {
         &self,
         context: &OperationContext,
         store_id: StoreId,
-        object_type: Option<&openfga_domain::TypeName>,
-        after: Option<ChangeId>,
-        options: ReadOptions,
-    ) -> Result<Vec<TupleChange>, StorageError>;
+        filter: &ChangeFilter,
+        options: &PageOptions,
+    ) -> Result<Page<TupleChange>, StorageError>;
 }
 
 /// Backend readiness capability.

@@ -1210,6 +1210,8 @@ dependencies = [
 name = "openfga-service"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "getrandom 0.4.3",
  "openfga-check",
  "openfga-domain",
  "openfga-model",
@@ -1218,6 +1220,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "ulid",
 ]
 
 [[package]]

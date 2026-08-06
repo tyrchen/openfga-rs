@@ -472,8 +472,13 @@ async fn observe_rust(service: &CheckService, event: &CorpusEvent) -> OutcomeCla
             }
             ServiceErrorKind::ResourceExhausted => OutcomeClass::ResourceExhausted,
             ServiceErrorKind::Timeout | ServiceErrorKind::Cancelled => OutcomeClass::Timeout,
-            ServiceErrorKind::Storage => OutcomeClass::Storage,
-            _ => OutcomeClass::Internal,
+            ServiceErrorKind::Unavailable => OutcomeClass::Storage,
+            ServiceErrorKind::StoreNotFound
+            | ServiceErrorKind::ModelNotFound
+            | ServiceErrorKind::AlreadyExists
+            | ServiceErrorKind::Conflict
+            | ServiceErrorKind::InvalidContinuation
+            | ServiceErrorKind::Internal => OutcomeClass::Internal,
         },
     }
 }

@@ -475,42 +475,14 @@ fn validate_model_identity(
 }
 
 fn validate_query_tuple(tuple: &TupleKey, model: &CompiledModel) -> Result<RelationId, CheckError> {
-    let relation = model
-        .relation_id(tuple.object().object_type(), tuple.relation())
-        .map_err(|source| CheckError::model("query_relation_missing", source))?;
-    validate_subject(tuple.subject(), model)?;
-    Ok(relation)
-}
-
-fn validate_subject(subject: &SubjectRef, model: &CompiledModel) -> Result<(), CheckError> {
-    model
-        .type_id(subject.subject_type())
-        .map_err(|source| CheckError::model("query_subject_type_missing", source))?;
-    if let SubjectRef::Userset(userset) = subject {
-        model
-            .relation_id(userset.object().object_type(), userset.relation())
-            .map_err(|source| CheckError::model("query_userset_relation_missing", source))?;
-    }
-    Ok(())
+    model.validate_query_tuple(tuple).map_err(Into::into)
 }
 
 fn validate_contextual_tuple(
     tuple: &RelationshipTuple,
     model: &CompiledModel,
 ) -> Result<(), CheckError> {
-    let relation_id = model
-        .relation_id(tuple.key().object().object_type(), tuple.key().relation())
-        .map_err(|source| CheckError::model("contextual_relation_missing", source))?;
-    let relation = model
-        .relation(relation_id)
-        .map_err(|source| CheckError::model("contextual_relation_invalid", source))?;
-    if matching_restriction(tuple, relation.restrictions(), model)?.is_none() {
-        return Err(CheckError::new(
-            CheckErrorKind::InvalidTuple,
-            "contextual_tuple_not_permitted",
-        ));
-    }
-    Ok(())
+    model.validate_relationship_tuple(tuple).map_err(Into::into)
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -1966,7 +1938,7 @@ mod tests {
             Branch::Allow => Ok(Decision::allow(CheckResolution::Direct)),
             Branch::Deny => Ok(Decision::deny(CheckResolution::Denied)),
             Branch::Error if operand == 0 => Err(CheckError::new(
-                CheckErrorKind::Storage,
+                CheckErrorKind::StorageUnavailable,
                 "operand_zero_error",
             )),
             Branch::Error => Err(CheckError::new(

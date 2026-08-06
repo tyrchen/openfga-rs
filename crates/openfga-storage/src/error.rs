@@ -6,7 +6,6 @@ use thiserror::Error;
 
 /// Stable storage failure category used by services and transports.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[non_exhaustive]
 pub enum StorageErrorKind {
     /// The requested record does not exist.
     NotFound,

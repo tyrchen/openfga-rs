@@ -11,11 +11,11 @@ use openfga_domain::{
     StoreId, SubjectRef, TupleKey, TypeName,
 };
 use openfga_storage::{
-    Assertion, ChangeOperation, ConditionFilter, MutationOutcome, ObjectRelationFilter,
-    OperationContext, Page, PageOptions, ReadOptions, ReverseTupleFilter, StorageCursor,
-    StorageError, StorageErrorKind, StoreName, StoreRecord, StoredAuthorizationModel, StoredTuple,
-    TupleChange, TupleWriteOptions, UsersetRestrictionFilter, UsersetTupleFilter,
-    WriteConflictPolicy,
+    Assertion, ChangeFilter, ChangeOperation, ConditionFilter, MutationOutcome,
+    ObjectRelationFilter, OperationContext, Page, PageOptions, ReadOptions, ReverseTupleFilter,
+    StorageCursor, StorageError, StorageErrorKind, StoreName, StoreRecord,
+    StoredAuthorizationModel, StoredTuple, TupleChange, TupleReadFilter, TupleWriteOptions,
+    UsersetRestrictionFilter, UsersetTupleFilter, WriteConflictPolicy,
 };
 use ulid::Ulid;
 
@@ -76,6 +76,43 @@ impl MemoryState {
             .get(&(store_id, key.clone()))
             .cloned()
             .ok_or_else(not_found)
+    }
+
+    pub(crate) fn read_tuples(
+        &self,
+        store_id: StoreId,
+        filter: &TupleReadFilter,
+        options: &PageOptions,
+    ) -> Result<Page<StoredTuple>, StorageError> {
+        self.require_store(store_id)?;
+        let after = options.after().map(parse_tuple_cursor).transpose()?;
+        let mut candidates = self
+            .tuples
+            .iter()
+            .filter(|((store, key), _)| {
+                *store == store_id
+                    && after.as_ref().is_none_or(|cursor| key > cursor)
+                    && filter.matches(key)
+            })
+            .map(|((_, key), stored)| (key.clone(), stored.clone()))
+            .take(options.maximum_results().saturating_add(1))
+            .collect::<Vec<_>>();
+        let has_more = candidates.len() > options.maximum_results();
+        if has_more {
+            candidates.pop();
+        }
+        let continuation = if has_more {
+            candidates
+                .last()
+                .map(|(key, _)| StorageCursor::new(key.to_string().into_bytes()))
+                .transpose()?
+        } else {
+            None
+        };
+        Ok(Page::new(
+            candidates.into_iter().map(|(_, stored)| stored).collect(),
+            continuation,
+        ))
     }
 
     pub(crate) fn read_object_relation(
@@ -304,6 +341,7 @@ impl MemoryState {
         store_id: StoreId,
         options: &PageOptions,
     ) -> Result<Page<Arc<StoredAuthorizationModel>>, StorageError> {
+        self.require_store(store_id)?;
         let after = options.after().map(parse_model_cursor).transpose()?;
         let ids = self
             .model_ids
@@ -455,25 +493,41 @@ impl MemoryState {
     pub(crate) fn read_changes(
         &self,
         store_id: StoreId,
-        object_type: Option<&TypeName>,
-        after: Option<ChangeId>,
-        options: ReadOptions,
-    ) -> Result<Vec<TupleChange>, StorageError> {
+        filter: &ChangeFilter,
+        options: &PageOptions,
+    ) -> Result<Page<TupleChange>, StorageError> {
         self.require_store(store_id)?;
-        Ok(self
-            .changes
-            .iter()
-            .filter(|((store, id), _)| {
-                *store == store_id && after.is_none_or(|cursor| *id > cursor)
-            })
-            .map(|(_, change)| change)
-            .filter(|change| {
-                object_type
-                    .is_none_or(|expected| change.tuple().key().object().object_type() == expected)
-            })
-            .take(options.maximum_results())
-            .cloned()
-            .collect())
+        let after = options.after().map(parse_change_cursor).transpose()?;
+        let mut changes =
+            self.changes
+                .iter()
+                .filter(|((store, id), _)| {
+                    *store == store_id && after.is_none_or(|cursor| *id > cursor)
+                })
+                .map(|(_, change)| change)
+                .filter(|change| {
+                    filter.object_type().is_none_or(|expected| {
+                        change.tuple().key().object().object_type() == expected
+                    }) && filter
+                        .start_time()
+                        .is_none_or(|start| change.timestamp() >= start)
+                })
+                .take(options.maximum_results().saturating_add(1))
+                .cloned()
+                .collect::<Vec<_>>();
+        let has_more = changes.len() > options.maximum_results();
+        if has_more {
+            changes.pop();
+        }
+        let continuation = if has_more {
+            changes
+                .last()
+                .map(|change| StorageCursor::new(change.id().to_string().into_bytes()))
+                .transpose()?
+        } else {
+            None
+        };
+        Ok(Page::new(changes, continuation))
     }
 
     fn collect_tuples<'a>(
@@ -708,6 +762,14 @@ fn parse_store_cursor(cursor: &StorageCursor) -> Result<StoreId, StorageError> {
 
 fn parse_model_cursor(cursor: &StorageCursor) -> Result<AuthorizationModelId, StorageError> {
     parse_cursor(cursor, "model_cursor")
+}
+
+fn parse_tuple_cursor(cursor: &StorageCursor) -> Result<TupleKey, StorageError> {
+    parse_cursor(cursor, "tuple_cursor")
+}
+
+fn parse_change_cursor(cursor: &StorageCursor) -> Result<ChangeId, StorageError> {
+    parse_cursor(cursor, "change_cursor")
 }
 
 fn parse_cursor<T: std::str::FromStr>(

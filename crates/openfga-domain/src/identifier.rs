@@ -60,6 +60,12 @@ macro_rules! define_ulid_identifier {
         pub struct $name(Ulid);
 
         impl $name {
+            #[doc = concat!("Creates a `", stringify!($name), "` from an already generated ULID.")]
+            #[must_use]
+            pub const fn from_ulid(value: Ulid) -> Self {
+                Self(value)
+            }
+
             #[doc = concat!("Returns the parsed ULID backing this `", stringify!($name), "`.")]
             #[must_use]
             pub const fn as_ulid(&self) -> &Ulid {

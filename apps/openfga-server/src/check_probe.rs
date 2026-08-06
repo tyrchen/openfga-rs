@@ -243,8 +243,10 @@ const fn map_batch_error(kind: CheckErrorKind) -> WireBatchCheckError {
         | CheckErrorKind::ConditionCostExceeded => {
             ("resource_exhausted", "authorization work limit exceeded")
         }
-        CheckErrorKind::Storage => ("service_unavailable", "authorization service unavailable"),
-        _ => ("internal_error", "authorization service failed"),
+        CheckErrorKind::StorageUnavailable => {
+            ("service_unavailable", "authorization service unavailable")
+        }
+        CheckErrorKind::Internal => ("internal_error", "authorization service failed"),
     };
     WireBatchCheckError { code, message }
 }
@@ -412,12 +414,16 @@ fn map_service_error(error: &ServiceError) -> ProbeError {
             "request_timeout",
             "authorization request did not complete",
         ),
-        ServiceErrorKind::Storage => (
+        ServiceErrorKind::Unavailable => (
             StatusCode::SERVICE_UNAVAILABLE,
             "service_unavailable",
             "authorization service unavailable",
         ),
-        _ => (
+        ServiceErrorKind::StoreNotFound
+        | ServiceErrorKind::AlreadyExists
+        | ServiceErrorKind::Conflict
+        | ServiceErrorKind::InvalidContinuation
+        | ServiceErrorKind::Internal => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal_error",
             "authorization service failed",

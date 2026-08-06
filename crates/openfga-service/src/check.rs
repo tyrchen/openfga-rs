@@ -137,16 +137,16 @@ impl CheckService {
         let context = OperationContext::new(query.consistency(), query.deadline(), cancellation);
         context.check()?;
         let model = match query.model_selection() {
-            ModelSelection::Explicit(model_id) => {
-                self.models
-                    .read_model(&context, query.store_id(), model_id)
-                    .await?
-            }
-            ModelSelection::Latest => {
-                self.models
-                    .read_latest_model(&context, query.store_id())
-                    .await?
-            }
+            ModelSelection::Explicit(model_id) => self
+                .models
+                .read_model(&context, query.store_id(), model_id)
+                .await
+                .map_err(ServiceError::model_storage)?,
+            ModelSelection::Latest => self
+                .models
+                .read_latest_model(&context, query.store_id())
+                .await
+                .map_err(ServiceError::model_storage)?,
             _ => return Err(ServiceError::unsupported_model_selection()),
         };
         context.check()?;

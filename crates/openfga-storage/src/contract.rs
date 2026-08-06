@@ -4,8 +4,9 @@ use openfga_domain::{RelationshipTuple, StoreId};
 use thiserror::Error;
 
 use crate::{
-    ChangeOperation, ChangeReader, ObjectRelationFilter, OperationContext, ReadOptions,
-    StorageError, StorageErrorKind, TupleReader, TupleWriteOptions, TupleWriter,
+    ChangeFilter, ChangeOperation, ChangeReader, ObjectRelationFilter, OperationContext,
+    PageOptions, ReadOptions, StorageError, StorageErrorKind, TupleReader, TupleWriteOptions,
+    TupleWriter,
 };
 
 /// Canonical inputs for the backend-independent tuple contract.
@@ -126,14 +127,22 @@ where
     {
         return Err(ContractError::Invariant("delete_visibility"));
     }
+    let page_options = PageOptions::from_read_options(fixture.read_options);
     let changes = backend
-        .read_changes(context, fixture.store_id, None, None, fixture.read_options)
+        .read_changes(
+            context,
+            fixture.store_id,
+            &ChangeFilter::default(),
+            &page_options,
+        )
         .await?;
-    if changes.len() != 3
+    if changes.items().len() != 3
         || changes
+            .items()
             .last()
             .is_none_or(|change| change.operation() != ChangeOperation::Delete)
         || !changes
+            .items()
             .windows(2)
             .all(|pair| matches!(pair, [left, right] if left.id() < right.id()))
     {

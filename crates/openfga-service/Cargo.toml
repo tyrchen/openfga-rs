@@ -12,13 +12,16 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+async-trait.workspace = true
+getrandom.workspace = true
 openfga-check.workspace = true
 openfga-domain.workspace = true
+openfga-model.workspace = true
 openfga-storage.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 tracing.workspace = true
+ulid.workspace = true
 
 [dev-dependencies]
-openfga-model.workspace = true
 openfga-storage-memory.workspace = true
-tokio.workspace = true
