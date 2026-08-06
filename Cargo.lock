@@ -1578,6 +1578,15 @@ dependencies = [
 [[package]]
 name = "openfga-list"
 version = "0.1.0"
+dependencies = [
+ "openfga-domain",
+ "openfga-model",
+ "openfga-storage",
+ "openfga-storage-memory",
+ "thiserror 2.0.19",
+ "tokio",
+ "typed-builder",
+]
 
 [[package]]
 name = "openfga-model"
