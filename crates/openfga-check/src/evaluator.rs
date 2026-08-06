@@ -9,8 +9,7 @@ use std::{
 
 use async_trait::async_trait;
 use openfga_condition::{
-    CancellationToken as ConditionCancellationToken, EvaluationBudget as ConditionBudget,
-    EvaluationErrorKind,
+    CancellationCheck, EvaluationBudget as ConditionBudget, EvaluationErrorKind,
 };
 use openfga_domain::{
     BatchCheckCommand, CheckCommand, ConditionContext, ConditionReference, ConsistencyPreference,
@@ -787,6 +786,29 @@ struct Counters {
     maximum_depth: u32,
 }
 
+struct RootConditionCancellation<'a> {
+    operation: &'a OperationContext,
+    #[cfg(test)]
+    poll_observer: Option<&'a (dyn Fn() + Sync)>,
+    #[cfg(test)]
+    clock: Option<&'a (dyn Fn() -> Instant + Sync)>,
+}
+
+impl CancellationCheck for RootConditionCancellation<'_> {
+    fn is_cancelled(&self) -> bool {
+        #[cfg(test)]
+        if let Some(observer) = self.poll_observer {
+            observer();
+        }
+        #[cfg(test)]
+        let current_time = self.clock.map_or_else(Instant::now, |clock| clock());
+        #[cfg(not(test))]
+        let current_time = Instant::now();
+        self.operation.cancellation().is_cancelled()
+            || self.operation.deadline().is_elapsed(current_time)
+    }
+}
+
 struct Scheduler {
     model: Arc<CompiledModel>,
     tuples: Arc<dyn TupleReader>,
@@ -795,7 +817,6 @@ struct Scheduler {
     operation: OperationContext,
     contextual: ContextualIndex,
     condition_context: ConditionContext,
-    condition_cancellation: ConditionCancellationToken,
     read_options: ReadOptions,
     counters: Counters,
     memo: BTreeMap<MemoKey, Decision>,
@@ -845,7 +866,6 @@ impl Scheduler {
             operation,
             contextual,
             condition_context,
-            condition_cancellation: ConditionCancellationToken::new(),
             read_options,
             counters: Counters::default(),
             memo: BTreeMap::new(),
@@ -907,11 +927,9 @@ impl Scheduler {
             let joined = tokio::select! {
                 biased;
                 () = self.operation.cancellation().cancelled() => {
-                    self.condition_cancellation.cancel();
                     return Err(cancelled("check_cancelled"));
                 }
                 () = sleep_until(deadline) => {
-                    self.condition_cancellation.cancel();
                     return Err(timed_out("check_deadline_elapsed"));
                 }
                 joined = self.reads.join_next() => joined,
@@ -1371,7 +1389,10 @@ impl Scheduler {
                         candidates.push(Candidate::Immediate(outcome));
                     }
                 }
-                DirectClass::Wildcard if wildcard_matches(tuple.key().subject(), &read.subject) => {
+                DirectClass::Wildcard
+                    if tuple.key().subject() == &read.subject
+                        || wildcard_matches(tuple.key().subject(), &read.subject) =>
+                {
                     if let Some(outcome) = self.evaluate_tuple_condition(&tuple)? {
                         candidates.push(Candidate::Immediate(outcome));
                     }
@@ -1382,13 +1403,17 @@ impl Scheduler {
                     {
                         match outcome {
                             Ok(decision) if decision.allowed => {
-                                candidates.push(Candidate::Semantic(SemanticWork {
-                                    object: userset.object().clone(),
-                                    relation,
-                                    subject: read.subject.clone(),
-                                    path: Arc::clone(&read.path),
-                                    depth: next_depth(read.depth)?,
-                                }));
+                                if tuple.key().subject() == &read.subject {
+                                    candidates.push(Candidate::Immediate(Ok(decision)));
+                                } else {
+                                    candidates.push(Candidate::Semantic(SemanticWork {
+                                        object: userset.object().clone(),
+                                        relation,
+                                        subject: read.subject.clone(),
+                                        path: Arc::clone(&read.path),
+                                        depth: next_depth(read.depth)?,
+                                    }));
+                                }
                             }
                             Ok(_) => {}
                             Err(error) => candidates.push(Candidate::Immediate(Err(error))),
@@ -1485,11 +1510,18 @@ impl Scheduler {
                 }
                 let condition_budget = ConditionBudget::new(u64::from(remaining))
                     .map_err(|_| condition_cost_exceeded())?;
+                let cancellation = RootConditionCancellation {
+                    operation: &self.operation,
+                    #[cfg(test)]
+                    poll_observer: None,
+                    #[cfg(test)]
+                    clock: None,
+                };
                 let evaluated = condition.evaluate(
                     &self.condition_context,
                     binding.context(),
                     condition_budget,
-                    &self.condition_cancellation,
+                    &cancellation,
                 );
                 self.check_context()?;
                 match evaluated {
@@ -1785,8 +1817,23 @@ const fn internal(code: &'static str) -> CheckError {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        collections::BTreeMap,
+        error::Error,
+        sync::atomic::{AtomicUsize, Ordering},
+        time::{Duration, Instant},
+    };
+
+    use openfga_condition::{
+        ConditionCompiler, ConditionDefinition, ConditionLimits, EvaluationBudget,
+        EvaluationErrorKind,
+    };
+    use openfga_domain::{ConditionContext, ConsistencyPreference, Deadline, RequestTimeout};
+    use openfga_storage::{OperationContext, StorageCancellationToken};
+
     use super::{
         CheckError, CheckErrorKind, CheckResolution, Decision, Evaluation, Reducer, ReducerKind,
+        RootConditionCancellation,
     };
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1813,6 +1860,89 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_should_poll_root_cancellation_during_condition_evaluation() -> Result<(), Box<dyn Error>>
+    {
+        let cancellation = StorageCancellationToken::new();
+        let operation = operation_context(Instant::now(), cancellation.clone())?;
+        let polls = AtomicUsize::new(0);
+        let observer = || {
+            if polls.fetch_add(1, Ordering::AcqRel) == 2 {
+                cancellation.cancel();
+            }
+        };
+        let signal = RootConditionCancellation {
+            operation: &operation,
+            poll_observer: Some(&observer),
+            clock: None,
+        };
+        let error = compiled_poll_condition()?
+            .evaluate(
+                &ConditionContext::empty(),
+                &ConditionContext::empty(),
+                EvaluationBudget::new(100)?,
+                &signal,
+            )
+            .err()
+            .ok_or("condition ignored root cancellation")?;
+        assert_eq!(error.kind(), EvaluationErrorKind::Cancelled);
+        assert!(polls.load(Ordering::Acquire) >= 3);
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_poll_root_deadline_during_condition_evaluation() -> Result<(), Box<dyn Error>> {
+        let start = Instant::now();
+        let operation = operation_context(start, StorageCancellationToken::new())?;
+        let polls = AtomicUsize::new(0);
+        let clock = || {
+            if polls.fetch_add(1, Ordering::AcqRel) < 2 {
+                start
+            } else {
+                start + Duration::from_secs(2)
+            }
+        };
+        let signal = RootConditionCancellation {
+            operation: &operation,
+            poll_observer: None,
+            clock: Some(&clock),
+        };
+        let error = compiled_poll_condition()?
+            .evaluate(
+                &ConditionContext::empty(),
+                &ConditionContext::empty(),
+                EvaluationBudget::new(100)?,
+                &signal,
+            )
+            .err()
+            .ok_or("condition ignored root deadline")?;
+        assert_eq!(error.kind(), EvaluationErrorKind::Cancelled);
+        assert!(polls.load(Ordering::Acquire) >= 3);
+        Ok(())
+    }
+
+    fn operation_context(
+        start: Instant,
+        cancellation: StorageCancellationToken,
+    ) -> Result<OperationContext, Box<dyn Error>> {
+        Ok(OperationContext::new(
+            ConsistencyPreference::HigherConsistency,
+            Deadline::from_timeout(start, RequestTimeout::new(Duration::from_secs(1))?)?,
+            cancellation,
+        ))
+    }
+
+    fn compiled_poll_condition() -> Result<openfga_condition::CompiledCondition, Box<dyn Error>> {
+        Ok(ConditionCompiler::default().compile(
+            &ConditionDefinition::new(
+                "poll_root".parse()?,
+                "true && true && true && true".to_owned(),
+                BTreeMap::new(),
+            ),
+            &ConditionLimits::default(),
+        )?)
     }
 
     fn reduce(kind: ReducerKind, branches: [Branch; 2], order: [usize; 2]) -> Evaluation {

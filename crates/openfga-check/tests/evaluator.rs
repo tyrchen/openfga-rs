@@ -63,8 +63,10 @@ async fn test_should_resolve_all_rewrites_usersets_wildcards_and_cycles()
     for query in [
         "document:direct#viewer@user:alice",
         "document:wild#viewer@user:bob",
+        "document:wild#viewer@user:*",
         "document:computed#viewer@user:alice",
         "document:userset#viewer@user:alice",
+        "document:userset#viewer@group:eng#member",
         "document:ttu#viewer@user:alice",
         "document:both#both@user:alice",
         "document:included#allowed@user:alice",

@@ -19,7 +19,7 @@ use crate::{
         UnaryOperator,
     },
     types::{
-        CancellationToken, CompiledMetadata, ConditionDefinition, ConditionLimits,
+        CancellationCheck, CompiledMetadata, ConditionDefinition, ConditionLimits,
         ConditionOutcome, EvaluationBudget, EvaluationContexts, ParameterType, ParameterTypeKind,
     },
     value::RuntimeValue,
@@ -94,7 +94,7 @@ impl CompiledCondition {
         request_context: &ConditionContext,
         tuple_context: &ConditionContext,
         budget: EvaluationBudget,
-        cancellation: &CancellationToken,
+        cancellation: &dyn CancellationCheck,
     ) -> Result<ConditionOutcome, EvaluationError> {
         evaluate(
             self,
@@ -867,7 +867,7 @@ fn iterable_types(value: &StaticType) -> Result<(StaticType, Option<StaticType>)
     }
 }
 
-fn fingerprint_definition(definition: &ConditionDefinition) -> Fingerprint {
+pub(crate) fn fingerprint_definition(definition: &ConditionDefinition) -> Fingerprint {
     let mut builder = FingerprintBuilder::new("openfga.condition.compiled.v1");
     builder.write_str(definition.name().as_str());
     builder.write_str(definition.expression());

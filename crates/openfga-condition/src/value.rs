@@ -328,7 +328,21 @@ fn cidr_v6(address: Ipv6Addr, network: Ipv6Addr, prefix: u8) -> Result<bool, Eva
 pub(crate) fn compare(left: &RuntimeValue, right: &RuntimeValue) -> Option<Ordering> {
     match (left, right) {
         (RuntimeValue::Int(left), RuntimeValue::Int(right)) => left.partial_cmp(right),
+        (RuntimeValue::Int(left), RuntimeValue::Uint(right)) => {
+            Some(compare_i64_u64(*left, *right))
+        }
+        (RuntimeValue::Int(left), RuntimeValue::Double(right)) => compare_i64_f64(*left, *right),
+        (RuntimeValue::Uint(left), RuntimeValue::Int(right)) => {
+            Some(compare_i64_u64(*right, *left).reverse())
+        }
         (RuntimeValue::Uint(left), RuntimeValue::Uint(right)) => left.partial_cmp(right),
+        (RuntimeValue::Uint(left), RuntimeValue::Double(right)) => compare_u64_f64(*left, *right),
+        (RuntimeValue::Double(left), RuntimeValue::Int(right)) => {
+            compare_i64_f64(*right, *left).map(Ordering::reverse)
+        }
+        (RuntimeValue::Double(left), RuntimeValue::Uint(right)) => {
+            compare_u64_f64(*right, *left).map(Ordering::reverse)
+        }
         (RuntimeValue::Double(left), RuntimeValue::Double(right)) => left.partial_cmp(right),
         (RuntimeValue::String(left), RuntimeValue::String(right)) => left.partial_cmp(right),
         (RuntimeValue::Bytes(left), RuntimeValue::Bytes(right)) => left.partial_cmp(right),
@@ -336,6 +350,28 @@ pub(crate) fn compare(left: &RuntimeValue, right: &RuntimeValue) -> Option<Order
         (RuntimeValue::Timestamp(left), RuntimeValue::Timestamp(right)) => left.partial_cmp(right),
         _ => None,
     }
+}
+
+fn compare_i64_u64(left: i64, right: u64) -> Ordering {
+    if left.is_negative() {
+        Ordering::Less
+    } else {
+        left.cast_unsigned().cmp(&right)
+    }
+}
+
+// CEL-Go deliberately promotes mixed integer/double operands to `double`,
+// including its IEEE-754 precision loss at large integer boundaries.
+#[allow(clippy::cast_precision_loss)]
+fn compare_i64_f64(left: i64, right: f64) -> Option<Ordering> {
+    (left as f64).partial_cmp(&right)
+}
+
+// CEL-Go deliberately promotes mixed integer/double operands to `double`,
+// including its IEEE-754 precision loss at large integer boundaries.
+#[allow(clippy::cast_precision_loss)]
+fn compare_u64_f64(left: u64, right: f64) -> Option<Ordering> {
+    (left as f64).partial_cmp(&right)
 }
 
 pub(crate) fn parameter_value<'a>(
@@ -356,4 +392,56 @@ const fn invalid_error() -> EvaluationError {
 
 const fn invalid_value_error() -> EvaluationError {
     EvaluationError::new(EvaluationErrorKind::InvalidValue)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cmp::Ordering;
+
+    use super::{RuntimeValue, compare};
+
+    #[test]
+    fn test_should_match_cel_go_cross_type_numeric_promotion() {
+        let cases = [
+            (RuntimeValue::Int(-1), RuntimeValue::Uint(0), Ordering::Less),
+            (
+                RuntimeValue::Int(1),
+                RuntimeValue::Double(1.5),
+                Ordering::Less,
+            ),
+            (
+                RuntimeValue::Double(-1.5),
+                RuntimeValue::Int(-1),
+                Ordering::Less,
+            ),
+            (
+                RuntimeValue::Int(i64::MAX),
+                RuntimeValue::Double(9_223_372_036_854_775_808.0),
+                Ordering::Equal,
+            ),
+            (
+                RuntimeValue::Uint(u64::MAX),
+                RuntimeValue::Double(18_446_744_073_709_551_616.0),
+                Ordering::Equal,
+            ),
+            (
+                RuntimeValue::Int(9_007_199_254_740_993),
+                RuntimeValue::Double(9_007_199_254_740_992.0),
+                Ordering::Equal,
+            ),
+            (
+                RuntimeValue::Double(-0.0),
+                RuntimeValue::Uint(0),
+                Ordering::Equal,
+            ),
+        ];
+        for (left, right, expected) in cases {
+            assert_eq!(compare(&left, &right), Some(expected));
+            assert_eq!(compare(&right, &left), Some(expected.reverse()));
+        }
+        assert_eq!(
+            compare(&RuntimeValue::Int(0), &RuntimeValue::Double(f64::NAN)),
+            None
+        );
+    }
 }

@@ -129,11 +129,12 @@ pub struct StoredAuthorizationModel {
 }
 
 impl StoredAuthorizationModel {
-    /// Validates source/compiled identity and creates a persistable model record.
+    /// Validates source/compiled identity and semantics, then creates a persistable record.
     ///
     /// # Errors
     ///
-    /// Returns an integrity error when the source and compiled handles differ.
+    /// Returns an integrity error when the source and compiled handles differ
+    /// in identity or compiler-produced source fingerprint.
     pub fn new(
         source: Arc<AuthorizationModelSource>,
         compiled: Arc<CompiledModel>,
@@ -143,6 +144,12 @@ impl StoredAuthorizationModel {
             return Err(StorageError::new(
                 StorageErrorKind::Integrity,
                 "model_source_compiled_identity_mismatch",
+            ));
+        }
+        if source.fingerprint() != compiled.source_fingerprint() {
+            return Err(StorageError::new(
+                StorageErrorKind::Integrity,
+                "model_source_compiled_semantics_mismatch",
             ));
         }
         Ok(Self {
@@ -881,11 +888,17 @@ impl HealthStatus {
 
 #[cfg(test)]
 mod tests {
-    use std::error::Error;
+    use std::{error::Error, sync::Arc, time::SystemTime};
 
-    use openfga_domain::InputLimits;
+    use openfga_domain::{InputLimits, Limit};
+    use openfga_model::{
+        AuthorizationModelSource, DirectRestrictionSource, ModelCompiler, ModelLimits,
+        RelationSource, RestrictionKindSource, RewriteSource, TypeDefinitionSource,
+    };
 
-    use super::{ConditionFilter, StorageCursor, StoreName};
+    use super::{
+        ConditionFilter, StorageCursor, StorageErrorKind, StoreName, StoredAuthorizationModel,
+    };
 
     #[test]
     fn test_should_enforce_pinned_store_name_allowlist_and_redaction() -> Result<(), Box<dyn Error>>
@@ -911,5 +924,78 @@ mod tests {
         let cursor = StorageCursor::new(b"sensitive-cursor".to_vec())?;
         assert!(!format!("{cursor:?}").contains("sensitive"));
         Ok(())
+    }
+
+    #[test]
+    fn test_should_reject_same_id_source_and_compiled_semantic_mismatch()
+    -> Result<(), Box<dyn Error>> {
+        let source = Arc::new(model_source("viewer")?);
+        let compiled = ModelCompiler::default().compile(&source)?;
+        let different_source = Arc::new(model_source("editor")?);
+        let error = StoredAuthorizationModel::new(different_source, compiled, SystemTime::now())
+            .err()
+            .ok_or("same-ID semantic mismatch unexpectedly accepted")?;
+        assert_eq!(error.kind(), StorageErrorKind::Integrity);
+        assert_eq!(error.code(), "model_source_compiled_semantics_mismatch");
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_accept_source_proof_from_custom_compiler_limits() -> Result<(), Box<dyn Error>> {
+        let relations = (0..101)
+            .map(|index| {
+                Ok(RelationSource::new(
+                    format!("relation_{index}").parse()?,
+                    RewriteSource::Direct,
+                    vec![DirectRestrictionSource::new(
+                        "user".parse()?,
+                        RestrictionKindSource::Object,
+                        None,
+                    )],
+                ))
+            })
+            .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+        let source = Arc::new(AuthorizationModelSource::new(
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV".parse()?,
+            "01ARZ3NDEKTSV4RRFFQ69G5FAW".parse()?,
+            "1.1".to_owned(),
+            vec![
+                TypeDefinitionSource::new("user".parse()?, Vec::new()),
+                TypeDefinitionSource::new("document".parse()?, relations),
+            ],
+            Vec::new(),
+        ));
+        let input = InputLimits::builder()
+            .relations(Limit::<2_000>::new(101)?)
+            .build();
+        let model_compiler = ModelCompiler::new(ModelLimits::builder().input(input).build());
+        let compiled_model = model_compiler.compile(&source)?;
+        let stored = StoredAuthorizationModel::new(source, compiled_model, SystemTime::now())?;
+        assert_eq!(stored.model_id().to_string(), "01ARZ3NDEKTSV4RRFFQ69G5FAW");
+        Ok(())
+    }
+
+    fn model_source(relation: &str) -> Result<AuthorizationModelSource, Box<dyn Error>> {
+        Ok(AuthorizationModelSource::new(
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV".parse()?,
+            "01ARZ3NDEKTSV4RRFFQ69G5FAW".parse()?,
+            "1.1".to_owned(),
+            vec![
+                TypeDefinitionSource::new("user".parse()?, Vec::new()),
+                TypeDefinitionSource::new(
+                    "document".parse()?,
+                    vec![RelationSource::new(
+                        relation.parse()?,
+                        RewriteSource::Direct,
+                        vec![DirectRestrictionSource::new(
+                            "user".parse()?,
+                            RestrictionKindSource::Object,
+                            None,
+                        )],
+                    )],
+                ),
+            ],
+            Vec::new(),
+        ))
     }
 }

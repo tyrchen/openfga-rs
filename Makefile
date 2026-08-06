@@ -180,7 +180,26 @@ check-differential: $(GO_BASELINE) build
 	$(CARGO) run --quiet -p openfga-server -- differential-check \
 		--go-url "http://$(GO_HTTP_ADDR)/" --rust-url "http://$(RUST_PROBE_ADDR)/"
 
-check-spike: check-baseline check-oracle check-differential
+check-corpus-differential: verify-go-tool verify-go-pin
+	@phase1_tmp=$$(mktemp -d); \
+	repo_root=$$(pwd -P); \
+	cleanup() { rm -rf "$$phase1_tmp"; }; \
+	trap cleanup EXIT INT TERM; \
+	case "$$repo_root" in *\\*|*\"*) echo "repository path cannot be encoded in the Go overlay" >&2; exit 1 ;; esac; \
+	printf '{"Replace":{"%s":"%s"}}\n' \
+		"$$repo_root/vendors/openfga/tests/check/export_test.go" \
+		"$$repo_root/tests/check-corpus-overlay/export_test.go" \
+		>"$$phase1_tmp/overlay.json"; \
+	cd vendors/openfga && \
+		OPENFGA_CHECK_CORPUS_OUTPUT="$$phase1_tmp/corpus.json" \
+		GOTOOLCHAIN=local GOFLAGS=-mod=readonly ../../$(GO_TOOL) test \
+		-overlay="$$phase1_tmp/overlay.json" ./tests/check \
+		-run '^TestExportCheckCorpus$$' -count=1 && \
+	cd "$$repo_root" && \
+		$(CARGO) run --quiet -p openfga-server -- differential-check-corpus \
+		--corpus "$$phase1_tmp/corpus.json"
+
+check-spike: check-baseline check-oracle check-differential check-corpus-differential
 
 listobjects-spike: verify-go-tool verify-go-pin
 	@cd vendors/openfga && \
@@ -244,7 +263,7 @@ release:
 update-submodule:
 	@git submodule update --init --recursive --remote
 
-.PHONY: audit build cel-baseline cel-spike check check-agent-sync check-baseline check-differential check-docs \
+.PHONY: audit build cel-baseline cel-spike check check-agent-sync check-baseline check-corpus-differential check-differential check-docs \
 	check-oracle check-proto check-spike \
 	clippy clippy-strict \
 	conformance deny differential-smoke doc fmt fuzz-condition fuzz-domain fuzz-model go-baseline listobjects-spike model-baseline \

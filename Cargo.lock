@@ -1192,6 +1192,7 @@ dependencies = [
  "axum",
  "clap",
  "openfga-check",
+ "openfga-condition",
  "openfga-domain",
  "openfga-model",
  "openfga-service",

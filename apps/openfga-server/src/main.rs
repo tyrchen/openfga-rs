@@ -5,6 +5,7 @@
 use std::{
     io::{self, Write},
     net::{IpAddr, SocketAddr},
+    path::PathBuf,
     time::Duration,
 };
 
@@ -17,6 +18,7 @@ use serde_json::Value;
 use tower::limit::ConcurrencyLimitLayer;
 use tower_http::{limit::RequestBodyLimitLayer, timeout::TimeoutLayer};
 
+mod check_corpus;
 mod check_probe;
 
 const MAX_PROBE_URL_BYTES: usize = 1_024;
@@ -64,6 +66,12 @@ enum Command {
         #[arg(long)]
         rust_url: String,
     },
+    /// Replay the complete pinned upstream Check fixture corpus against Rust.
+    DifferentialCheckCorpus {
+        /// Recorded corpus JSON produced by the pinned Go fixture exporter.
+        #[arg(long)]
+        corpus: PathBuf,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -106,6 +114,7 @@ async fn main() -> Result<()> {
         Command::DifferentialCheck { go_url, rust_url } => {
             check_probe::run_differential(&go_url, &rust_url).await
         }
+        Command::DifferentialCheckCorpus { corpus } => check_corpus::run(corpus).await,
     }
 }
 

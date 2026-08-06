@@ -11,7 +11,7 @@ use crate::{
     compiler::CompiledCondition,
     error::{EvaluationError, EvaluationErrorKind},
     ir::{BinaryOperator, Comprehension, Function, NodeId, NodeKind, UnaryOperator},
-    types::{CancellationToken, ConditionOutcome, EvaluationBudget, EvaluationContexts},
+    types::{CancellationCheck, ConditionOutcome, EvaluationBudget, EvaluationContexts},
     value::{
         RuntimeValue, compare, convert_parameter, ip_in_cidr, parameter_value, parse_duration,
         parse_ip_address, parse_timestamp,
@@ -109,7 +109,7 @@ pub(crate) fn evaluate(
     compiled: &CompiledCondition,
     contexts: EvaluationContexts<'_>,
     budget: EvaluationBudget,
-    cancellation: &CancellationToken,
+    cancellation: &dyn CancellationCheck,
 ) -> Result<ConditionOutcome, EvaluationError> {
     let parameter_values = prepare_parameters(compiled, contexts, cancellation)?;
     let mut machine = Machine {
@@ -127,7 +127,7 @@ pub(crate) fn evaluate(
 
 struct Machine<'a> {
     compiled: &'a CompiledCondition,
-    cancellation: &'a CancellationToken,
+    cancellation: &'a dyn CancellationCheck,
     maximum_cost: u64,
     cost: u64,
     frames: Vec<Frame>,
@@ -1045,6 +1045,10 @@ fn scalar_equal(left: &RuntimeValue, right: &RuntimeValue) -> bool {
         (RuntimeValue::Int(left), RuntimeValue::Int(right)) => left == right,
         (RuntimeValue::Uint(left), RuntimeValue::Uint(right)) => left == right,
         (RuntimeValue::Double(left), RuntimeValue::Double(right)) => left == right,
+        (
+            RuntimeValue::Int(_) | RuntimeValue::Uint(_) | RuntimeValue::Double(_),
+            RuntimeValue::Int(_) | RuntimeValue::Uint(_) | RuntimeValue::Double(_),
+        ) => compare(left, right).is_some_and(Ordering::is_eq),
         (RuntimeValue::String(left), RuntimeValue::String(right)) => left == right,
         (RuntimeValue::Bytes(left), RuntimeValue::Bytes(right)) => left == right,
         (RuntimeValue::Duration(left), RuntimeValue::Duration(right)) => left == right,
@@ -1090,11 +1094,13 @@ fn collect_top_level_unknowns<'a>(
 fn prepare_parameters(
     compiled: &CompiledCondition,
     contexts: EvaluationContexts<'_>,
-    cancellation: &CancellationToken,
+    cancellation: &dyn CancellationCheck,
 ) -> Result<BTreeMap<ParameterName, RuntimeValue>, EvaluationError> {
     let mut values = BTreeMap::new();
+    let mut missing = 0_usize;
     for (name, parameter_type) in compiled.parameters() {
         let Some(value) = parameter_value(name, contexts.request, contexts.tuple) else {
+            missing = missing.checked_add(1).ok_or_else(invalid_state)?;
             continue;
         };
         charge_context_value(
@@ -1105,12 +1111,15 @@ fn prepare_parameters(
         )?;
         values.insert(name.clone(), convert_parameter(value, parameter_type)?);
     }
+    if missing != 0 {
+        return Err(EvaluationError::missing(missing));
+    }
     Ok(values)
 }
 
 fn charge_context_value(
     root: &ContextValue,
-    cancellation: &CancellationToken,
+    cancellation: &dyn CancellationCheck,
     maximum_value_bytes: usize,
     maximum_collection_items: usize,
 ) -> Result<(), EvaluationError> {

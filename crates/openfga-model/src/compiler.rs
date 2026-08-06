@@ -66,6 +66,7 @@ pub struct CompiledModel {
     model_id: AuthorizationModelId,
     schema_version: Box<str>,
     compiler_format_version: u32,
+    source_fingerprint: Fingerprint,
     fingerprint: Fingerprint,
     types: Box<[CompiledType]>,
     type_lookup: BTreeMap<TypeName, TypeId>,
@@ -100,6 +101,12 @@ impl CompiledModel {
     #[must_use]
     pub const fn compiler_format_version(&self) -> u32 {
         self.compiler_format_version
+    }
+
+    /// Returns the compiler-produced proof of the exact source model.
+    #[must_use]
+    pub const fn source_fingerprint(&self) -> Fingerprint {
+        self.source_fingerprint
     }
 
     /// Returns the canonical semantic fingerprint.
@@ -371,6 +378,7 @@ impl<'a> Compiler<'a> {
             model_id: self.source.model_id,
             schema_version: self.source.schema_version.clone().into_boxed_str(),
             compiler_format_version: MODEL_COMPILER_FORMAT_VERSION,
+            source_fingerprint: self.source.fingerprint(),
             fingerprint,
             types: symbols.types.into_boxed_slice(),
             type_lookup: symbols.type_lookup,

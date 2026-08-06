@@ -45,6 +45,6 @@ mod value;
 pub use compiler::{CompiledCondition, ConditionCompiler};
 pub use error::{CompileError, CompileErrorKind, EvaluationError, EvaluationErrorKind};
 pub use types::{
-    CancellationToken, ConditionDefinition, ConditionLimits, ConditionLimitsBuilder,
-    ConditionOutcome, EvaluationBudget, ParameterType,
+    CancellationCheck, CancellationToken, ConditionDefinition, ConditionLimits,
+    ConditionLimitsBuilder, ConditionOutcome, EvaluationBudget, ParameterType,
 };

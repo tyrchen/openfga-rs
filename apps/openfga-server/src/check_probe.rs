@@ -1,6 +1,7 @@
 //! Loopback-only Phase 1 Check probe and normalized differential comparator.
 
 use std::{
+    collections::BTreeMap,
     io::{self, Write},
     net::SocketAddr,
     sync::Arc,
@@ -15,15 +16,17 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use openfga_check::CheckBudget;
+use openfga_check::{CheckBudget, CheckErrorKind};
+use openfga_condition::{ConditionDefinition, ParameterType};
 use openfga_domain::{
-    AuthorizationModelId, CheckCommand, ConditionContext, ConsistencyPreference, ContextualTuples,
-    Deadline, InputLimits, ModelSelection, ObjectRef, Principal, PrincipalKind, QueryContext,
-    RelationName, RelationshipTuple, RequestTimeout, StoreId, SubjectRef, TupleKey,
+    AuthorizationModelId, BatchCheckCommand, BatchCheckItem, BatchCheckItems, CheckCommand,
+    ConditionBinding, ConditionContext, ConditionReference, ConsistencyPreference,
+    ContextualTuples, Deadline, InputLimits, ModelSelection, ObjectRef, Principal, PrincipalKind,
+    QueryContext, RelationName, RelationshipTuple, RequestTimeout, StoreId, SubjectRef, TupleKey,
 };
 use openfga_model::{
-    AuthorizationModelSource, DirectRestrictionSource, ModelCompiler, RelationSource,
-    RestrictionKindSource, RewriteSource, TypeDefinitionSource,
+    AuthorizationModelSource, ConditionSource, DirectRestrictionSource, ModelCompiler,
+    RelationSource, RestrictionKindSource, RewriteSource, TypeDefinitionSource,
 };
 use openfga_service::{CheckService, ServiceError, ServiceErrorKind};
 use openfga_storage::{
@@ -41,7 +44,7 @@ use super::{health, shutdown_signal, validated_loopback_url};
 
 const STORE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 const MODEL_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAW";
-const GO_BASELINE_COMMIT: &str = "4e4f79ed841513dfd61746a75ef473f6198299f7";
+pub(crate) const GO_BASELINE_COMMIT: &str = "4e4f79ed841513dfd61746a75ef473f6198299f7";
 const MAXIMUM_BODY_BYTES: usize = 32 * 1_024;
 const MAXIMUM_RESPONSE_BYTES: usize = 8 * 1_024;
 const MAXIMUM_CONCURRENCY: usize = 16;
@@ -85,6 +88,45 @@ struct WireCheckRequest {
 #[derive(Debug, Deserialize, Serialize)]
 struct WireCheckResponse {
     allowed: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct WireBatchCheckItem {
+    tuple_key: WireTupleKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    contextual_tuples: Option<WireContextualTuples>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    context: Option<Value>,
+    correlation_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct WireBatchCheckRequest {
+    checks: Vec<WireBatchCheckItem>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    authorization_model_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    consistency: String,
+}
+
+#[derive(Debug, Serialize)]
+struct WireBatchCheckResponse {
+    result: BTreeMap<String, WireBatchCheckSingleResult>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum WireBatchCheckSingleResult {
+    Allowed { allowed: bool },
+    Error { error: WireBatchCheckError },
+}
+
+#[derive(Debug, Serialize)]
+struct WireBatchCheckError {
+    code: &'static str,
+    message: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -132,6 +174,7 @@ pub(crate) async fn serve(address: SocketAddr) -> Result<()> {
     let application = Router::new()
         .route("/healthz", get(health))
         .route("/stores/{store_id}/check", post(check))
+        .route("/stores/{store_id}/batch-check", post(batch_check))
         .with_state(state)
         .layer(RequestBodyLimitLayer::new(MAXIMUM_BODY_BYTES))
         .layer(TimeoutLayer::with_status_code(
@@ -156,6 +199,56 @@ pub(crate) async fn serve(address: SocketAddr) -> Result<()> {
     stop_result
 }
 
+async fn batch_check(
+    Path(store_id): Path<String>,
+    State(state): State<ProbeState>,
+    Json(request): Json<WireBatchCheckRequest>,
+) -> Result<Json<WireBatchCheckResponse>, ProbeError> {
+    let command = convert_batch_request(&store_id, request)?;
+    let outcome = state
+        .service
+        .batch_check(&command, StorageCancellationToken::new())
+        .await
+        .map_err(|error| map_service_error(&error))?;
+    let result = outcome
+        .results()
+        .iter()
+        .map(|result| {
+            let item = match result.outcome() {
+                Ok(outcome) => WireBatchCheckSingleResult::Allowed {
+                    allowed: outcome.allowed(),
+                },
+                Err(error) => WireBatchCheckSingleResult::Error {
+                    error: map_batch_error(error.kind()),
+                },
+            };
+            (result.correlation_id().as_str().to_owned(), item)
+        })
+        .collect();
+    Ok(Json(WireBatchCheckResponse { result }))
+}
+
+const fn map_batch_error(kind: CheckErrorKind) -> WireBatchCheckError {
+    let (code, message) = match kind {
+        CheckErrorKind::InvalidModel | CheckErrorKind::InvalidTuple | CheckErrorKind::Condition => {
+            ("validation_error", "invalid check input")
+        }
+        CheckErrorKind::Cancelled | CheckErrorKind::Timeout => {
+            ("request_timeout", "authorization request did not complete")
+        }
+        CheckErrorKind::DepthExceeded
+        | CheckErrorKind::DispatchExceeded
+        | CheckErrorKind::DatastoreQueryExceeded
+        | CheckErrorKind::TupleItemExceeded
+        | CheckErrorKind::ConditionCostExceeded => {
+            ("resource_exhausted", "authorization work limit exceeded")
+        }
+        CheckErrorKind::Storage => ("service_unavailable", "authorization service unavailable"),
+        _ => ("internal_error", "authorization service failed"),
+    };
+    WireBatchCheckError { code, message }
+}
+
 async fn check(
     Path(store_id): Path<String>,
     State(state): State<ProbeState>,
@@ -174,34 +267,89 @@ async fn check(
 
 fn convert_request(store_id: &str, request: WireCheckRequest) -> Result<CheckCommand, ProbeError> {
     let limits = InputLimits::default();
+    let tuple = convert_tuple(&request.tuple_key, &limits)?;
+    let contextual_tuples = convert_contextual_tuples(request.contextual_tuples, &limits)?;
+    let condition_context = convert_condition_context(request.context, &limits)?;
+    let query = convert_query_context(
+        store_id,
+        &request.authorization_model_id,
+        &request.consistency,
+        contextual_tuples,
+        condition_context,
+    )?;
+    Ok(CheckCommand::new(query, tuple))
+}
+
+fn convert_batch_request(
+    store_id: &str,
+    request: WireBatchCheckRequest,
+) -> Result<BatchCheckCommand, ProbeError> {
+    let limits = InputLimits::default();
+    let items = request
+        .checks
+        .into_iter()
+        .map(|item| {
+            Ok(BatchCheckItem::new(
+                item.correlation_id
+                    .parse()
+                    .map_err(|_| ProbeError::validation())?,
+                convert_tuple(&item.tuple_key, &limits)?,
+                convert_contextual_tuples(item.contextual_tuples, &limits)?,
+                convert_condition_context(item.context, &limits)?,
+            ))
+        })
+        .collect::<Result<Vec<_>, ProbeError>>()?;
+    let items = BatchCheckItems::new(items, &limits).map_err(|_| ProbeError::validation())?;
+    let query = convert_query_context(
+        store_id,
+        &request.authorization_model_id,
+        &request.consistency,
+        ContextualTuples::empty(),
+        ConditionContext::empty(),
+    )?;
+    Ok(BatchCheckCommand::new(query, items))
+}
+
+fn convert_contextual_tuples(
+    tuples: Option<WireContextualTuples>,
+    limits: &InputLimits,
+) -> Result<ContextualTuples, ProbeError> {
+    let tuples = tuples
+        .map_or_else(Vec::new, |tuples| tuples.tuple_keys)
+        .into_iter()
+        .map(|tuple| convert_tuple(&tuple, limits).map(RelationshipTuple::unconditional))
+        .collect::<Result<Vec<_>, _>>()?;
+    ContextualTuples::new(tuples, limits).map_err(|_| ProbeError::validation())
+}
+
+fn convert_condition_context(
+    context: Option<Value>,
+    limits: &InputLimits,
+) -> Result<ConditionContext, ProbeError> {
+    ConditionContext::try_from_json(context.unwrap_or_else(|| Value::Object(Map::new())), limits)
+        .map_err(|_| ProbeError::validation())
+}
+
+fn convert_query_context(
+    store_id: &str,
+    authorization_model_id: &str,
+    consistency: &str,
+    contextual_tuples: ContextualTuples,
+    condition_context: ConditionContext,
+) -> Result<QueryContext, ProbeError> {
     let store_id = store_id
         .parse::<StoreId>()
         .map_err(|_| ProbeError::validation())?;
-    let model_selection = if request.authorization_model_id.is_empty() {
+    let model_selection = if authorization_model_id.is_empty() {
         ModelSelection::Latest
     } else {
         ModelSelection::Explicit(
-            request
-                .authorization_model_id
+            authorization_model_id
                 .parse::<AuthorizationModelId>()
                 .map_err(|_| ProbeError::validation())?,
         )
     };
-    let tuple = convert_tuple(&request.tuple_key, &limits)?;
-    let contextual_tuples = request
-        .contextual_tuples
-        .map_or_else(Vec::new, |tuples| tuples.tuple_keys)
-        .into_iter()
-        .map(|tuple| convert_tuple(&tuple, &limits).map(RelationshipTuple::unconditional))
-        .collect::<Result<Vec<_>, _>>()?;
-    let contextual_tuples =
-        ContextualTuples::new(contextual_tuples, &limits).map_err(|_| ProbeError::validation())?;
-    let condition_context = ConditionContext::try_from_json(
-        request.context.unwrap_or_else(|| Value::Object(Map::new())),
-        &limits,
-    )
-    .map_err(|_| ProbeError::validation())?;
-    let consistency = convert_consistency(&request.consistency)?;
+    let consistency = convert_consistency(consistency)?;
     let deadline = Deadline::from_timeout(
         Instant::now(),
         RequestTimeout::new(REQUEST_TIMEOUT).map_err(|_| ProbeError::validation())?,
@@ -221,7 +369,7 @@ fn convert_request(store_id: &str, request: WireCheckRequest) -> Result<CheckCom
                 .map_err(|_| ProbeError::validation())?,
         ))
         .build();
-    Ok(CheckCommand::new(query, tuple))
+    Ok(query)
 }
 
 fn convert_tuple(tuple: &WireTupleKey, limits: &InputLimits) -> Result<TupleKey, ProbeError> {
@@ -332,14 +480,39 @@ fn operation_context() -> Result<OperationContext> {
     ))
 }
 
+fn object_restriction(
+    subject_type: &str,
+    condition: Option<&str>,
+) -> Result<DirectRestrictionSource> {
+    Ok(DirectRestrictionSource::new(
+        subject_type.parse()?,
+        RestrictionKindSource::Object,
+        condition.map(str::parse).transpose()?,
+    ))
+}
+
+fn wildcard_restriction(subject_type: &str) -> Result<DirectRestrictionSource> {
+    Ok(DirectRestrictionSource::new(
+        subject_type.parse()?,
+        RestrictionKindSource::Wildcard,
+        None,
+    ))
+}
+
+fn userset_restriction(subject_type: &str, relation: &str) -> Result<DirectRestrictionSource> {
+    Ok(DirectRestrictionSource::new(
+        subject_type.parse()?,
+        RestrictionKindSource::Userset(relation.parse()?),
+        None,
+    ))
+}
+
+fn computed_rewrite(relation: &str) -> Result<RewriteSource> {
+    Ok(RewriteSource::Computed(relation.parse()?))
+}
+
 fn fixture_model_source() -> Result<AuthorizationModelSource> {
-    let object = |subject_type: &str| -> Result<DirectRestrictionSource> {
-        Ok(DirectRestrictionSource::new(
-            subject_type.parse()?,
-            RestrictionKindSource::Object,
-            None,
-        ))
-    };
+    let parameters = BTreeMap::from([("x".parse()?, ParameterType::any())]);
     Ok(AuthorizationModelSource::new(
         STORE_ID.parse()?,
         MODEL_ID.parse()?,
@@ -351,40 +524,146 @@ fn fixture_model_source() -> Result<AuthorizationModelSource> {
                 vec![RelationSource::new(
                     "member".parse()?,
                     RewriteSource::Direct,
-                    vec![object("user")?],
+                    vec![
+                        object_restriction("user", None)?,
+                        userset_restriction("group", "member")?,
+                    ],
                 )],
             ),
             TypeDefinitionSource::new(
-                "document".parse()?,
+                "folder".parse()?,
                 vec![RelationSource::new(
                     "viewer".parse()?,
                     RewriteSource::Direct,
                     vec![
-                        object("user")?,
-                        DirectRestrictionSource::new(
-                            "user".parse()?,
-                            RestrictionKindSource::Wildcard,
-                            None,
-                        ),
-                        DirectRestrictionSource::new(
-                            "group".parse()?,
-                            RestrictionKindSource::Userset("member".parse()?),
-                            None,
-                        ),
+                        object_restriction("user", None)?,
+                        wildcard_restriction("user")?,
                     ],
                 )],
             ),
+            fixture_document_type()?,
         ],
-        Vec::new(),
+        vec![
+            ConditionSource::new(
+                "under_limit".parse()?,
+                ConditionDefinition::new(
+                    "under_limit".parse()?,
+                    "x < 100 && x == 50".to_owned(),
+                    parameters.clone(),
+                ),
+            ),
+            ConditionSource::new(
+                "at_precision_boundary".parse()?,
+                ConditionDefinition::new(
+                    "at_precision_boundary".parse()?,
+                    "x == 9223372036854775807".to_owned(),
+                    parameters,
+                ),
+            ),
+        ],
+    ))
+}
+
+fn fixture_document_type() -> Result<TypeDefinitionSource> {
+    Ok(TypeDefinitionSource::new(
+        "document".parse()?,
+        vec![
+            RelationSource::new(
+                "owner".parse()?,
+                RewriteSource::Direct,
+                vec![object_restriction("user", None)?],
+            ),
+            RelationSource::new(
+                "editor".parse()?,
+                RewriteSource::Direct,
+                vec![object_restriction("user", None)?],
+            ),
+            RelationSource::new(
+                "banned".parse()?,
+                RewriteSource::Direct,
+                vec![object_restriction("user", None)?],
+            ),
+            RelationSource::new(
+                "conditional".parse()?,
+                RewriteSource::Direct,
+                vec![object_restriction("user", Some("under_limit"))?],
+            ),
+            RelationSource::new(
+                "boundary".parse()?,
+                RewriteSource::Direct,
+                vec![object_restriction("user", Some("at_precision_boundary"))?],
+            ),
+            RelationSource::new(
+                "parent".parse()?,
+                RewriteSource::Direct,
+                vec![object_restriction("folder", None)?],
+            ),
+            RelationSource::new(
+                "viewer".parse()?,
+                RewriteSource::Union(vec![
+                    RewriteSource::Direct,
+                    computed_rewrite("owner")?,
+                    RewriteSource::TupleToUserset {
+                        tupleset: "parent".parse()?,
+                        computed: "viewer".parse()?,
+                    },
+                ]),
+                vec![
+                    object_restriction("user", None)?,
+                    wildcard_restriction("user")?,
+                    userset_restriction("group", "member")?,
+                ],
+            ),
+            RelationSource::new(
+                "guarded".parse()?,
+                RewriteSource::Union(vec![
+                    computed_rewrite("conditional")?,
+                    computed_rewrite("owner")?,
+                ]),
+                Vec::new(),
+            ),
+            RelationSource::new(
+                "both".parse()?,
+                RewriteSource::Intersection(vec![
+                    computed_rewrite("owner")?,
+                    computed_rewrite("editor")?,
+                ]),
+                Vec::new(),
+            ),
+            RelationSource::new(
+                "allowed".parse()?,
+                RewriteSource::Difference {
+                    base: Box::new(computed_rewrite("viewer")?),
+                    subtract: Box::new(computed_rewrite("banned")?),
+                },
+                Vec::new(),
+            ),
+        ],
     ))
 }
 
 fn fixture_tuples() -> Result<Vec<RelationshipTuple>> {
-    [
+    let unconditional = [
         "document:direct#viewer@user:anne",
         "document:wild#viewer@user:*",
         "document:userset#viewer@group:eng#member",
         "group:eng#member@user:bob",
+        "document:computed#owner@user:anne",
+        "document:ttu#parent@folder:roadmap",
+        "folder:roadmap#viewer@user:anne",
+        "document:both#owner@user:anne",
+        "document:both#editor@user:anne",
+        "document:both-deny#owner@user:anne",
+        "document:included#viewer@user:anne",
+        "document:excluded#viewer@user:anne",
+        "document:excluded#banned@user:anne",
+        "document:cycle-userset-allow#viewer@group:cycle-allow-a#member",
+        "group:cycle-allow-a#member@group:cycle-allow-b#member",
+        "group:cycle-allow-b#member@group:cycle-allow-a#member",
+        "group:cycle-allow-b#member@user:anne",
+        "document:cycle-userset-deny#viewer@group:cycle-deny-a#member",
+        "group:cycle-deny-a#member@group:cycle-deny-b#member",
+        "group:cycle-deny-b#member@group:cycle-deny-a#member",
     ]
     .into_iter()
     .map(|tuple| {
@@ -393,7 +672,32 @@ fn fixture_tuples() -> Result<Vec<RelationshipTuple>> {
             .map(RelationshipTuple::unconditional)
             .map_err(Into::into)
     })
-    .collect()
+    .collect::<Result<Vec<_>>>()?;
+    let mut tuples = Vec::with_capacity(unconditional.len() + 3);
+    tuples.extend(unconditional);
+    for (tuple, x) in [
+        ("document:condition#conditional@user:anne", 50),
+        ("document:condition-deny#conditional@user:anne", 150),
+    ] {
+        tuples.push(RelationshipTuple::new(
+            tuple.parse()?,
+            ConditionReference::Conditional(ConditionBinding::new(
+                "under_limit".parse()?,
+                ConditionContext::try_from_json(json!({"x": x}), &InputLimits::default())?,
+            )),
+        ));
+    }
+    tuples.push(RelationshipTuple::new(
+        "document:precision#boundary@user:anne".parse()?,
+        ConditionReference::Conditional(ConditionBinding::new(
+            "at_precision_boundary".parse()?,
+            ConditionContext::try_from_json(
+                json!({"x": 9_223_372_036_854_775_808.0}),
+                &InputLimits::default(),
+            )?,
+        )),
+    ));
+    Ok(tuples)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -403,6 +707,8 @@ struct DifferentialCase {
     relation: &'static str,
     user: &'static str,
     contextual_tuple: Option<(&'static str, &'static str, &'static str)>,
+    context_x: Option<i64>,
+    consistency: &'static str,
 }
 
 impl DifferentialCase {
@@ -422,21 +728,23 @@ impl DifferentialCase {
                     }],
                 }
             }),
-            context: None,
+            context: self.context_x.map(|x| json!({"x": x})),
             authorization_model_id: model_id.to_owned(),
-            consistency: String::new(),
+            consistency: self.consistency.to_owned(),
             trace: false,
         }
     }
 }
 
-const DIFFERENTIAL_CASES: [DifferentialCase; 6] = [
+const DIFFERENTIAL_CASES: [DifferentialCase; 17] = [
     DifferentialCase {
         name: "direct_allow",
         object: "document:direct",
         relation: "viewer",
         user: "user:anne",
         contextual_tuple: None,
+        context_x: None,
+        consistency: "",
     },
     DifferentialCase {
         name: "direct_deny",
@@ -444,6 +752,8 @@ const DIFFERENTIAL_CASES: [DifferentialCase; 6] = [
         relation: "viewer",
         user: "user:bob",
         contextual_tuple: None,
+        context_x: None,
+        consistency: "",
     },
     DifferentialCase {
         name: "typed_wildcard_allow",
@@ -451,6 +761,8 @@ const DIFFERENTIAL_CASES: [DifferentialCase; 6] = [
         relation: "viewer",
         user: "user:carol",
         contextual_tuple: None,
+        context_x: None,
+        consistency: "",
     },
     DifferentialCase {
         name: "userset_allow",
@@ -458,6 +770,107 @@ const DIFFERENTIAL_CASES: [DifferentialCase; 6] = [
         relation: "viewer",
         user: "user:bob",
         contextual_tuple: None,
+        context_x: None,
+        consistency: "",
+    },
+    DifferentialCase {
+        name: "computed_userset_allow",
+        object: "document:computed",
+        relation: "viewer",
+        user: "user:anne",
+        contextual_tuple: None,
+        context_x: None,
+        consistency: "",
+    },
+    DifferentialCase {
+        name: "tuple_to_userset_allow",
+        object: "document:ttu",
+        relation: "viewer",
+        user: "user:anne",
+        contextual_tuple: None,
+        context_x: None,
+        consistency: "",
+    },
+    DifferentialCase {
+        name: "intersection_allow",
+        object: "document:both",
+        relation: "both",
+        user: "user:anne",
+        contextual_tuple: None,
+        context_x: None,
+        consistency: "",
+    },
+    DifferentialCase {
+        name: "intersection_deny",
+        object: "document:both-deny",
+        relation: "both",
+        user: "user:anne",
+        contextual_tuple: None,
+        context_x: None,
+        consistency: "",
+    },
+    DifferentialCase {
+        name: "difference_allow",
+        object: "document:included",
+        relation: "allowed",
+        user: "user:anne",
+        contextual_tuple: None,
+        context_x: None,
+        consistency: "",
+    },
+    DifferentialCase {
+        name: "difference_deny",
+        object: "document:excluded",
+        relation: "allowed",
+        user: "user:anne",
+        contextual_tuple: None,
+        context_x: None,
+        consistency: "",
+    },
+    DifferentialCase {
+        name: "condition_tuple_context_allow",
+        object: "document:condition",
+        relation: "guarded",
+        user: "user:anne",
+        contextual_tuple: None,
+        context_x: Some(200),
+        consistency: "",
+    },
+    DifferentialCase {
+        name: "condition_deny",
+        object: "document:condition-deny",
+        relation: "guarded",
+        user: "user:anne",
+        contextual_tuple: None,
+        context_x: Some(50),
+        consistency: "",
+    },
+    DifferentialCase {
+        name: "condition_dynamic_numeric_boundary_allow",
+        object: "document:precision",
+        relation: "boundary",
+        user: "user:anne",
+        contextual_tuple: None,
+        context_x: None,
+        consistency: "",
+    },
+    DifferentialCase {
+        name: "userset_cycle_with_direct_allow",
+        object: "document:cycle-userset-allow",
+        relation: "viewer",
+        user: "user:anne",
+        contextual_tuple: None,
+        context_x: None,
+        consistency: "",
+    },
+    DifferentialCase {
+        name: "userset_cycle_deny",
+        object: "document:cycle-userset-deny",
+        relation: "viewer",
+        user: "user:anne",
+        contextual_tuple: None,
+        context_x: None,
+        consistency: "",
     },
     DifferentialCase {
         name: "contextual_tuple_allow",
@@ -465,6 +878,8 @@ const DIFFERENTIAL_CASES: [DifferentialCase; 6] = [
         relation: "viewer",
         user: "user:carol",
         contextual_tuple: Some(("document:contextual", "viewer", "user:carol")),
+        context_x: None,
+        consistency: "HIGHER_CONSISTENCY",
     },
     DifferentialCase {
         name: "invalid_object_error",
@@ -472,6 +887,8 @@ const DIFFERENTIAL_CASES: [DifferentialCase; 6] = [
         relation: "viewer",
         user: "user:anne",
         contextual_tuple: None,
+        context_x: None,
+        consistency: "",
     },
 ];
 
@@ -491,6 +908,29 @@ struct CheckCaseReport {
     rust: NormalizedCheck,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NormalizedBatchItem {
+    allowed: Option<bool>,
+    error_class: Option<&'static str>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NormalizedBatch {
+    http_status: u16,
+    results: BTreeMap<String, NormalizedBatchItem>,
+    error_class: Option<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchCaseReport {
+    name: &'static str,
+    go: NormalizedBatch,
+    rust: NormalizedBatch,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CheckMismatch {
@@ -506,6 +946,7 @@ struct DifferentialCheckReport {
     baseline_commit: &'static str,
     corpus_source: &'static str,
     cases: Vec<CheckCaseReport>,
+    batch_case: BatchCaseReport,
     mismatches: Vec<CheckMismatch>,
 }
 
@@ -541,10 +982,32 @@ pub(crate) async fn run_differential(go_url: &str, rust_url: &str) -> Result<()>
             rust,
         });
     }
+    let go_batch = observe_batch(
+        &client,
+        &go_url,
+        &go_store,
+        &batch_differential_request(&go_model),
+    )
+    .await
+    .context("failed to run Go BatchCheck case")?;
+    let rust_batch = observe_batch(
+        &client,
+        &rust_url,
+        STORE_ID,
+        &batch_differential_request(MODEL_ID),
+    )
+    .await
+    .context("failed to run Rust BatchCheck case")?;
+    compare_batch(&go_batch, &rust_batch, &mut mismatches)?;
     let report = DifferentialCheckReport {
         baseline_commit: GO_BASELINE_COMMIT,
         corpus_source: "vendors/openfga/tests/check",
         cases: reports,
+        batch_case: BatchCaseReport {
+            name: "correlated_mixed_batch",
+            go: go_batch,
+            rust: rust_batch,
+        },
         mismatches,
     };
     write_report(&report)?;
@@ -552,6 +1015,71 @@ pub(crate) async fn run_differential(go_url: &str, rust_url: &str) -> Result<()>
         bail!("Check differential found normalized mismatches");
     }
     Ok(())
+}
+
+fn batch_differential_request(model_id: &str) -> WireBatchCheckRequest {
+    let item = |correlation_id: &str,
+                object: &str,
+                relation: &str,
+                user: &str,
+                contextual_tuples: Option<WireContextualTuples>,
+                context: Option<Value>| {
+        WireBatchCheckItem {
+            tuple_key: WireTupleKey {
+                object: object.to_owned(),
+                relation: relation.to_owned(),
+                user: user.to_owned(),
+            },
+            contextual_tuples,
+            context,
+            correlation_id: correlation_id.to_owned(),
+        }
+    };
+    WireBatchCheckRequest {
+        checks: vec![
+            item(
+                "allow",
+                "document:direct",
+                "viewer",
+                "user:anne",
+                None,
+                None,
+            ),
+            item("deny", "document:direct", "viewer", "user:bob", None, None),
+            item(
+                "condition",
+                "document:condition",
+                "guarded",
+                "user:anne",
+                None,
+                Some(json!({"x": 200})),
+            ),
+            item(
+                "contextual",
+                "document:batch-contextual",
+                "viewer",
+                "user:carol",
+                Some(WireContextualTuples {
+                    tuple_keys: vec![WireTupleKey {
+                        object: "document:batch-contextual".to_owned(),
+                        relation: "viewer".to_owned(),
+                        user: "user:carol".to_owned(),
+                    }],
+                }),
+                None,
+            ),
+            item(
+                "item-error",
+                "document:direct",
+                "missing",
+                "user:anne",
+                None,
+                None,
+            ),
+        ],
+        authorization_model_id: model_id.to_owned(),
+        consistency: "HIGHER_CONSISTENCY".to_owned(),
+    }
 }
 
 fn differential_client() -> Result<Client> {
@@ -617,21 +1145,86 @@ fn go_model_document() -> Value {
                 "type": "group",
                 "relations": {"member": {"this": {}}},
                 "metadata": {"relations": {"member": {
-                    "directly_related_user_types": [{"type": "user"}]
+                    "directly_related_user_types": [
+                        {"type": "user"},
+                        {"type": "group", "relation": "member"}
+                    ]
                 }}}
             },
             {
-                "type": "document",
+                "type": "folder",
                 "relations": {"viewer": {"this": {}}},
                 "metadata": {"relations": {"viewer": {
                     "directly_related_user_types": [
                         {"type": "user"},
-                        {"type": "user", "wildcard": {}},
-                        {"type": "group", "relation": "member"}
+                        {"type": "user", "wildcard": {}}
                     ]
                 }}}
+            },
+            {
+                "type": "document",
+                "relations": {
+                    "owner": {"this": {}},
+                    "editor": {"this": {}},
+                    "banned": {"this": {}},
+                    "conditional": {"this": {}},
+                    "boundary": {"this": {}},
+                    "parent": {"this": {}},
+                    "viewer": {"union": {"child": [
+                        {"this": {}},
+                        {"computedUserset": {"relation": "owner"}},
+                        {"tupleToUserset": {
+                            "tupleset": {"relation": "parent"},
+                            "computedUserset": {"relation": "viewer"}
+                        }}
+                    ]}},
+                    "guarded": {"union": {"child": [
+                        {"computedUserset": {"relation": "conditional"}},
+                        {"computedUserset": {"relation": "owner"}}
+                    ]}},
+                    "both": {"intersection": {"child": [
+                        {"computedUserset": {"relation": "owner"}},
+                        {"computedUserset": {"relation": "editor"}}
+                    ]}},
+                    "allowed": {"difference": {
+                        "base": {"computedUserset": {"relation": "viewer"}},
+                        "subtract": {"computedUserset": {"relation": "banned"}}
+                    }}
+                },
+                "metadata": {"relations": {
+                    "owner": {"directly_related_user_types": [{"type": "user"}]},
+                    "editor": {"directly_related_user_types": [{"type": "user"}]},
+                    "banned": {"directly_related_user_types": [{"type": "user"}]},
+                    "conditional": {"directly_related_user_types": [
+                        {"type": "user", "condition": "under_limit"}
+                    ]},
+                    "boundary": {"directly_related_user_types": [
+                        {"type": "user", "condition": "at_precision_boundary"}
+                    ]},
+                    "parent": {"directly_related_user_types": [{"type": "folder"}]},
+                    "viewer": {"directly_related_user_types": [
+                        {"type": "user"},
+                        {"type": "user", "wildcard": {}},
+                        {"type": "group", "relation": "member"}
+                    ]},
+                    "guarded": {"directly_related_user_types": []},
+                    "both": {"directly_related_user_types": []},
+                    "allowed": {"directly_related_user_types": []}
+                }}
             }
-        ]
+        ],
+        "conditions": {
+            "under_limit": {
+                "name": "under_limit",
+                "expression": "x < 100 && x == 50",
+                "parameters": {"x": {"type_name": "TYPE_NAME_ANY"}}
+            },
+            "at_precision_boundary": {
+                "name": "at_precision_boundary",
+                "expression": "x == 9223372036854775807",
+                "parameters": {"x": {"type_name": "TYPE_NAME_ANY"}}
+            }
+        }
     })
 }
 
@@ -641,6 +1234,43 @@ fn go_fixture_tuples() -> Vec<Value> {
         json!({"object": "document:wild", "relation": "viewer", "user": "user:*"}),
         json!({"object": "document:userset", "relation": "viewer", "user": "group:eng#member"}),
         json!({"object": "group:eng", "relation": "member", "user": "user:bob"}),
+        json!({"object": "document:computed", "relation": "owner", "user": "user:anne"}),
+        json!({"object": "document:ttu", "relation": "parent", "user": "folder:roadmap"}),
+        json!({"object": "folder:roadmap", "relation": "viewer", "user": "user:anne"}),
+        json!({"object": "document:both", "relation": "owner", "user": "user:anne"}),
+        json!({"object": "document:both", "relation": "editor", "user": "user:anne"}),
+        json!({"object": "document:both-deny", "relation": "owner", "user": "user:anne"}),
+        json!({"object": "document:included", "relation": "viewer", "user": "user:anne"}),
+        json!({"object": "document:excluded", "relation": "viewer", "user": "user:anne"}),
+        json!({"object": "document:excluded", "relation": "banned", "user": "user:anne"}),
+        json!({"object": "document:cycle-userset-allow", "relation": "viewer", "user": "group:cycle-allow-a#member"}),
+        json!({"object": "group:cycle-allow-a", "relation": "member", "user": "group:cycle-allow-b#member"}),
+        json!({"object": "group:cycle-allow-b", "relation": "member", "user": "group:cycle-allow-a#member"}),
+        json!({"object": "group:cycle-allow-b", "relation": "member", "user": "user:anne"}),
+        json!({"object": "document:cycle-userset-deny", "relation": "viewer", "user": "group:cycle-deny-a#member"}),
+        json!({"object": "group:cycle-deny-a", "relation": "member", "user": "group:cycle-deny-b#member"}),
+        json!({"object": "group:cycle-deny-b", "relation": "member", "user": "group:cycle-deny-a#member"}),
+        json!({
+            "object": "document:condition",
+            "relation": "conditional",
+            "user": "user:anne",
+            "condition": {"name": "under_limit", "context": {"x": 50}}
+        }),
+        json!({
+            "object": "document:condition-deny",
+            "relation": "conditional",
+            "user": "user:anne",
+            "condition": {"name": "under_limit", "context": {"x": 150}}
+        }),
+        json!({
+            "object": "document:precision",
+            "relation": "boundary",
+            "user": "user:anne",
+            "condition": {
+                "name": "at_precision_boundary",
+                "context": {"x": 9_223_372_036_854_775_808.0}
+            }
+        }),
     ]
 }
 
@@ -676,6 +1306,101 @@ async fn observe_check(
         allowed: None,
         error_class: Some(classify_error(status)),
     })
+}
+
+async fn observe_batch(
+    client: &Client,
+    base_url: &Url,
+    store_id: &str,
+    request: &WireBatchCheckRequest,
+) -> Result<NormalizedBatch> {
+    let batch_url = base_url
+        .join(&format!("stores/{store_id}/batch-check"))
+        .context("failed to build BatchCheck URL")?;
+    let response = client
+        .post(batch_url)
+        .json(request)
+        .send()
+        .await
+        .context("BatchCheck request failed")?;
+    let status = response.status();
+    let body = read_bounded(response).await?;
+    if !status.is_success() {
+        return Ok(NormalizedBatch {
+            http_status: status.as_u16(),
+            results: BTreeMap::new(),
+            error_class: Some(classify_error(status)),
+        });
+    }
+    let body: Value =
+        serde_json::from_slice(&body).context("successful BatchCheck body is not valid JSON")?;
+    let result = body
+        .get("result")
+        .and_then(Value::as_object)
+        .context("successful BatchCheck body has no result object")?;
+    let results = result
+        .iter()
+        .map(|(correlation_id, item)| {
+            let allowed = item.get("allowed").and_then(Value::as_bool);
+            let error_class = item
+                .get("error")
+                .map(classify_batch_item_error)
+                .transpose()?;
+            if allowed.is_none() == error_class.is_none() {
+                bail!("BatchCheck item has an invalid result union");
+            }
+            Ok((
+                correlation_id.clone(),
+                NormalizedBatchItem {
+                    allowed,
+                    error_class,
+                },
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    Ok(NormalizedBatch {
+        http_status: status.as_u16(),
+        results,
+        error_class: None,
+    })
+}
+
+fn classify_batch_item_error(error: &Value) -> Result<&'static str> {
+    let field = |snake_case: &str, camel_case: &str| {
+        error
+            .get(snake_case)
+            .or_else(|| error.get(camel_case))
+            .and_then(Value::as_str)
+    };
+    if let Some(code) = field("input_error", "inputError") {
+        return match code {
+            "authorization_model_resolution_too_complex" => Ok("resource_exhausted"),
+            "validation_error" | "invalid_tuple" => Ok("validation"),
+            _ => bail!("BatchCheck item returned an unknown input-error category"),
+        };
+    }
+    if let Some(code) = field("internal_error", "internalError") {
+        return match code {
+            "deadline_exceeded" => Ok("timeout"),
+            "resource_exhausted" => Ok("resource_exhausted"),
+            "unavailable" => Ok("storage"),
+            "internal_error"
+            | "already_exists"
+            | "failed_precondition"
+            | "aborted"
+            | "out_of_range"
+            | "data_loss" => Ok("internal"),
+            _ => bail!("BatchCheck item returned an unknown internal-error category"),
+        };
+    }
+    match error.get("code").and_then(Value::as_str) {
+        Some("validation_error") => Ok("validation"),
+        Some("request_timeout") => Ok("timeout"),
+        Some("resource_exhausted") => Ok("resource_exhausted"),
+        Some("service_unavailable") => Ok("storage"),
+        Some("internal_error") => Ok("internal"),
+        _ => bail!("BatchCheck item returned no recognized error category"),
+    }
 }
 
 const fn classify_error(status: reqwest::StatusCode) -> &'static str {
@@ -719,6 +1444,38 @@ fn compare_case(
             rust: rust.error_class.unwrap_or("none").to_owned(),
         });
     }
+}
+
+fn compare_batch(
+    go: &NormalizedBatch,
+    rust: &NormalizedBatch,
+    mismatches: &mut Vec<CheckMismatch>,
+) -> Result<()> {
+    if go.http_status != rust.http_status {
+        mismatches.push(CheckMismatch {
+            case: "correlated_mixed_batch",
+            field: "httpStatus",
+            go: go.http_status.to_string(),
+            rust: rust.http_status.to_string(),
+        });
+    }
+    if go.results != rust.results {
+        mismatches.push(CheckMismatch {
+            case: "correlated_mixed_batch",
+            field: "results",
+            go: serde_json::to_string(&go.results).context("failed to normalize Go batch")?,
+            rust: serde_json::to_string(&rust.results).context("failed to normalize Rust batch")?,
+        });
+    }
+    if go.error_class != rust.error_class {
+        mismatches.push(CheckMismatch {
+            case: "correlated_mixed_batch",
+            field: "errorClass",
+            go: go.error_class.unwrap_or("none").to_owned(),
+            rust: rust.error_class.unwrap_or("none").to_owned(),
+        });
+    }
+    Ok(())
 }
 
 fn optional_value(value: Option<bool>) -> String {
@@ -781,7 +1538,12 @@ fn write_report(report: &DifferentialCheckReport) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CheckMismatch, NormalizedCheck, WireCheckRequest, compare_case, convert_request};
+    use serde_json::json;
+
+    use super::{
+        CheckMismatch, NormalizedCheck, WireCheckRequest, classify_batch_item_error, compare_case,
+        convert_request,
+    };
 
     #[test]
     fn test_should_reject_invalid_wire_values_without_echoing_them() {
@@ -823,5 +1585,24 @@ mod tests {
             mismatches.first().map(|mismatch| mismatch.field),
             Some("httpStatus"),
         );
+    }
+
+    #[test]
+    fn test_should_classify_explicit_batch_error_categories() {
+        let cases = [
+            (json!({"input_error": "validation_error"}), "validation"),
+            (
+                json!({"inputError": "authorization_model_resolution_too_complex"}),
+                "resource_exhausted",
+            ),
+            (json!({"internal_error": "deadline_exceeded"}), "timeout"),
+            (json!({"internalError": "unavailable"}), "storage"),
+            (json!({"code": "internal_error"}), "internal"),
+        ];
+        for (wire_error, expected) in cases {
+            assert_eq!(classify_batch_item_error(&wire_error).ok(), Some(expected));
+        }
+        assert!(classify_batch_item_error(&json!({"input_error": "future_code"})).is_err());
+        assert!(classify_batch_item_error(&json!({})).is_err());
     }
 }

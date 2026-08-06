@@ -137,6 +137,12 @@ impl ConditionDefinition {
     pub const fn parameters(&self) -> &BTreeMap<ParameterName, ParameterType> {
         &self.parameters
     }
+
+    /// Returns a deterministic proof of this exact source definition.
+    #[must_use]
+    pub fn fingerprint(&self) -> Fingerprint {
+        crate::compiler::fingerprint_definition(self)
+    }
 }
 
 impl fmt::Debug for ConditionDefinition {
@@ -263,6 +269,15 @@ impl EvaluationBudget {
 #[non_exhaustive]
 pub struct CancellationToken(Arc<AtomicBool>);
 
+/// Read-only cancellation source polled throughout synchronous evaluation.
+///
+/// This trait lets an orchestration layer link condition work directly to its
+/// own cancellation and deadline state without a bridging task or second token.
+pub trait CancellationCheck: Send + Sync {
+    /// Returns whether evaluation should stop promptly.
+    fn is_cancelled(&self) -> bool;
+}
+
 impl CancellationToken {
     /// Creates a non-cancelled signal.
     #[must_use]
@@ -275,8 +290,14 @@ impl CancellationToken {
         self.0.store(true, Ordering::Release);
     }
 
-    pub(crate) fn is_cancelled(&self) -> bool {
+    fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::Acquire)
+    }
+}
+
+impl CancellationCheck for CancellationToken {
+    fn is_cancelled(&self) -> bool {
+        self.is_cancelled()
     }
 }
 

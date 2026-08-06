@@ -105,7 +105,53 @@ fn test_should_type_parameters_and_overlay_tuple_context() -> Result<(), Box<dyn
 }
 
 #[test]
-fn test_should_preserve_partial_missing_parameter_logic() -> Result<(), Box<dyn Error>> {
+fn test_should_match_cel_dynamic_cross_type_numeric_comparisons() -> Result<(), Box<dyn Error>> {
+    let parameters = BTreeMap::from([(ParameterName::try_from("x")?, ParameterType::any())]);
+    let compiled = ConditionCompiler::default().compile(
+        &definition(
+            "dynamic_numeric",
+            "x < 2 && x <= 1u && x >= 1 && x == 1 && x == 1u",
+            parameters,
+        )?,
+        &ConditionLimits::default(),
+    )?;
+    let context = ConditionContext::try_from_json(json!({"x": 1}), &InputLimits::default())?;
+    let outcome = compiled.evaluate(
+        &context,
+        &ConditionContext::empty(),
+        EvaluationBudget::new(100)?,
+        &CancellationToken::new(),
+    )?;
+    assert!(outcome.condition_met());
+
+    let boundary = ConditionCompiler::default().compile(
+        &definition(
+            "dynamic_numeric_boundary",
+            "x == 9223372036854775807",
+            BTreeMap::from([(ParameterName::try_from("x")?, ParameterType::any())]),
+        )?,
+        &ConditionLimits::default(),
+    )?;
+    let context = ConditionContext::try_from_json(
+        json!({"x": 9_223_372_036_854_775_808.0}),
+        &InputLimits::default(),
+    )?;
+    assert!(
+        boundary
+            .evaluate(
+                &context,
+                &ConditionContext::empty(),
+                EvaluationBudget::new(100)?,
+                &CancellationToken::new(),
+            )?
+            .condition_met(),
+    );
+    Ok(())
+}
+
+#[test]
+fn test_should_reject_missing_parameters_before_expression_evaluation() -> Result<(), Box<dyn Error>>
+{
     let parameters = BTreeMap::from([
         (ParameterName::try_from("first")?, ParameterType::string()),
         (ParameterName::try_from("second")?, ParameterType::string()),
@@ -126,35 +172,30 @@ fn test_should_preserve_partial_missing_parameter_logic() -> Result<(), Box<dyn 
         &ConditionLimits::default(),
     )?;
     let budget = EvaluationBudget::new(100)?;
-    assert!(
-        or_condition
-            .evaluate(
-                &second_true,
-                &ConditionContext::empty(),
-                budget,
-                &CancellationToken::new()
-            )?
-            .condition_met()
-    );
-    assert!(
-        !and_condition
-            .evaluate(
-                &second_false,
-                &ConditionContext::empty(),
-                budget,
-                &CancellationToken::new()
-            )?
-            .condition_met()
-    );
-    let missing = or_condition.evaluate(
-        &second_false,
-        &ConditionContext::empty(),
-        budget,
-        &CancellationToken::new(),
-    );
-    assert!(
-        matches!(missing, Err(error) if error.kind() == EvaluationErrorKind::MissingParameters && error.missing_parameter_count() == 1)
-    );
+    for result in [
+        or_condition.evaluate(
+            &second_true,
+            &ConditionContext::empty(),
+            budget,
+            &CancellationToken::new(),
+        ),
+        and_condition.evaluate(
+            &second_false,
+            &ConditionContext::empty(),
+            budget,
+            &CancellationToken::new(),
+        ),
+        or_condition.evaluate(
+            &second_false,
+            &ConditionContext::empty(),
+            budget,
+            &CancellationToken::new(),
+        ),
+    ] {
+        assert!(
+            matches!(result, Err(error) if error.kind() == EvaluationErrorKind::MissingParameters && error.missing_parameter_count() == 1)
+        );
+    }
 
     let comprehension_parameters = BTreeMap::from([
         (
@@ -172,15 +213,14 @@ fn test_should_preserve_partial_missing_parameter_logic() -> Result<(), Box<dyn 
         &ConditionLimits::default(),
     )?;
     let items = ConditionContext::try_from_json(json!({"items": [1, 2]}), &limits)?;
+    let missing = partial_exists.evaluate(
+        &items,
+        &ConditionContext::empty(),
+        EvaluationBudget::new(500)?,
+        &CancellationToken::new(),
+    );
     assert!(
-        partial_exists
-            .evaluate(
-                &items,
-                &ConditionContext::empty(),
-                EvaluationBudget::new(500)?,
-                &CancellationToken::new(),
-            )?
-            .condition_met()
+        matches!(missing, Err(error) if error.kind() == EvaluationErrorKind::MissingParameters)
     );
     Ok(())
 }

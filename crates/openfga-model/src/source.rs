@@ -3,7 +3,10 @@
 use std::{fmt, mem};
 
 use openfga_condition::ConditionDefinition;
-use openfga_domain::{AuthorizationModelId, ConditionName, RelationName, StoreId, TypeName};
+use openfga_domain::{
+    AuthorizationModelId, ConditionName, Fingerprint, FingerprintBuilder, RelationName, StoreId,
+    TypeName,
+};
 
 /// One authorization model after bounded wire conversion and before semantic compilation.
 #[non_exhaustive]
@@ -45,6 +48,12 @@ impl AuthorizationModelSource {
     pub const fn model_id(&self) -> &AuthorizationModelId {
         &self.model_id
     }
+
+    /// Returns a deterministic proof of this exact ordered source model.
+    #[must_use]
+    pub fn fingerprint(&self) -> Fingerprint {
+        source_fingerprint(self)
+    }
 }
 
 impl fmt::Debug for AuthorizationModelSource {
@@ -58,6 +67,84 @@ impl fmt::Debug for AuthorizationModelSource {
             .field("conditions", &self.conditions.len())
             .finish_non_exhaustive()
     }
+}
+
+fn source_fingerprint(source: &AuthorizationModelSource) -> Fingerprint {
+    let mut builder = FingerprintBuilder::new("openfga.authorization-model-source.v1");
+    builder.write_str(&source.store_id.to_string());
+    builder.write_str(&source.model_id.to_string());
+    builder.write_str(&source.schema_version);
+    builder.write_u64(source_length(source.type_definitions.len()));
+    for type_definition in &source.type_definitions {
+        builder.write_str(type_definition.name.as_str());
+        builder.write_u64(source_length(type_definition.relations.len()));
+        for relation in &type_definition.relations {
+            builder.write_str(relation.name.as_str());
+            write_rewrite_fingerprint(&relation.rewrite, &mut builder);
+            builder.write_u64(source_length(relation.restrictions.len()));
+            for restriction in &relation.restrictions {
+                builder.write_str(restriction.subject_type.as_str());
+                match &restriction.kind {
+                    RestrictionKindSource::Object => builder.write_tag(0),
+                    RestrictionKindSource::Userset(relation) => {
+                        builder.write_tag(1);
+                        builder.write_str(relation.as_str());
+                    }
+                    RestrictionKindSource::Wildcard => builder.write_tag(2),
+                }
+                match &restriction.condition {
+                    Some(condition) => {
+                        builder.write_tag(1);
+                        builder.write_str(condition.as_str());
+                    }
+                    None => builder.write_tag(0),
+                }
+            }
+        }
+    }
+    builder.write_u64(source_length(source.conditions.len()));
+    for condition in &source.conditions {
+        builder.write_str(condition.key.as_str());
+        builder.write_bytes(condition.definition.fingerprint().as_bytes());
+    }
+    builder.finish()
+}
+
+fn write_rewrite_fingerprint(root: &RewriteSource, builder: &mut FingerprintBuilder) {
+    let mut pending = vec![root];
+    while let Some(rewrite) = pending.pop() {
+        match rewrite {
+            RewriteSource::Direct => builder.write_tag(0),
+            RewriteSource::Computed(relation) => {
+                builder.write_tag(1);
+                builder.write_str(relation.as_str());
+            }
+            RewriteSource::TupleToUserset { tupleset, computed } => {
+                builder.write_tag(2);
+                builder.write_str(tupleset.as_str());
+                builder.write_str(computed.as_str());
+            }
+            RewriteSource::Union(children) => {
+                builder.write_tag(3);
+                builder.write_u64(source_length(children.len()));
+                pending.extend(children.iter().rev());
+            }
+            RewriteSource::Intersection(children) => {
+                builder.write_tag(4);
+                builder.write_u64(source_length(children.len()));
+                pending.extend(children.iter().rev());
+            }
+            RewriteSource::Difference { base, subtract } => {
+                builder.write_tag(5);
+                pending.push(subtract);
+                pending.push(base);
+            }
+        }
+    }
+}
+
+fn source_length(length: usize) -> u64 {
+    u64::try_from(length).unwrap_or(u64::MAX)
 }
 
 /// One ordered object-type declaration.
