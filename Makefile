@@ -1,4 +1,5 @@
 CARGO ?= cargo
+RUSTFMT_TOOLCHAIN := nightly-2026-07-29
 GO_VERSION := 1.26.5
 GO_TOOL := .tools/go/bin/go
 GO_BASELINE_COMMIT := 4e4f79ed841513dfd61746a75ef473f6198299f7
@@ -15,7 +16,7 @@ test:
 	@$(CARGO) test --workspace --all-targets
 
 fmt:
-	@$(CARGO) +nightly fmt --all -- --check
+	@$(CARGO) +$(RUSTFMT_TOOLCHAIN) fmt --all -- --check
 
 clippy:
 	@$(CARGO) clippy --workspace --all-targets -- -D warnings
@@ -115,7 +116,13 @@ differential-smoke: $(GO_BASELINE) build
 	FGA_API_URL="http://$(GO_HTTP_ADDR)" node tests/sdk-smoke-js/smoke.mjs; \
 	npm audit --prefix tests/sdk-smoke-js --audit-level=moderate
 
-cel-spike:
+cel-baseline: verify-go-tool verify-go-pin
+	@cd tests/cel-baseline-go && \
+		GOTOOLCHAIN=local GOFLAGS=-mod=readonly ../../$(GO_TOOL) test ./... && \
+		GOTOOLCHAIN=local GOFLAGS=-mod=readonly ../../$(GO_TOOL) run . \
+			../cel-conformance/cases.json
+
+cel-spike: cel-baseline
 	@$(CARGO) test -p openfga-condition --test phase0_candidate
 
 listobjects-spike: verify-go-tool verify-go-pin
@@ -159,6 +166,7 @@ release:
 update-submodule:
 	@git submodule update --init --recursive --remote
 
-.PHONY: audit build cel-spike check check-agent-sync check-docs check-proto clippy clippy-strict \
+.PHONY: audit build cel-baseline cel-spike check check-agent-sync check-docs check-proto \
+	clippy clippy-strict \
 	conformance deny differential-smoke doc fmt go-baseline listobjects-spike proto release test \
 	update-submodule verify-go-pin verify-go-tool

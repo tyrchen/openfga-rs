@@ -1024,6 +1024,8 @@ version = "0.1.0"
 dependencies = [
  "cel-interpreter",
  "cel-parser",
+ "serde",
+ "serde_json",
  "thiserror 2.0.19",
 ]
 
@@ -1063,6 +1065,7 @@ dependencies = [
  "anyhow",
  "clap",
  "protoc-bin-vendored",
+ "serde",
  "serde_json",
  "sha2",
  "tokio",
@@ -1080,6 +1083,8 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tower",
+ "tower-http",
 ]
 
 [[package]]
@@ -2111,7 +2116,9 @@ dependencies = [
  "futures-util",
  "http",
  "http-body",
+ "http-body-util",
  "pin-project-lite",
+ "tokio",
  "tower",
  "tower-layer",
  "tower-service",

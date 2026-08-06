@@ -3,21 +3,55 @@
 #![forbid(unsafe_code)]
 
 use std::{
+    collections::BTreeMap,
     fmt::Write as _,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::Stdio,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
+use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::process::Command;
 use tonic_prost_build::Config;
 
-const EXPECTED_API_COMMIT: &str = "f153694bfc20f7be303e33cabe72b668596c5a06";
-const EXPECTED_VENDORED_PROTO_SHA256: &str =
-    "8afaacc68fab3005a988d18edaf44cf38f309fc77de6601d04f0825a520d7d28";
+const EXPECTED_API_REPOSITORY: &str = "https://github.com/openfga/api.git";
+const EXPECTED_PROTOC_DISTRIBUTION: &str = "protoc-bin-vendored 3.2.0";
+const EXPECTED_PROTOC_VERSION: &str = "31.1";
+const EXPECTED_PROST_VERSION: &str = "0.14.4";
+const EXPECTED_TONIC_VERSION: &str = "0.14.6";
+const EXPECTED_IMPORT_PROVENANCE: &[(&str, &str, &str, &str)] = &[
+    (
+        "buf.build/envoyproxy/protoc-gen-validate",
+        "https://github.com/envoyproxy/protoc-gen-validate.git",
+        "414042a5ff2e98dc47f8161937316a25b1da5bba",
+        "licenses/envoyproxy-protoc-gen-validate.LICENSE",
+    ),
+    (
+        "buf.build/googleapis/googleapis",
+        "https://github.com/googleapis/googleapis.git",
+        "23141773936b44fb83e26edaf39b64e50a691cb1",
+        "licenses/googleapis.LICENSE",
+    ),
+    (
+        "buf.build/grpc-ecosystem/grpc-gateway",
+        "https://github.com/grpc-ecosystem/grpc-gateway.git",
+        "cb724e4d41e20a47bb6067845908d3f19e79b984",
+        "licenses/grpc-gateway.LICENSE",
+    ),
+];
+const EXPECTED_PROTOC_PLATFORMS: &[&str] = &[
+    "linux-aarch64",
+    "linux-ppc64le",
+    "linux-s390x",
+    "linux-x86",
+    "linux-x86_64",
+    "macos-aarch64",
+    "macos-x86_64",
+    "windows-x86_64",
+];
 const GENERATED_FILES: &[&str] = &[
     "openfga.v1.rs",
     "openfga_descriptor.bin",
@@ -31,46 +65,54 @@ const OPENFGA_PROTO_FILES: &[&str] = &[
     "openfga/v1/openfga_service.proto",
     "openfga/v1/openfga_service_consistency.proto",
 ];
-const API_INPUTS: &[(&str, &str)] = &[
-    (
-        "openfga/v1/authzmodel.proto",
-        "c4a2ee0f5bbb3d49659a742c353bef0e9271bf1e88edf1554ec98adaa61e7489",
-    ),
-    (
-        "openfga/v1/errors_ignore.proto",
-        "fb356436851b49898c57420f7efac8145c078871c9cfa11f10188c3615dfff9d",
-    ),
-    (
-        "openfga/v1/openapi.proto",
-        "e18fb74d6d9d4bfea0c0d4909ceaf319838cfecae57c01dacb922c5ad5632cd3",
-    ),
-    (
-        "openfga/v1/openfga.proto",
-        "f06f35b29f619a44f2e936b7d7a46434e4b2e5617426f699a0a56be83eea4f97",
-    ),
-    (
-        "openfga/v1/openfga_service.proto",
-        "d05816c630c6f99f66ebda17a1c389e5612935316943c0e4abb0f70cd14f4695",
-    ),
-    (
-        "openfga/v1/openfga_service_consistency.proto",
-        "5fe6b029af164de557c79750ea6517943c9ad35ee15683bd88b9a3b0abefc79f",
-    ),
-    (
-        "docs/openapiv2/apidocs.swagger.json",
-        "861e32f12c0b63ded8108ec6fc03bbc1fc3ae8d422214072a9a2f1e0981b4855",
-    ),
-];
-const PROTOC_BINARY_SHA256: &[&str] = &[
-    "5ea6b5ee26c6169925d6c99c8141b855db02c4d382c60b48f535971791b6e8b8",
-    "4e33404682b4c09e8126ade198284f0de2fecee586b5f6569832f998a25e1eed",
-    "6867b2e740c858564873d14896c29be2f6ff19bfde4b58b166296caeb8918b0b",
-    "4ead2930a0d1c57ef4cf573b30d804186c6f76480c4bef3eb6f129a95f7b4a1f",
-    "caaf8517e57c57d34a7d6f0544172d9051abf58556aa35c70d3fb0d824b8cfbb",
-    "a54e72a5c3b06f8eecd235a0ea22ca8494cec738a655cabbd0b9a9864f82f4f1",
-    "773c020a052293bafe187e7c3cd0a0116e2d25798373c6fa1f47648e2a4d5303",
-    "cbd1ca1fd6afd1bb6ddd1c09c118ecd4c50f928980857f16fe6fc23704ea17e2",
-];
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProtocolLock {
+    api: ApiLock,
+    imports: Vec<ImportLock>,
+    protoc: ProtocLock,
+    generated: GeneratedLock,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ApiLock {
+    repository: String,
+    commit: String,
+    git_archive_sha256: String,
+    buf_lock_sha256: String,
+    vendored_imports_aggregate_sha256: String,
+    inputs_sha256: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ImportLock {
+    module: String,
+    commit: String,
+    digest: String,
+    source_repository: String,
+    license_source_commit: String,
+    license_file: String,
+    license_sha256: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProtocLock {
+    version: String,
+    distribution: String,
+    binary_sha256: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct GeneratedLock {
+    tonic: String,
+    prost: String,
+    aggregate_sha256: String,
+}
 
 #[derive(Debug, Parser)]
 #[command(about = "Generate pinned OpenFGA v1 Rust protocol artifacts")]
@@ -93,9 +135,14 @@ async fn main() -> Result<()> {
     let workspace_root = workspace_root()?;
     let api_root = workspace_root.join("vendors/openfga-api");
     let vendor_root = workspace_root.join("crates/openfga-proto/proto/vendor");
+    let protocol_lock =
+        load_protocol_lock(&workspace_root.join("crates/openfga-proto/proto.lock.json")).await?;
+    verify_lock_metadata(&protocol_lock)?;
+    verify_workspace_dependency_versions(&workspace_root, &protocol_lock).await?;
 
-    verify_api_pin(&api_root).await?;
-    verify_vendored_proto_inputs(&vendor_root).await?;
+    verify_api_pin(&api_root, &protocol_lock.api, &protocol_lock.imports).await?;
+    verify_vendored_proto_inputs(&vendor_root, &protocol_lock.api).await?;
+    verify_import_licenses(&vendor_root, &protocol_lock.imports).await?;
     tokio::fs::create_dir_all(&arguments.output)
         .await
         .with_context(|| format!("failed to create {}", arguments.output.display()))?;
@@ -104,7 +151,7 @@ async fn main() -> Result<()> {
         .context("failed to locate the vendored protoc binary")?;
     let protoc_include = protoc_bin_vendored::include_path()
         .context("failed to locate the vendored protoc includes")?;
-    verify_protoc(&protoc_binary).await?;
+    verify_protoc(&protoc_binary, &protocol_lock.protoc).await?;
 
     let proto_inputs = OPENFGA_PROTO_FILES
         .iter()
@@ -129,13 +176,113 @@ async fn main() -> Result<()> {
         &arguments.output.join("route_metadata.rs"),
     )
     .await?;
-    verify_generated_artifacts(
-        &arguments.output,
-        &workspace_root.join("crates/openfga-proto/proto.lock.json"),
-    )
-    .await?;
+    verify_generated_artifacts(&arguments.output, &protocol_lock.generated).await?;
 
     Ok(())
+}
+
+async fn load_protocol_lock(path: &Path) -> Result<ProtocolLock> {
+    let contents = tokio::fs::read(path)
+        .await
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    serde_json::from_slice(&contents).with_context(|| format!("failed to parse {}", path.display()))
+}
+
+fn verify_lock_metadata(protocol_lock: &ProtocolLock) -> Result<()> {
+    if protocol_lock.api.repository != EXPECTED_API_REPOSITORY {
+        bail!("protocol lock names an unexpected API repository");
+    }
+    if protocol_lock.protoc.version != EXPECTED_PROTOC_VERSION
+        || protocol_lock.protoc.distribution != EXPECTED_PROTOC_DISTRIBUTION
+    {
+        bail!("protocol lock does not match the reviewed protoc dependency");
+    }
+    if protocol_lock.generated.tonic != EXPECTED_TONIC_VERSION
+        || protocol_lock.generated.prost != EXPECTED_PROST_VERSION
+    {
+        bail!("protocol lock does not match the reviewed Tonic/Prost dependencies");
+    }
+    if !is_lower_hex(&protocol_lock.api.commit, 40)
+        || !is_lower_hex(&protocol_lock.api.git_archive_sha256, 64)
+        || !is_lower_hex(&protocol_lock.api.buf_lock_sha256, 64)
+        || !is_lower_hex(&protocol_lock.api.vendored_imports_aggregate_sha256, 64)
+        || !is_lower_hex(&protocol_lock.generated.aggregate_sha256, 64)
+    {
+        bail!("protocol lock contains a malformed source or artifact digest");
+    }
+    if protocol_lock.imports.len() != EXPECTED_IMPORT_PROVENANCE.len()
+        || protocol_lock.protoc.binary_sha256.len() != EXPECTED_PROTOC_PLATFORMS.len()
+        || EXPECTED_PROTOC_PLATFORMS
+            .iter()
+            .any(|platform| !protocol_lock.protoc.binary_sha256.contains_key(*platform))
+        || EXPECTED_IMPORT_PROVENANCE.iter().any(
+            |(module, source_repository, license_source_commit, license_file)| {
+                !protocol_lock.imports.iter().any(|import| {
+                    import.module == *module
+                        && import.source_repository == *source_repository
+                        && import.license_source_commit == *license_source_commit
+                        && import.license_file == *license_file
+                })
+            },
+        )
+    {
+        bail!("protocol lock does not contain the complete reviewed platform/import set");
+    }
+    Ok(())
+}
+
+fn is_lower_hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+async fn verify_workspace_dependency_versions(
+    workspace_root: &Path,
+    protocol_lock: &ProtocolLock,
+) -> Result<()> {
+    let path = workspace_root.join("Cargo.lock");
+    let contents = tokio::fs::read_to_string(&path)
+        .await
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let locked_versions = cargo_locked_versions(&contents)?;
+    let expected = [
+        ("prost", protocol_lock.generated.prost.as_str()),
+        ("protoc-bin-vendored", "3.2.0"),
+        ("tonic", protocol_lock.generated.tonic.as_str()),
+    ];
+    for (package, expected_version) in expected {
+        if locked_versions.get(package).map(String::as_str) != Some(expected_version) {
+            bail!("protocol lock version for {package} does not match Cargo.lock");
+        }
+    }
+    Ok(())
+}
+
+fn cargo_locked_versions(contents: &str) -> Result<BTreeMap<String, String>> {
+    let mut versions = BTreeMap::new();
+    let mut package_name = None;
+    for line in contents.lines() {
+        if line == "[[package]]" {
+            package_name = None;
+        } else if let Some(name) = quoted_toml_value(line, "name") {
+            package_name = Some(name);
+        } else if let (Some(name), Some(version)) =
+            (package_name.take(), quoted_toml_value(line, "version"))
+            && ["prost", "protoc-bin-vendored", "tonic"].contains(&name.as_str())
+            && versions.insert(name.clone(), version).is_some()
+        {
+            bail!("Cargo.lock contains duplicate reviewed protocol package {name}");
+        }
+    }
+    Ok(versions)
+}
+
+fn quoted_toml_value(line: &str, key: &str) -> Option<String> {
+    line.strip_prefix(&format!("{key} = \""))
+        .and_then(|value| value.strip_suffix('"'))
+        .map(str::to_owned)
 }
 
 fn workspace_root() -> Result<PathBuf> {
@@ -147,7 +294,7 @@ fn workspace_root() -> Result<PathBuf> {
         .ok_or_else(|| anyhow!("code generator is not located under the workspace tools directory"))
 }
 
-async fn verify_api_pin(api_root: &Path) -> Result<()> {
+async fn verify_api_pin(api_root: &Path, api: &ApiLock, imports: &[ImportLock]) -> Result<()> {
     let git_output = Command::new("git")
         .arg("-C")
         .arg(api_root)
@@ -161,35 +308,122 @@ async fn verify_api_pin(api_root: &Path) -> Result<()> {
     }
     let commit =
         String::from_utf8(git_output.stdout).context("OpenFGA API commit was not valid UTF-8")?;
-    if commit.trim() != EXPECTED_API_COMMIT {
+    if commit.trim() != api.commit {
         bail!(
-            "OpenFGA API source pin mismatch: expected {EXPECTED_API_COMMIT}, found {}",
+            "OpenFGA API source pin mismatch: expected {}, found {}",
+            api.commit,
             commit.trim()
         );
     }
+    let remote = Command::new("git")
+        .arg("-C")
+        .arg(api_root)
+        .args(["remote", "get-url", "origin"])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .context("failed to inspect the OpenFGA API source remote")?;
+    let remote_url =
+        String::from_utf8(remote.stdout).context("OpenFGA API remote was not valid UTF-8")?;
+    if !remote.status.success() || remote_url.trim() != api.repository {
+        bail!("OpenFGA API source remote does not match the protocol lock");
+    }
+
+    let archive = Command::new("git")
+        .arg("-C")
+        .arg(api_root)
+        .args(["archive", "--format=tar", "HEAD"])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .context("failed to archive the OpenFGA API source")?;
+    if !archive.status.success() || sha256_hex(&archive.stdout)? != api.git_archive_sha256 {
+        bail!("OpenFGA API archive checksum does not match the protocol lock");
+    }
 
     let lock_path = api_root.join("buf.lock");
-    let lock = tokio::fs::read(&lock_path)
+    let buf_lock = tokio::fs::read(&lock_path)
         .await
         .with_context(|| format!("failed to read {}", lock_path.display()))?;
-    let lock_digest = sha256_hex(&lock)?;
-    if lock_digest != "183317100d2a9ef772e49777dc2c99b9ea9c500f748bdb607c2df6a18bdd9961" {
+    if sha256_hex(&buf_lock)? != api.buf_lock_sha256 {
         bail!("OpenFGA API buf.lock checksum does not match the reviewed source pin");
     }
-    for (path, expected_digest) in API_INPUTS {
+    let buf_lock_text = String::from_utf8(buf_lock).context("OpenFGA buf.lock is not UTF-8")?;
+    for import in imports {
+        verify_import_metadata(import, &buf_lock_text)?;
+    }
+
+    let expected_input_count = OPENFGA_PROTO_FILES.len().saturating_add(1);
+    if api.inputs_sha256.len() != expected_input_count
+        || !api
+            .inputs_sha256
+            .contains_key("docs/openapiv2/apidocs.swagger.json")
+        || OPENFGA_PROTO_FILES
+            .iter()
+            .any(|path| !api.inputs_sha256.contains_key(*path))
+    {
+        bail!("protocol lock does not contain the exact OpenFGA API input set");
+    }
+    for (path, expected_digest) in &api.inputs_sha256 {
+        if !is_lower_hex(expected_digest, 64) {
+            bail!("protocol lock has a malformed OpenFGA API input checksum");
+        }
         let input_path = api_root.join(path);
         let input = tokio::fs::read(&input_path)
             .await
             .with_context(|| format!("failed to read {}", input_path.display()))?;
         let actual_digest = sha256_hex(&input)?;
-        if &actual_digest != expected_digest {
+        if actual_digest != *expected_digest {
             bail!("OpenFGA API input checksum mismatch for {path}");
         }
     }
     Ok(())
 }
 
-async fn verify_protoc(protoc: &Path) -> Result<()> {
+fn verify_import_metadata(import: &ImportLock, buf_lock: &str) -> Result<()> {
+    let module = import
+        .module
+        .strip_prefix("buf.build/")
+        .context("protocol import is not a public BSR module")?;
+    let (owner, repository) = module
+        .split_once('/')
+        .context("protocol import has an invalid BSR module name")?;
+    if owner.is_empty()
+        || repository.is_empty()
+        || !is_lower_hex(&import.commit, 32)
+        || !import
+            .digest
+            .strip_prefix("shake256:")
+            .is_some_and(|digest| is_lower_hex(digest, 128))
+        || !buf_lock.contains(&format!("owner: {owner}"))
+        || !buf_lock.contains(&format!("repository: {repository}"))
+        || !buf_lock.contains(&format!("commit: {}", import.commit))
+        || !buf_lock.contains(&format!("digest: {}", import.digest))
+    {
+        bail!("protocol import metadata does not match the pinned API buf.lock");
+    }
+    if !import.source_repository.starts_with("https://github.com/")
+        || !Path::new(&import.source_repository)
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("git"))
+        || !is_lower_hex(&import.license_source_commit, 40)
+        || !is_safe_license_path(&import.license_file)
+        || !is_lower_hex(&import.license_sha256, 64)
+    {
+        bail!("protocol import license provenance is malformed");
+    }
+    Ok(())
+}
+
+fn is_safe_license_path(path: &str) -> bool {
+    let path = Path::new(path);
+    path.starts_with("licenses")
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+}
+
+async fn verify_protoc(protoc: &Path, lock: &ProtocLock) -> Result<()> {
     let output = Command::new(protoc)
         .arg("--version")
         .stdin(Stdio::null())
@@ -200,20 +434,28 @@ async fn verify_protoc(protoc: &Path) -> Result<()> {
         bail!("vendored protoc failed its version check");
     }
     let version = String::from_utf8(output.stdout).context("protoc version was not valid UTF-8")?;
-    if version.trim() != "libprotoc 31.1" {
+    if version.trim() != format!("libprotoc {}", lock.version) {
         bail!("unexpected protoc version: {}", version.trim());
     }
     let binary = tokio::fs::read(protoc)
         .await
         .context("failed to checksum the vendored protoc binary")?;
     let digest = sha256_hex(&binary)?;
-    if !PROTOC_BINARY_SHA256.contains(&digest.as_str()) {
+    if lock
+        .binary_sha256
+        .values()
+        .any(|expected| !is_lower_hex(expected, 64))
+        || !lock
+            .binary_sha256
+            .values()
+            .any(|expected| expected == &digest)
+    {
         bail!("vendored protoc binary checksum is not in the reviewed platform set");
     }
     Ok(())
 }
 
-async fn verify_vendored_proto_inputs(vendor_root: &Path) -> Result<()> {
+async fn verify_vendored_proto_inputs(vendor_root: &Path, api: &ApiLock) -> Result<()> {
     let mut directories = vec![vendor_root.to_path_buf()];
     let mut files = Vec::new();
     while let Some(directory) = directories.pop() {
@@ -259,8 +501,24 @@ async fn verify_vendored_proto_inputs(vendor_root: &Path) -> Result<()> {
         aggregate.update(contents);
     }
     let digest = hex_encode(&aggregate.finalize())?;
-    if digest != EXPECTED_VENDORED_PROTO_SHA256 {
+    if digest != api.vendored_imports_aggregate_sha256 {
         bail!("vendored protocol import checksum does not match the reviewed source set");
+    }
+    Ok(())
+}
+
+async fn verify_import_licenses(vendor_root: &Path, imports: &[ImportLock]) -> Result<()> {
+    for import in imports {
+        let path = vendor_root.join(&import.license_file);
+        let contents = tokio::fs::read(&path)
+            .await
+            .with_context(|| format!("failed to read import license {}", path.display()))?;
+        if sha256_hex(&contents)? != import.license_sha256 {
+            bail!(
+                "protocol import license checksum mismatch for {}",
+                import.module
+            );
+        }
     }
     Ok(())
 }
@@ -277,17 +535,7 @@ fn hex_encode(input: &[u8]) -> Result<String> {
     Ok(encoded)
 }
 
-async fn verify_generated_artifacts(output: &Path, lock_path: &Path) -> Result<()> {
-    let lock = tokio::fs::read(lock_path)
-        .await
-        .with_context(|| format!("failed to read {}", lock_path.display()))?;
-    let document: Value = serde_json::from_slice(&lock)
-        .with_context(|| format!("failed to parse {}", lock_path.display()))?;
-    let expected_digest = document
-        .pointer("/generated/aggregateSha256")
-        .and_then(Value::as_str)
-        .context("protocol lock has no generated aggregate checksum")?;
-
+async fn verify_generated_artifacts(output: &Path, lock: &GeneratedLock) -> Result<()> {
     let mut aggregate = Sha256::new();
     for name in GENERATED_FILES {
         let path = output.join(name);
@@ -299,10 +547,10 @@ async fn verify_generated_artifacts(output: &Path, lock_path: &Path) -> Result<(
         aggregate.update(contents);
     }
     let actual_digest = hex_encode(&aggregate.finalize())?;
-    if actual_digest != expected_digest {
+    if actual_digest != lock.aggregate_sha256 {
         bail!(
-            "generated protocol checksum mismatch: expected {expected_digest}, found \
-             {actual_digest}"
+            "generated protocol checksum mismatch: expected {}, found {actual_digest}",
+            lock.aggregate_sha256
         );
     }
     Ok(())
@@ -366,4 +614,24 @@ async fn generate_route_metadata(swagger_path: &Path, output_path: &Path) -> Res
         .await
         .with_context(|| format!("failed to write {}", output_path.display()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ProtocolLock, verify_lock_metadata};
+
+    #[test]
+    fn test_should_reject_protocol_lock_dependency_drift() {
+        let protocol_lock = serde_json::from_str::<ProtocolLock>(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../crates/openfga-proto/proto.lock.json"
+        )));
+        assert!(protocol_lock.is_ok());
+        let Some(mut protocol_lock) = protocol_lock.ok() else {
+            return;
+        };
+        assert!(verify_lock_metadata(&protocol_lock).is_ok());
+        protocol_lock.generated.tonic = "0.0.0-drift".to_owned();
+        assert!(verify_lock_metadata(&protocol_lock).is_err());
+    }
 }

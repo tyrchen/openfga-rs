@@ -28,6 +28,8 @@ tokio = { version = "~1.53.1", default-features = false, features = ["macros", "
 tonic = { version = "~0.14.6", default-features = false, features = ["channel", "codegen", "transport"] }
 tonic-prost = { version = "~0.14.6", default-features = false }
 tonic-prost-build = { version = "~0.14.6", default-features = false, features = ["cleanup-markdown", "transport"] }
+tower = { version = "~0.5.3", default-features = false, features = ["limit"] }
+tower-http = { version = "~0.6.11", default-features = false, features = ["limit", "timeout"] }
 
 # Workspace crates
 openfga-auth = { path = "crates/openfga-auth" }

@@ -9,14 +9,19 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use axum::{Json, Router, routing::get};
+use axum::{Json, Router, http::StatusCode, routing::get};
 use clap::{Parser, Subcommand};
-use reqwest::{Client, Url};
+use reqwest::{Client, Url, redirect::Policy};
 use serde::Serialize;
 use serde_json::Value;
+use tower::limit::ConcurrencyLimitLayer;
+use tower_http::{limit::RequestBodyLimitLayer, timeout::TimeoutLayer};
 
 const MAX_PROBE_URL_BYTES: usize = 1_024;
 const MAX_HEALTH_BODY_BYTES: u16 = 4_096;
+const MAX_PROBE_REQUEST_BODY_BYTES: usize = 1_024;
+const MAX_PROBE_CONCURRENCY: usize = 16;
+const PROBE_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Parser)]
 #[command(name = "openfga-server", about = "OpenFGA-compatible Rust server")]
@@ -87,7 +92,14 @@ async fn serve_probe(address: SocketAddr) -> Result<()> {
     if !address.ip().is_loopback() {
         bail!("the Phase 0 probe may bind only to a loopback address");
     }
-    let application = Router::new().route("/healthz", get(health));
+    let application = Router::new()
+        .route("/healthz", get(health))
+        .layer(RequestBodyLimitLayer::new(MAX_PROBE_REQUEST_BODY_BYTES))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            PROBE_REQUEST_TIMEOUT,
+        ))
+        .layer(ConcurrencyLimitLayer::new(MAX_PROBE_CONCURRENCY));
     let listener = tokio::net::TcpListener::bind(address)
         .await
         .with_context(|| format!("failed to bind the Phase 0 probe to {address}"))?;
@@ -111,6 +123,7 @@ async fn run_differential_smoke(go_url: &str, rust_url: &str) -> Result<()> {
     let client = Client::builder()
         .connect_timeout(Duration::from_secs(2))
         .timeout(Duration::from_secs(5))
+        .redirect(Policy::none())
         .build()
         .context("failed to build the differential HTTP client")?;
 
@@ -148,12 +161,15 @@ fn validated_loopback_url(input: &str) -> Result<Url> {
         bail!("probe URL must be an origin without a path, query, or fragment");
     }
     let host = url.host_str().context("probe URL has no host")?;
-    let is_loopback = host.eq_ignore_ascii_case("localhost")
-        || host
-            .parse::<IpAddr>()
-            .is_ok_and(|address| address.is_loopback());
-    if !is_loopback {
-        bail!("Phase 0 differential probes may target only loopback hosts");
+    let ip_literal = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host);
+    let address = ip_literal
+        .parse::<IpAddr>()
+        .context("Phase 0 differential probes require an IP-literal host")?;
+    if !address.is_loopback() {
+        bail!("Phase 0 differential probes may target only loopback addresses");
     }
     Ok(url)
 }
@@ -234,9 +250,11 @@ mod tests {
     #[test]
     fn test_should_reject_non_loopback_probe_urls() {
         assert!(validated_loopback_url("https://example.com").is_err());
+        assert!(validated_loopback_url("http://localhost:8080/").is_err());
         assert!(validated_loopback_url("http://192.0.2.1:8080").is_err());
         assert!(validated_loopback_url("http://127.0.0.1:8080/admin").is_err());
         assert!(validated_loopback_url("http://127.0.0.1:8080/?token=secret").is_err());
+        assert!(validated_loopback_url("http://[::1]:8080/").is_ok());
     }
 
     #[test]

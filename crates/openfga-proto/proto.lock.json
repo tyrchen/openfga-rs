@@ -4,8 +4,46 @@
     "commit": "f153694bfc20f7be303e33cabe72b668596c5a06",
     "gitArchiveSha256": "1c6139e00b02e1b1d736f4070b87eb3b491ed31fd5dbe4285fbe2540a5789b34",
     "bufLockSha256": "183317100d2a9ef772e49777dc2c99b9ea9c500f748bdb607c2df6a18bdd9961",
-    "vendoredImportsAggregateSha256": "8afaacc68fab3005a988d18edaf44cf38f309fc77de6601d04f0825a520d7d28"
+    "vendoredImportsAggregateSha256": "8afaacc68fab3005a988d18edaf44cf38f309fc77de6601d04f0825a520d7d28",
+    "inputsSha256": {
+      "docs/openapiv2/apidocs.swagger.json": "861e32f12c0b63ded8108ec6fc03bbc1fc3ae8d422214072a9a2f1e0981b4855",
+      "openfga/v1/authzmodel.proto": "c4a2ee0f5bbb3d49659a742c353bef0e9271bf1e88edf1554ec98adaa61e7489",
+      "openfga/v1/errors_ignore.proto": "fb356436851b49898c57420f7efac8145c078871c9cfa11f10188c3615dfff9d",
+      "openfga/v1/openapi.proto": "e18fb74d6d9d4bfea0c0d4909ceaf319838cfecae57c01dacb922c5ad5632cd3",
+      "openfga/v1/openfga.proto": "f06f35b29f619a44f2e936b7d7a46434e4b2e5617426f699a0a56be83eea4f97",
+      "openfga/v1/openfga_service.proto": "d05816c630c6f99f66ebda17a1c389e5612935316943c0e4abb0f70cd14f4695",
+      "openfga/v1/openfga_service_consistency.proto": "5fe6b029af164de557c79750ea6517943c9ad35ee15683bd88b9a3b0abefc79f"
+    }
   },
+  "imports": [
+    {
+      "module": "buf.build/envoyproxy/protoc-gen-validate",
+      "commit": "ea113bc841fa448ab34bf3f9fa6cef0f",
+      "digest": "shake256:8f3653779e824957a4fe3d18cdb73531f7f7ed1393848082dfe1f90026fd187da9534e759b5833f4e5487be0d34cfa7d4ff149af9a2694863773387d61d09fce",
+      "sourceRepository": "https://github.com/envoyproxy/protoc-gen-validate.git",
+      "licenseSourceCommit": "414042a5ff2e98dc47f8161937316a25b1da5bba",
+      "licenseFile": "licenses/envoyproxy-protoc-gen-validate.LICENSE",
+      "licenseSha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "module": "buf.build/googleapis/googleapis",
+      "commit": "2011a25076274e6b974567fbf6697481",
+      "digest": "shake256:7149cf5e9955c692d381e557830555d4e93f205a0f1b8e2dfdae46d029369aa3fc1980e35df0d310f7cc3b622f93e19ad276769a283a967dd3065ddfd3a40e13",
+      "sourceRepository": "https://github.com/googleapis/googleapis.git",
+      "licenseSourceCommit": "23141773936b44fb83e26edaf39b64e50a691cb1",
+      "licenseFile": "licenses/googleapis.LICENSE",
+      "licenseSha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+    },
+    {
+      "module": "buf.build/grpc-ecosystem/grpc-gateway",
+      "commit": "b661eb9bddab46c7bdbad4c73161bb11",
+      "digest": "shake256:67b115260e12cb2d6c5d5ce8dbbf3a095c86f0e52b84f9dbd16dec9433b218f8694bc9aadb1d45eb6fd52f5a7029977d460e2d58afb3208ab6c680e7b21c80e4",
+      "sourceRepository": "https://github.com/grpc-ecosystem/grpc-gateway.git",
+      "licenseSourceCommit": "cb724e4d41e20a47bb6067845908d3f19e79b984",
+      "licenseFile": "licenses/grpc-gateway.LICENSE",
+      "licenseSha256": "a15b1d1b168954c92ff7fb1620382418f7c72f4f4d251ee791d1098ad68ab0c4"
+    }
+  ],
   "protoc": {
     "version": "31.1",
     "distribution": "protoc-bin-vendored 3.2.0",

@@ -1,0 +1,70 @@
+{
+  "cases": [
+    {
+      "name": "boolean_short_circuit",
+      "expression": "true && !false",
+      "expectedBaseline": { "kind": "bool", "value": true },
+      "expectedCandidate": { "kind": "bool", "value": true }
+    },
+    {
+      "name": "integer_comparison",
+      "expression": "1 < 2",
+      "expectedBaseline": { "kind": "bool", "value": true },
+      "expectedCandidate": { "kind": "bool", "value": true }
+    },
+    {
+      "name": "double_comparison",
+      "expression": "1.5 < 2.0",
+      "expectedBaseline": { "kind": "bool", "value": true },
+      "expectedCandidate": { "kind": "bool", "value": true }
+    },
+    {
+      "name": "bytes_equality",
+      "expression": "b'abc' == b'abc'",
+      "expectedBaseline": { "kind": "bool", "value": true },
+      "expectedCandidate": { "kind": "bool", "value": true }
+    },
+    {
+      "name": "duration_comparison",
+      "expression": "duration('1h') < duration('2h')",
+      "expectedBaseline": { "kind": "bool", "value": true },
+      "expectedCandidate": { "kind": "bool", "value": true }
+    },
+    {
+      "name": "timestamp_comparison",
+      "expression": "timestamp('2024-01-01T00:00:00Z') < timestamp('2025-01-01T00:00:00Z')",
+      "expectedBaseline": { "kind": "bool", "value": true },
+      "expectedCandidate": { "kind": "bool", "value": true }
+    },
+    {
+      "name": "list_membership",
+      "expression": "'a' in ['a', 'b']",
+      "expectedBaseline": { "kind": "bool", "value": true },
+      "expectedCandidate": { "kind": "bool", "value": true }
+    },
+    {
+      "name": "map_membership",
+      "expression": "'key' in {'key': 1}",
+      "expectedBaseline": { "kind": "bool", "value": true },
+      "expectedCandidate": { "kind": "bool", "value": true }
+    },
+    {
+      "name": "null_equality",
+      "expression": "null == null",
+      "expectedBaseline": { "kind": "bool", "value": true },
+      "expectedCandidate": { "kind": "bool", "value": true }
+    },
+    {
+      "name": "openfga_ip_address",
+      "expression": "ipaddress('192.168.0.1').in_cidr('192.168.0.0/24')",
+      "expectedBaseline": { "kind": "bool", "value": true },
+      "expectedCandidate": { "kind": "error" }
+    },
+    {
+      "name": "boolean_result_requirement",
+      "expression": "1",
+      "expectedBaseline": { "kind": "error" },
+      "expectedCandidate": { "kind": "nonBoolean" }
+    }
+  ]
+}

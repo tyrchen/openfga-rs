@@ -14,9 +14,12 @@ conditions are never disabled or interpreted approximately.
 
 ## Executable matrix
 
-`cargo test -p openfga-condition --test phase0_candidate` exercises the candidate directly.
-The cases are transformed from
+`tests/cel-conformance/cases.json` is a shared, bounded fixture corpus transformed from
 `vendors/openfga/internal/condition/condition_test.go` and the design acceptance matrix.
+`make cel-spike` first executes every case through the exact vendored OpenFGA condition package
+and its `cel-go 0.30.0`, then executes the same expressions through the Rust candidate and compares
+both normalized outcomes with the fixture. This covers positive scalar/value behavior, the
+OpenFGA IP extension, and compile-time Boolean result enforcement.
 
 | Capability | Candidate result | OpenFGA requirement | Decision impact |
 | --- | --- | --- | --- |
@@ -31,9 +34,11 @@ The cases are transformed from
 ## Cancellation and cost evidence
 
 The cancellation test installs a blocking candidate function, begins evaluation, marks a request
-cancelled, and proves the evaluator remains active until an unrelated release signal arrives. No
-sleep or detached work is used. The cost test assigns a conceptual budget of one to a three-item
-comprehension and observes all three function calls because the candidate API has no cost channel.
+cancelled, and proves the evaluator remains active until an unrelated release signal arrives. The
+whole dependency call runs in a child test process with a five-second parent deadline and forced
+termination on overrun, so dependency drift fails instead of hanging CI. The cost test assigns a
+conceptual budget of one to a three-item comprehension and observes all three function calls
+because the candidate API has no cost channel.
 
 These are structural gaps, not adapter error-mapping gaps. Wrapping `Program::execute` with a
 deadline would return early while leaving blocking evaluation alive, violating the project's
@@ -80,9 +85,10 @@ owned project diagnostics. Compiled conditions retain only immutable, thread-saf
 make cel-spike
 ```
 
-Observed on 2026-08-05: all seven selection tests passed, including positive value semantics and
-the four disqualifying compatibility/safety cases. The dependency is retained only as a test
-candidate; production `openfga-condition` depends on the parser, not the rejected evaluator.
+Observed on 2026-08-05: all eleven shared baseline cases matched their normalized OpenFGA and
+candidate expectations, and every disqualifying compatibility/safety test passed. The dependency
+is retained only as a test candidate; production `openfga-condition` depends on the parser, not
+the rejected evaluator.
 
 `cel-interpreter` brings the unmaintained `paste 1.0.15` transitively. `cargo audit` reports
 RUSTSEC-2024-0436 as an allowed unmaintained warning (not a vulnerability), and `cargo-deny`

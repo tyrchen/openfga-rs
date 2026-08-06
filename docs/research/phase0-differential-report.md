@@ -18,8 +18,10 @@ terminates and waits for both processes on success, error, or interruption.
 
 The health comparator preserves HTTP status and maps only a case-insensitive JSON `status` value
 of `SERVING` to the Boolean `serving: true`. It does not discard any other compared field. Bodies
-are capped at 4 KiB, URLs are capped at 1 KiB, and only credential-free loopback HTTP URLs are
-accepted. Mismatches name the exact normalized field and both values without including response
+are capped at 4 KiB, URLs are capped at 1 KiB, and only credential-free loopback IP-literal HTTP
+URLs are accepted. Redirects are disabled, so a validated origin cannot escape that boundary. The
+probe itself caps request bodies at 1 KiB, concurrent requests at 16, and request execution at five
+seconds. Mismatches name the exact normalized field and both values without including response
 bodies or identifiers.
 
 Observed report:

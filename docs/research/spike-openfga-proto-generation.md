@@ -25,6 +25,12 @@ The generated aggregate hashes each artifact's relative filename, a NUL separato
 in the generator's fixed order. It is therefore independent of the checkout or temporary output
 path while detecting both renames and content changes.
 
+The three imported BSR modules are recorded by module commit and digest. Their source repositories,
+reviewed license-source commits, local license paths, and license SHA-256 values are also locked.
+The generator validates the API git archive, every API input, the upstream `buf.lock` entries, the
+vendored import aggregate, each license, the active `protoc` binary, and generated artifacts before
+it succeeds; changing a descriptive lock field without matching evidence is therefore a failure.
+
 ## Generation and ownership
 
 ```text

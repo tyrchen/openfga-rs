@@ -1,5 +1,8 @@
 //! Executable Phase 0 evidence for rejecting `cel-interpreter` as the `OpenFGA` evaluator.
 
+// The cancellation candidate is deliberately isolated in a killable test subprocess.
+#[allow(clippy::disallowed_types)]
+use std::process::{Command, Stdio};
 use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
@@ -7,42 +10,97 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
+    time::{Duration, Instant},
 };
 
 use cel_interpreter::{Context, Program, Value};
+use serde::Deserialize;
 
-#[test]
-fn test_should_confirm_candidate_baseline_scalar_behavior() {
-    let mut context = Context::default();
-    context.add_variable_from_value("x", 1_i64);
-    context.add_variable_from_value("y", 2_i64);
-    let program = Program::compile("x < y && 'a' in ['a', 'b']");
-    assert!(matches!(
-        program.map(|compiled| compiled.execute(&context)),
-        Ok(Ok(Value::Bool(true)))
-    ));
+const CANCELLATION_HELPER_ENV: &str = "OPENFGA_CEL_CANCELLATION_HELPER";
+const MAX_FIXTURE_CASES: usize = 64;
+const MAX_FIXTURE_EXPRESSION_BYTES: usize = 4_096;
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Fixture {
+    cases: Vec<FixtureCase>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FixtureCase {
+    name: String,
+    expression: String,
+    expected_baseline: Outcome,
+    expected_candidate: Outcome,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Outcome {
+    kind: OutcomeKind,
+    value: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+enum OutcomeKind {
+    Bool,
+    Error,
+    NonBoolean,
 }
 
 #[test]
-fn test_should_record_candidate_value_matrix() {
-    let expressions = [
-        "true && !false",
-        "1 < 2",
-        "1.5 < 2.0",
-        "b'abc' == b'abc'",
-        "duration('1h') < duration('2h')",
-        "timestamp('2024-01-01T00:00:00Z') < timestamp('2025-01-01T00:00:00Z')",
-        "'a' in ['a', 'b']",
-        "'key' in {'key': 1}",
-        "null == null",
-    ];
-    for expression in expressions {
-        let outcome =
-            Program::compile(expression).map(|program| program.execute(&Context::default()));
+fn test_should_execute_shared_openfga_candidate_matrix() {
+    let fixture = serde_json::from_str::<Fixture>(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/cel-conformance/cases.json"
+    )));
+    assert!(fixture.is_ok());
+    let Some(fixture) = fixture.ok() else {
+        return;
+    };
+    assert!(!fixture.cases.is_empty());
+    assert!(fixture.cases.len() <= MAX_FIXTURE_CASES);
+    for case in fixture.cases {
+        assert!(!case.name.is_empty() && case.name.len() <= 128);
+        assert!(!case.expression.is_empty());
+        assert!(case.expression.len() <= MAX_FIXTURE_EXPRESSION_BYTES);
+        assert!(matches!(
+            case.expected_baseline.kind,
+            OutcomeKind::Bool | OutcomeKind::Error
+        ));
+        let outcome = normalize_candidate(&case.expression);
         assert!(
-            matches!(outcome, Ok(Ok(Value::Bool(true)))),
-            "candidate value-matrix failure for {expression}"
+            outcome == case.expected_candidate,
+            "candidate matrix mismatch for {}: expected {:?}, found {:?}",
+            case.name,
+            case.expected_candidate,
+            outcome
         );
+    }
+}
+
+fn normalize_candidate(expression: &str) -> Outcome {
+    let Ok(program) = Program::compile(expression) else {
+        return Outcome {
+            kind: OutcomeKind::Error,
+            value: None,
+        };
+    };
+    match program.execute(&Context::default()) {
+        Ok(Value::Bool(value)) => Outcome {
+            kind: OutcomeKind::Bool,
+            value: Some(value),
+        },
+        Ok(_) => Outcome {
+            kind: OutcomeKind::NonBoolean,
+            value: None,
+        },
+        Err(_) => Outcome {
+            kind: OutcomeKind::Error,
+            value: None,
+        },
     }
 }
 
@@ -94,6 +152,51 @@ fn test_should_expose_absent_runtime_cost_budget() {
 
 #[test]
 fn test_should_expose_absent_in_evaluator_cancellation() {
+    let outcome = run_bounded_cancellation_helper();
+    assert!(outcome.is_ok(), "{outcome:?}");
+}
+
+#[allow(clippy::disallowed_types)]
+fn run_bounded_cancellation_helper() -> Result<(), String> {
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("failed to resolve the test executable: {error}"))?;
+    let mut child = Command::new(executable)
+        .args([
+            "--ignored",
+            "--exact",
+            "test_should_run_candidate_cancellation_helper",
+            "--nocapture",
+        ])
+        .env(CANCELLATION_HELPER_ENV, "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("failed to start cancellation helper: {error}"))?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        match child
+            .try_wait()
+            .map_err(|error| format!("failed to wait for cancellation helper: {error}"))?
+        {
+            Some(status) if status.success() => return Ok(()),
+            Some(status) => return Err(format!("cancellation helper exited with {status}")),
+            None => thread::sleep(Duration::from_millis(10)),
+        }
+    }
+    child
+        .kill()
+        .map_err(|error| format!("failed to kill timed-out cancellation helper: {error}"))?;
+    child
+        .wait()
+        .map_err(|error| format!("failed to reap timed-out cancellation helper: {error}"))?;
+    Err("candidate cancellation evidence exceeded its five-second process limit".to_owned())
+}
+
+#[test]
+#[ignore = "executed in a bounded child process by the cancellation evidence test"]
+fn test_should_run_candidate_cancellation_helper() {
+    assert_eq!(std::env::var(CANCELLATION_HELPER_ENV).as_deref(), Ok("1"));
     let started = Arc::new(AtomicBool::new(false));
     let release = Arc::new(AtomicBool::new(false));
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -102,7 +205,8 @@ fn test_should_expose_absent_in_evaluator_cancellation() {
     let mut context = Context::default();
     context.add_function("blocking", move || {
         function_started.store(true, Ordering::Release);
-        while !function_release.load(Ordering::Acquire) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !function_release.load(Ordering::Acquire) && Instant::now() < deadline {
             thread::yield_now();
         }
         true
@@ -114,7 +218,8 @@ fn test_should_expose_absent_in_evaluator_cancellation() {
     };
     let evaluator =
         thread::spawn(move || matches!(program.execute(&context), Ok(Value::Bool(true))));
-    while !started.load(Ordering::Acquire) {
+    let start_deadline = Instant::now() + Duration::from_secs(1);
+    while !started.load(Ordering::Acquire) && Instant::now() < start_deadline {
         thread::yield_now();
     }
     cancelled.store(true, Ordering::Release);
