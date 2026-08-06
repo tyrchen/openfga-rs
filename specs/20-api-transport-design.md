@@ -1,0 +1,64 @@
+# API and transport design
+
+Status: Proposed · Depends on: [`10-domain-model-design.md`](10-domain-model-design.md), [`14-check-engine-design.md`](14-check-engine-design.md), [`15-list-queries-design.md`](15-list-queries-design.md)
+
+## Protocol source
+
+The protobuf/API source is pinned to the exact OpenFGA API revision resolved in Phase 0 and recorded with its checksum. `openfga-proto` generates Tonic/Prost code deterministically using a pinned `protoc`, or checks in generated code with a reproducibility target; the spike chooses one method. Generated files are never hand-edited.
+
+The server implements OpenFGA v1 methods:
+
+- stores: CreateStore, GetStore, DeleteStore, ListStores;
+- models: WriteAuthorizationModel, ReadAuthorizationModel, ReadAuthorizationModels;
+- assertions: WriteAssertions, ReadAssertions;
+- tuples/changes: Write, Read, ReadChanges;
+- queries: Check, BatchCheck, Expand, ListObjects, StreamedListObjects, ListUsers.
+
+Tonic is authoritative for gRPC. Explicit Axum route adapters provide baseline HTTP paths and JSON, using generated messages as the wire schema. AuthZEN routes/services are added only in their roadmap milestone.
+
+## Request pipeline
+
+Both transports pass through equivalent Tower policy in this order: connection/TLS limits, body/message limit, request ID, trace context, panic containment, authentication, store/action authorization, endpoint concurrency/load shedding, deadline, wire validation, domain conversion, service call, error mapping, response-size/telemetry. Authentication failures occur before store existence disclosure.
+
+Client deadlines are clamped to endpoint maxima. Server timeout/cancellation propagates through service, evaluator, condition engine, storage, and streams. HTTP disconnect and gRPC cancellation stop producers and join work.
+
+## Wire behavior
+
+- Protobuf presence/default semantics and JSON field names match the pinned API; project-owned JSON uses `camelCase` but generated protobuf rules prevail on protocol messages.
+- Unknown JSON fields, malformed enums, oversized strings/collections, duplicate ambiguous inputs, and invalid UTF-8 are rejected at the boundary as baseline-compatible errors.
+- BatchCheck validates the outer request and reports per-item results/errors with stable correlation exactly as baseline behavior requires.
+- ListObjects unary and streaming share one domain engine; streaming observes backpressure and emits baseline-compatible terminal errors.
+- Response ordering is deterministic where promised; otherwise tests compare semantic sets while retaining stable project behavior for operability.
+
+## Errors
+
+One explicit table maps every domain error variant to gRPC status, OpenFGA error code/message shape, HTTP status, and retry classification. Validation/model errors are safe and actionable; storage/internal errors are redacted and carry a request ID. `NotFound`, `AlreadyExists`, `Unauthenticated`, and `PermissionDenied` remain distinct. Deadline, client cancellation, server overload, and budget exhaustion are not converted to deny or empty lists.
+
+The mapping table is generated/tested or exhaustively matched so adding an error variant fails compilation or tests until mapping is supplied. Error bodies never include SQL, token content, CEL context, preshared keys, authorization headers, or raw hostile values.
+
+## Pagination and tokens
+
+Unary list/read APIs use bounded page sizes with compatible defaults/maxima. Transport treats continuation tokens as opaque strings; storage/service validates version, integrity, endpoint, store, normalized filters, expiry, and decoded size. Key rotation supports multiple active verification keys. Token errors map to the baseline invalid-continuation behavior.
+
+## Compatibility evidence
+
+Golden fixtures cover protobuf binary/JSON encoding, route templates, defaults, validation, error bodies/status, paging, and streams. The official SDK matrix runs against both Go and Rust servers. Phase 0 records unavoidable implementation-independent ordering/token differences; no difference is accepted merely because clients usually ignore it.
+
+## Acceptance criteria
+
+- Every listed endpoint has gRPC and HTTP compatibility tests and OpenAPI/proto documentation.
+- Generated API artifacts reproduce byte-for-byte in CI from the recorded source/toolchain.
+- Middleware-order tests prevent authentication and body/deadline limits from being bypassed.
+- Cancellation and slow-client tests show bounded memory and no leaked service work.
+- SDK smoke suites and differential error/pagination cases pass against the pinned baseline.
+
+## Engineering norms
+
+All repository `AGENTS.md` engineering sections bind transport adapters. Wire deserialization is immediately validated into domain commands; generated protobuf serde rules take precedence and project JSON is camelCase; every body/string/collection is bounded; all task/stream work is timed, cancelled, and joined; errors are exhaustively mapped/redacted; middleware spans are structured; and every public adapter/error surface is documented and integration tested.
+
+## Cross-references
+
+- ← Depends on: [`10-domain-model-design.md`](10-domain-model-design.md), [`14-check-engine-design.md`](14-check-engine-design.md), [`15-list-queries-design.md`](15-list-queries-design.md)
+- → Consumed by: [`21-runtime-operations-design.md`](21-runtime-operations-design.md), [`70-security-design.md`](70-security-design.md)
+- ↔ Research: [`../docs/research/study-openfga-implementation.md`](../docs/research/study-openfga-implementation.md), [`../docs/research/survey-rust-ecosystem.md`](../docs/research/survey-rust-ecosystem.md)
+- ↔ Prior art: OpenFGA/AuthZEN service ownership in `vendors/openfga/pkg/server/server.go:165` and Check request orchestration in `vendors/openfga/pkg/server/check.go:36`
