@@ -17,6 +17,8 @@ use serde_json::Value;
 use tower::limit::ConcurrencyLimitLayer;
 use tower_http::{limit::RequestBodyLimitLayer, timeout::TimeoutLayer};
 
+mod check_probe;
+
 const MAX_PROBE_URL_BYTES: usize = 1_024;
 const MAX_HEALTH_BODY_BYTES: u16 = 4_096;
 const MAX_PROBE_REQUEST_BODY_BYTES: usize = 1_024;
@@ -38,12 +40,27 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:18081")]
         address: SocketAddr,
     },
+    /// Serve the Phase 1 local Check compatibility probe.
+    CheckProbeServer {
+        /// Loopback socket used by the Check probe server.
+        #[arg(long, default_value = "127.0.0.1:18081")]
+        address: SocketAddr,
+    },
     /// Compare normalized health observations from the pinned Go server and Rust probe.
     DifferentialSmoke {
         /// Base URL of the vendored Go baseline.
         #[arg(long)]
         go_url: String,
         /// Base URL of the Rust probe.
+        #[arg(long)]
+        rust_url: String,
+    },
+    /// Compare a bounded Check corpus against the pinned Go and Rust probes.
+    DifferentialCheck {
+        /// Base URL of the vendored Go baseline.
+        #[arg(long)]
+        go_url: String,
+        /// Base URL of the Rust Check probe.
         #[arg(long)]
         rust_url: String,
     },
@@ -82,8 +99,12 @@ struct DifferentialReport {
 async fn main() -> Result<()> {
     match Arguments::parse().command {
         Command::ProbeServer { address } => serve_probe(address).await,
+        Command::CheckProbeServer { address } => check_probe::serve(address).await,
         Command::DifferentialSmoke { go_url, rust_url } => {
             run_differential_smoke(&go_url, &rust_url).await
+        }
+        Command::DifferentialCheck { go_url, rust_url } => {
+            check_probe::run_differential(&go_url, &rust_url).await
         }
     }
 }

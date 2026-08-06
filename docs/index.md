@@ -10,5 +10,6 @@
 | [OpenFGA CEL conformance spike](./research/spike-cel-openfga-conformance.md) | Executable candidate matrix and bounded project-evaluator decision | Accepted |
 | [ListObjects algorithm spike](./research/spike-listobjects-algorithm.md) | Reverse-plus-Check versus worker-pipeline comparison and baseline selection | Accepted |
 | [Phase 0 differential report](./research/phase0-differential-report.md) | Vendored Go/Rust probe lifecycle, normalization contract, and SDK smoke | Passing |
+| [Phase 1 Check differential report](./research/phase1-check-differential-report.md) | Live Go/Rust Check decisions, error classification, and bounded probe contract | Passing |
 
 The OpenFGA study is pinned to `vendors/openfga` commit `4e4f79ed841513dfd61746a75ef473f6198299f7`. The Rust survey was checked on 2026-08-05 and must be refreshed before dependency changes.

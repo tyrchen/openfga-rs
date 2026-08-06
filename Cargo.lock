@@ -1191,6 +1191,12 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
+ "openfga-check",
+ "openfga-domain",
+ "openfga-model",
+ "openfga-service",
+ "openfga-storage",
+ "openfga-storage-memory",
  "reqwest",
  "serde",
  "serde_json",
@@ -1202,6 +1208,16 @@ dependencies = [
 [[package]]
 name = "openfga-service"
 version = "0.1.0"
+dependencies = [
+ "openfga-check",
+ "openfga-domain",
+ "openfga-model",
+ "openfga-storage",
+ "openfga-storage-memory",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "openfga-storage"

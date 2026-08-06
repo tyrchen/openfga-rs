@@ -145,7 +145,42 @@ check-baseline: verify-go-tool verify-go-pin
 check-oracle:
 	@$(CARGO) test -p openfga-check --all-targets
 
-check-spike: check-baseline check-oracle
+check-differential: $(GO_BASELINE) build
+	@phase1_tmp=$$(mktemp -d); \
+	go_pid=""; rust_pid=""; \
+	cleanup() { \
+		test -z "$$go_pid" || kill "$$go_pid" 2>/dev/null || true; \
+		test -z "$$rust_pid" || kill "$$rust_pid" 2>/dev/null || true; \
+		test -z "$$go_pid" || wait "$$go_pid" 2>/dev/null || true; \
+		test -z "$$rust_pid" || wait "$$rust_pid" 2>/dev/null || true; \
+		rm -rf "$$phase1_tmp"; \
+	}; \
+	trap cleanup EXIT INT TERM; \
+	$(GO_BASELINE) run --http-addr $(GO_HTTP_ADDR) --grpc-addr $(GO_GRPC_ADDR) \
+		--playground-enabled=false >"$$phase1_tmp/go.log" 2>&1 & go_pid=$$!; \
+	$(CARGO) run --quiet -p openfga-server -- check-probe-server \
+		--address $(RUST_PROBE_ADDR) >"$$phase1_tmp/rust.log" 2>&1 & rust_pid=$$!; \
+	for endpoint in "http://$(GO_HTTP_ADDR)/healthz" "http://$(RUST_PROBE_ADDR)/healthz"; do \
+		attempt=0; \
+		until curl --fail --silent "$$endpoint" >/dev/null; do \
+			if ! kill -0 "$$go_pid" 2>/dev/null || ! kill -0 "$$rust_pid" 2>/dev/null; then \
+				echo "a Check compatibility server exited before readiness" >&2; \
+				tail -100 "$$phase1_tmp/go.log" "$$phase1_tmp/rust.log" >&2; \
+				exit 1; \
+			fi; \
+			attempt=$$((attempt + 1)); \
+			if test "$$attempt" -ge 100; then \
+				echo "Check server did not become ready: $$endpoint" >&2; \
+				tail -100 "$$phase1_tmp/go.log" "$$phase1_tmp/rust.log" >&2; \
+				exit 1; \
+			fi; \
+			sleep 0.1; \
+		done; \
+	done; \
+	$(CARGO) run --quiet -p openfga-server -- differential-check \
+		--go-url "http://$(GO_HTTP_ADDR)/" --rust-url "http://$(RUST_PROBE_ADDR)/"
+
+check-spike: check-baseline check-oracle check-differential
 
 listobjects-spike: verify-go-tool verify-go-pin
 	@cd vendors/openfga && \
@@ -209,7 +244,7 @@ release:
 update-submodule:
 	@git submodule update --init --recursive --remote
 
-.PHONY: audit build cel-baseline cel-spike check check-agent-sync check-baseline check-docs \
+.PHONY: audit build cel-baseline cel-spike check check-agent-sync check-baseline check-differential check-docs \
 	check-oracle check-proto check-spike \
 	clippy clippy-strict \
 	conformance deny differential-smoke doc fmt fuzz-condition fuzz-domain fuzz-model go-baseline listobjects-spike model-baseline \
