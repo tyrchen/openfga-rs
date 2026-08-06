@@ -15,13 +15,12 @@ use std::{
 use anyhow::{Context, Result, bail};
 use axum::{Json, Router, http::StatusCode, routing::get};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use openfga_auth::{AuthenticationService, JwksActor, PresharedKey};
 use openfga_check::CheckBudget;
 use openfga_domain::{
-    ConsistencyPreference, Deadline, InputLimits, Limit, Principal, PrincipalId, PrincipalKind,
-    RequestTimeout, TokenCodec, TokenKey,
+    ConsistencyPreference, Deadline, InputLimits, Limit, RequestTimeout, TokenCodec, TokenKey,
 };
 use openfga_model::ModelCompiler;
-use openfga_proto::openfga::v1::open_fga_service_server::OpenFgaServiceServer;
 use openfga_service::{
     AssertionService, ChangeService, CheckService, IdentifierSource, ModelPublication,
     ModelService, StoreService, SystemIdentifierSource, SystemIdentifierSourceConfig,
@@ -33,7 +32,10 @@ use openfga_storage::{
 };
 use openfga_storage_memory::{MemoryStorage, MemoryStorageConfig};
 use openfga_storage_sql::{PostgresStorage, PostgresStorageConfig};
-use openfga_transport::{OpenFgaApi, OpenFgaServices, TransportConfig, grpc_service, http_router};
+use openfga_transport::{
+    AuthenticatedGrpcService, OpenFgaApi, OpenFgaServices, TransportConfig, grpc_service,
+    http_router,
+};
 use secrecy::SecretString;
 use serde::Serialize;
 use tokio::{
@@ -48,13 +50,12 @@ use tonic_health::{ServingStatus, server::HealthReporter};
 use tower::limit::ConcurrencyLimitLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 
-use crate::config::{ServerConfig, StorageBackend};
+use crate::config::{AuthMode, DEVELOPMENT_PRINCIPAL_ID, ServerConfig, StorageBackend};
 
 const MAXIMUM_SECRET_ENV_BYTES: usize = 8_192;
 const MAXIMUM_TLS_FILE_BYTES: u64 = 2 * 1_024 * 1_024;
 const MAXIMUM_HEALTH_BODY_BYTES: usize = 1_024;
 const MAXIMUM_HEALTH_CONCURRENCY: usize = 64;
-const DEVELOPMENT_PRINCIPAL: &str = "openfga-development-runtime";
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -113,9 +114,33 @@ impl fmt::Debug for StorageOwner {
 
 struct RuntimeAssembly {
     api: OpenFgaApi,
+    authentication: AuthenticationService,
+    jwks_actor: Option<JwksActor>,
     storage: StorageOwner,
     health: Arc<dyn HealthCheck>,
     identifiers: Arc<SystemIdentifierSource>,
+}
+
+#[derive(Clone, Debug)]
+struct TransportRuntime {
+    api: OpenFgaApi,
+    authentication: AuthenticationService,
+}
+
+#[derive(Clone)]
+struct ReadinessDependencies {
+    storage: Arc<dyn HealthCheck>,
+    authentication: AuthenticationService,
+}
+
+impl fmt::Debug for ReadinessDependencies {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ReadinessDependencies")
+            .field("storage", &"dyn HealthCheck")
+            .field("authentication", &self.authentication)
+            .finish_non_exhaustive()
+    }
 }
 
 impl fmt::Debug for RuntimeAssembly {
@@ -123,6 +148,8 @@ impl fmt::Debug for RuntimeAssembly {
         formatter
             .debug_struct("RuntimeAssembly")
             .field("api", &self.api)
+            .field("authentication", &self.authentication)
+            .field("jwks_actor", &self.jwks_actor)
             .field("storage", &self.storage)
             .field("health", &"dyn HealthCheck")
             .field("identifiers_running", &self.identifiers.is_running())
@@ -134,27 +161,46 @@ impl fmt::Debug for RuntimeAssembly {
 pub(crate) async fn run(config: ServerConfig) -> Result<()> {
     let tls = load_tls(&config).await?;
     let assembly = assemble(&config).await?;
+    let RuntimeAssembly {
+        api,
+        authentication,
+        jwks_actor,
+        storage,
+        health,
+        identifiers,
+    } = assembly;
     let http_listener = bind(config.listeners.http, "HTTP").await?;
     let grpc_listener = bind(config.listeners.grpc, "gRPC").await?;
     let health_state = Arc::new(HealthState::new());
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
     health_reporter
-        .set_serving::<OpenFgaServiceServer<OpenFgaApi>>()
+        .set_serving::<AuthenticatedGrpcService>()
         .await;
 
     let mut tasks = JoinSet::new();
+    if let Some(actor) = jwks_actor {
+        let actor_shutdown = shutdown_rx.clone();
+        tasks.spawn(async move {
+            actor.run(actor_shutdown).await;
+            Ok(())
+        });
+    }
     spawn_http(
         &mut tasks,
         http_listener,
-        http_router(assembly.api.clone()).merge(health_router(Arc::clone(&health_state))),
+        http_router(api.clone(), authentication.clone())
+            .merge(health_router(Arc::clone(&health_state))),
         tls.as_ref(),
         shutdown_rx.clone(),
     )?;
     spawn_grpc(
         &mut tasks,
         grpc_listener,
-        assembly.api,
+        TransportRuntime {
+            api,
+            authentication: authentication.clone(),
+        },
         health_service,
         tls.as_ref(),
         shutdown_rx.clone(),
@@ -162,7 +208,10 @@ pub(crate) async fn run(config: ServerConfig) -> Result<()> {
     )?;
     spawn_health_monitor(
         &mut tasks,
-        Arc::clone(&assembly.health),
+        ReadinessDependencies {
+            storage: Arc::clone(&health),
+            authentication,
+        },
         Arc::clone(&health_state),
         health_reporter.clone(),
         shutdown_rx,
@@ -184,12 +233,12 @@ pub(crate) async fn run(config: ServerConfig) -> Result<()> {
         .set_service_status("", ServingStatus::NotServing)
         .await;
     health_reporter
-        .set_not_serving::<OpenFgaServiceServer<OpenFgaApi>>()
+        .set_not_serving::<AuthenticatedGrpcService>()
         .await;
     let drain_result = drain_tasks(&mut tasks, config.drain_timeout()).await;
     health_state.live.store(false, Ordering::Release);
-    drop(assembly.health);
-    shutdown_resources(assembly.storage, assembly.identifiers).await?;
+    drop(health);
+    shutdown_resources(storage, identifiers).await?;
     first_failure?;
     drain_result
 }
@@ -230,6 +279,7 @@ pub(crate) fn postgres_config(
 }
 
 async fn assemble(config: &ServerConfig) -> Result<RuntimeAssembly> {
+    let (authentication, jwks_actor) = authentication(config).await?;
     let limits = InputLimits::default();
     let identifiers = Arc::new(
         SystemIdentifierSource::start(SystemIdentifierSourceConfig::default())
@@ -270,17 +320,12 @@ async fn assemble(config: &ServerConfig) -> Result<RuntimeAssembly> {
         TokenCodec::new(token_key, Vec::new(), &limits)
             .context("failed to create continuation token codec")?,
     );
-    let principal = Principal::new(
-        PrincipalKind::Development,
-        DEVELOPMENT_PRINCIPAL
-            .parse::<PrincipalId>()
-            .context("development principal invariant is invalid")?,
-    );
+    let authorization_policy = Arc::new(config.authorization_policy()?);
     let page_size = NonZeroU32::new(config.transport.default_page_size)
         .context("default page size must be nonzero")?;
     let transport = TransportConfig::builder()
         .limits(limits)
-        .principal(principal)
+        .authorization_policy(authorization_policy)
         .token_codec(token_codec)
         .default_page_size(page_size)
         .request_timeout(config.request_timeout()?)
@@ -293,10 +338,52 @@ async fn assemble(config: &ServerConfig) -> Result<RuntimeAssembly> {
         .context("transport configuration is invalid")?;
     Ok(RuntimeAssembly {
         api,
+        authentication,
+        jwks_actor,
         storage,
         health,
         identifiers,
     })
+}
+
+async fn authentication(
+    config: &ServerConfig,
+) -> Result<(AuthenticationService, Option<JwksActor>)> {
+    match config.auth.mode {
+        AuthMode::Disabled => Ok((
+            AuthenticationService::development(
+                DEVELOPMENT_PRINCIPAL_ID
+                    .parse()
+                    .context("development principal invariant is invalid")?,
+            ),
+            None,
+        )),
+        AuthMode::Preshared => {
+            let keys = config
+                .auth
+                .preshared
+                .keys
+                .iter()
+                .map(|key| {
+                    let secret = load_secret(&key.key_env)?;
+                    PresharedKey::new(key.id.parse()?, &secret)
+                        .context("preshared authentication key is invalid")
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok((
+                AuthenticationService::preshared(keys)
+                    .context("preshared authentication configuration is invalid")?,
+                None,
+            ))
+        }
+        AuthMode::Oidc => {
+            let (authentication, actor) =
+                AuthenticationService::open_id_connect(config.oidc_config())
+                    .await
+                    .context("OIDC authentication initialization failed")?;
+            Ok((authentication, Some(actor)))
+        }
+    }
 }
 
 fn services<B>(
@@ -554,7 +641,7 @@ fn spawn_http(
 fn spawn_grpc<H>(
     tasks: &mut JoinSet<Result<()>>,
     listener: tokio::net::TcpListener,
-    api: OpenFgaApi,
+    transport: TransportRuntime,
     health_service: H,
     tls: Option<&TlsMaterial>,
     shutdown: watch::Receiver<bool>,
@@ -588,7 +675,7 @@ where
     tasks.spawn(async move {
         server
             .add_service(health_service)
-            .add_service(grpc_service(api))
+            .add_service(grpc_service(transport.api, transport.authentication))
             .serve_with_incoming_shutdown(incoming, wait_for_shutdown(shutdown))
             .await
             .context("gRPC listener failed")
@@ -598,7 +685,7 @@ where
 
 fn spawn_health_monitor(
     tasks: &mut JoinSet<Result<()>>,
-    storage: Arc<dyn HealthCheck>,
+    dependencies: ReadinessDependencies,
     state: Arc<HealthState>,
     reporter: HealthReporter,
     mut shutdown: watch::Receiver<bool>,
@@ -616,15 +703,22 @@ fn spawn_health_monitor(
                     }
                 }
                 _ = ticker.tick() => {
-                    let ready = probe_storage(storage.as_ref(), probe_timeout).await;
+                    let storage_ready = probe_storage(dependencies.storage.as_ref(), probe_timeout).await;
+                    let authentication_ready = dependencies.authentication.is_ready();
+                    let ready = storage_ready && authentication_ready;
                     if *shutdown.borrow() {
                         return Ok(());
                     }
                     let was_ready = state.set_ready(ready);
                     if ready && !was_ready {
-                        tracing::info!(dependency = "storage", "readiness dependency recovered");
+                        tracing::info!(dependency = "runtime", "readiness dependencies recovered");
                     } else if !ready && was_ready {
-                        tracing::warn!(dependency = "storage", "readiness dependency failed");
+                        tracing::warn!(
+                            dependency = "runtime",
+                            storage.ready = storage_ready,
+                            authentication.ready = authentication_ready,
+                            "readiness dependency failed"
+                        );
                     }
                     let status = if ready {
                         ServingStatus::Serving

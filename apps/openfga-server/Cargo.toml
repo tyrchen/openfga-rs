@@ -16,6 +16,7 @@ axum-server.workspace = true
 base64.workspace = true
 clap.workspace = true
 config.workspace = true
+openfga-auth.workspace = true
 openfga-check.workspace = true
 openfga-condition.workspace = true
 openfga-domain.workspace = true

@@ -1,0 +1,71 @@
+profile: development
+listeners:
+  http: 127.0.0.1:8080
+  grpc: 127.0.0.1:8081
+tls:
+  enabled: false
+storage:
+  backend: memory
+  memory:
+    actorCapacity: 256
+  postgres:
+    primaryUrlEnv: OPENFGA_DATABASE_URL
+    maxConnections: 16
+    minConnections: 0
+    acquireTimeoutMs: 5000
+    statementTimeoutMs: 5000
+    replicaMaxLagMs: 1000
+    maxTupleMutations: 100
+    migrateOnStart: false
+auth:
+  mode: preshared
+  preshared:
+    keys:
+      - id: local-operator
+        keyEnv: OPENFGA_PRESHARED_KEY
+  authorization:
+    bindings:
+      - principal: local-operator
+        actions:
+          - createStore
+          - listStores
+          - getStore
+          - updateStore
+          - deleteStore
+          - readAuthorizationModels
+          - writeAuthorizationModel
+          - readAssertions
+          - writeAssertions
+          - read
+          - write
+          - readChanges
+          - check
+          - batchCheck
+          - expand
+          - listObjects
+          - streamedListObjects
+          - listUsers
+        stores: ["*"]
+transport:
+  defaultPageSize: 50
+  requestTimeoutMs: 5000
+  tokenTtlSeconds: 86400
+  maximumMessageBytes: 1048576
+  maximumConcurrency: 1024
+  tokenKeyId: primary
+  tokenKeyEnv: OPENFGA_TOKEN_KEY
+evaluator:
+  depth: 25
+  dispatches: 10000
+  datastoreQueries: 100
+  tupleItems: 10000
+  conditionCost: 100000
+  concurrentReads: 16
+  batchConcurrency: 16
+telemetry:
+  logFormat: pretty
+  logFilter: info
+  exportTimeoutMs: 5000
+shutdown:
+  drainTimeoutMs: 10000
+  healthIntervalMs: 1000

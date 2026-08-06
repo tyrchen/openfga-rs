@@ -2,7 +2,8 @@
 
 use std::{fmt, num::NonZeroU32, sync::Arc, time::Duration};
 
-use openfga_domain::{InputLimits, Principal, RequestTimeout, TokenCodec};
+use openfga_auth::AuthorizationPolicy;
+use openfga_domain::{InputLimits, RequestTimeout, TokenCodec};
 use openfga_service::{
     AssertionService, ChangeService, CheckService, ModelService, StoreService, TupleService,
 };
@@ -34,8 +35,8 @@ pub struct OpenFgaServices {
 pub struct TransportConfig {
     /// Domain input ceilings.
     pub(crate) limits: InputLimits,
-    /// Authenticated principal supplied until request authentication lands in task 2.5.
-    pub(crate) principal: Principal,
+    /// Default-deny store/action authorization policy.
+    pub(crate) authorization_policy: Arc<AuthorizationPolicy>,
     /// Rotating continuation-token codec.
     pub(crate) token_codec: Arc<TokenCodec>,
     /// Default number of records returned by list methods.
@@ -89,7 +90,7 @@ impl fmt::Debug for TransportConfig {
         formatter
             .debug_struct("TransportConfig")
             .field("limits", &self.limits)
-            .field("principal", &self.principal)
+            .field("authorization_policy", &self.authorization_policy)
             .field("token_codec", &"[REDACTED]")
             .field("default_page_size", &self.default_page_size)
             .field("request_timeout", &self.request_timeout)

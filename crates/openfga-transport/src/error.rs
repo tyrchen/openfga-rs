@@ -2,9 +2,10 @@
 
 use axum::{
     Json,
-    http::StatusCode,
+    http::{HeaderValue, StatusCode, header::WWW_AUTHENTICATE},
     response::{IntoResponse, Response},
 };
+use openfga_auth::AuthenticationError;
 use openfga_service::{ServiceError, ServiceErrorKind};
 use serde::Serialize;
 use tonic::Code;
@@ -96,6 +97,33 @@ impl ApiError {
         )
     }
 
+    pub(crate) const fn unauthenticated() -> Self {
+        Self::new(
+            StatusCode::UNAUTHORIZED,
+            Code::Unauthenticated,
+            "unauthenticated",
+            "authentication credentials are missing or invalid",
+        )
+    }
+
+    pub(crate) const fn permission_denied() -> Self {
+        Self::new(
+            StatusCode::FORBIDDEN,
+            Code::PermissionDenied,
+            "forbidden",
+            "the principal is not authorized to perform the action",
+        )
+    }
+
+    pub(crate) const fn authentication_unavailable() -> Self {
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            Code::Unavailable,
+            "unavailable",
+            "authentication service is unavailable",
+        )
+    }
+
     const fn new(
         http_status: StatusCode,
         grpc_code: Code,
@@ -120,6 +148,18 @@ impl ApiError {
     #[must_use]
     pub const fn http_status(&self) -> StatusCode {
         self.http_status
+    }
+}
+
+impl From<AuthenticationError> for ApiError {
+    fn from(error: AuthenticationError) -> Self {
+        match error {
+            AuthenticationError::MissingCredentials | AuthenticationError::InvalidCredentials => {
+                Self::unauthenticated()
+            }
+            AuthenticationError::Unavailable => Self::authentication_unavailable(),
+            _ => Self::unauthenticated(),
+        }
     }
 }
 
@@ -199,13 +239,20 @@ impl From<ApiError> for tonic::Status {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (
+        let unauthenticated = self.http_status == StatusCode::UNAUTHORIZED;
+        let mut response = (
             self.http_status,
             Json(ErrorBody {
                 code: self.code,
                 message: self.message,
             }),
         )
-            .into_response()
+            .into_response();
+        if unauthenticated {
+            response
+                .headers_mut()
+                .insert(WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+        }
+        response
     }
 }

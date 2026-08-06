@@ -1,6 +1,7 @@
 //! Bounded YAML configuration loading and validation.
 
 use std::{
+    collections::{BTreeSet, HashSet},
     net::SocketAddr,
     path::{Component, Path, PathBuf},
     time::Duration,
@@ -8,7 +9,10 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use config::{Case, Config, Environment, File, FileFormat};
-use openfga_domain::{Limit, RequestTimeout, TokenKeyId};
+use openfga_auth::{
+    Action, AuthorizationPolicy, OidcAlgorithm, OidcConfig, PolicyBinding, StoreScope,
+};
+use openfga_domain::{Limit, PrincipalId, RequestTimeout, StoreId, TokenKeyId};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 
@@ -18,6 +22,9 @@ const MAXIMUM_OTLP_ENDPOINT_BYTES: usize = 2_048;
 const MAXIMUM_SHUTDOWN_DURATION: Duration = Duration::from_mins(5);
 const MAXIMUM_HEALTH_INTERVAL: Duration = Duration::from_mins(1);
 const MAXIMUM_REQUEST_TIMEOUT: Duration = Duration::from_mins(5);
+const MAXIMUM_AUTH_KEYS: usize = 32;
+const MAXIMUM_POLICY_BINDINGS: usize = 1_024;
+pub(crate) const DEVELOPMENT_PRINCIPAL_ID: &str = "openfga-development-runtime";
 
 /// Fully validated server configuration. No secret values are retained here.
 #[derive(Clone, Debug, Serialize)]
@@ -134,12 +141,94 @@ impl Default for PostgresConfig {
 #[serde(rename_all = "camelCase")]
 pub(crate) enum AuthMode {
     Disabled,
+    Preshared,
+    Oidc,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct AuthConfig {
     pub(crate) mode: AuthMode,
+    #[serde(default)]
+    pub(crate) preshared: PresharedAuthConfig,
+    #[serde(default)]
+    pub(crate) oidc: OidcAuthConfig,
+    #[serde(default)]
+    pub(crate) authorization: AuthorizationConfig,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct PresharedAuthConfig {
+    #[serde(default)]
+    pub(crate) keys: Vec<PresharedKeyConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct PresharedKeyConfig {
+    pub(crate) id: String,
+    pub(crate) key_env: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct OidcAuthConfig {
+    #[serde(default)]
+    pub(crate) issuer: String,
+    #[serde(default)]
+    pub(crate) audiences: Vec<String>,
+    #[serde(default)]
+    pub(crate) authorized_parties: Vec<String>,
+    #[serde(default = "default_oidc_algorithms")]
+    pub(crate) algorithms: Vec<OidcAlgorithm>,
+    #[serde(default)]
+    pub(crate) allowed_hosts: Vec<String>,
+    #[serde(default = "default_oidc_token_bytes")]
+    pub(crate) maximum_token_bytes: usize,
+    #[serde(default = "default_oidc_document_bytes")]
+    pub(crate) maximum_document_bytes: usize,
+    #[serde(default = "default_oidc_fetch_timeout_ms")]
+    pub(crate) fetch_timeout_ms: u64,
+    #[serde(default = "default_oidc_clock_skew_seconds")]
+    pub(crate) clock_skew_seconds: u64,
+    #[serde(default = "default_oidc_refresh_seconds")]
+    pub(crate) refresh_interval_seconds: u64,
+    #[serde(default = "default_oidc_stale_seconds")]
+    pub(crate) stale_key_grace_seconds: u64,
+}
+
+impl Default for OidcAuthConfig {
+    fn default() -> Self {
+        Self {
+            issuer: String::new(),
+            audiences: Vec::new(),
+            authorized_parties: Vec::new(),
+            algorithms: default_oidc_algorithms(),
+            allowed_hosts: Vec::new(),
+            maximum_token_bytes: default_oidc_token_bytes(),
+            maximum_document_bytes: default_oidc_document_bytes(),
+            fetch_timeout_ms: default_oidc_fetch_timeout_ms(),
+            clock_skew_seconds: default_oidc_clock_skew_seconds(),
+            refresh_interval_seconds: default_oidc_refresh_seconds(),
+            stale_key_grace_seconds: default_oidc_stale_seconds(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct AuthorizationConfig {
+    #[serde(default)]
+    pub(crate) bindings: Vec<AuthorizationBindingConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct AuthorizationBindingConfig {
+    pub(crate) principal: String,
+    pub(crate) actions: Vec<Action>,
+    pub(crate) stores: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -292,6 +381,7 @@ impl ServerConfig {
         {
             bail!("disabled authentication requires development profile and loopback listeners");
         }
+        self.validate_auth()?;
         self.validate_tls()?;
         self.validate_storage()?;
         self.validate_transport()?;
@@ -321,6 +411,156 @@ impl ServerConfig {
 
     pub(crate) const fn health_interval(&self) -> Duration {
         Duration::from_millis(self.shutdown.health_interval_ms)
+    }
+
+    pub(crate) fn oidc_config(&self) -> OidcConfig {
+        OidcConfig::builder()
+            .issuer(self.auth.oidc.issuer.clone())
+            .audiences(self.auth.oidc.audiences.clone())
+            .authorized_parties(self.auth.oidc.authorized_parties.clone())
+            .algorithms(self.auth.oidc.algorithms.clone())
+            .allowed_hosts(self.auth.oidc.allowed_hosts.clone())
+            .maximum_token_bytes(self.auth.oidc.maximum_token_bytes)
+            .maximum_document_bytes(self.auth.oidc.maximum_document_bytes)
+            .fetch_timeout(Duration::from_millis(self.auth.oidc.fetch_timeout_ms))
+            .clock_skew(Duration::from_secs(self.auth.oidc.clock_skew_seconds))
+            .refresh_interval(Duration::from_secs(self.auth.oidc.refresh_interval_seconds))
+            .stale_key_grace(Duration::from_secs(self.auth.oidc.stale_key_grace_seconds))
+            .build()
+    }
+
+    pub(crate) fn authorization_policy(&self) -> Result<AuthorizationPolicy> {
+        if self.auth.mode == AuthMode::Disabled {
+            return Ok(AuthorizationPolicy::development(
+                DEVELOPMENT_PRINCIPAL_ID.parse()?,
+            ));
+        }
+        let bindings = self
+            .auth
+            .authorization
+            .bindings
+            .iter()
+            .map(|binding| {
+                let principal_id = binding.principal.parse::<PrincipalId>()?;
+                let actions = binding.actions.iter().copied().collect::<BTreeSet<_>>();
+                let stores = if binding.stores.as_slice() == ["*"] {
+                    StoreScope::Any
+                } else {
+                    StoreScope::Stores(
+                        binding
+                            .stores
+                            .iter()
+                            .map(|store| store.parse::<StoreId>())
+                            .collect::<Result<BTreeSet<_>, _>>()?,
+                    )
+                };
+                Ok(PolicyBinding::new(principal_id, actions, stores))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(AuthorizationPolicy::new(bindings))
+    }
+
+    fn validate_auth(&self) -> Result<()> {
+        match self.auth.mode {
+            AuthMode::Disabled => {
+                if !self.auth.preshared.keys.is_empty()
+                    || self.auth.oidc != OidcAuthConfig::default()
+                    || !self.auth.authorization.bindings.is_empty()
+                {
+                    bail!("disabled authentication cannot retain ignored credentials or policy");
+                }
+            }
+            AuthMode::Preshared => {
+                self.validate_preshared()?;
+                if self.auth.oidc != OidcAuthConfig::default() {
+                    bail!("preshared authentication cannot retain ignored OIDC configuration");
+                }
+                self.validate_authorization()?;
+            }
+            AuthMode::Oidc => {
+                if !self.auth.preshared.keys.is_empty() {
+                    bail!("OIDC authentication cannot retain ignored preshared keys");
+                }
+                self.oidc_config()
+                    .validate()
+                    .context("OIDC configuration is invalid")?;
+                self.validate_authorization()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_preshared(&self) -> Result<()> {
+        if self.auth.preshared.keys.is_empty() || self.auth.preshared.keys.len() > MAXIMUM_AUTH_KEYS
+        {
+            bail!("preshared authentication requires between 1 and 32 active keys");
+        }
+        let mut labels = HashSet::with_capacity(self.auth.preshared.keys.len());
+        let mut environments = HashSet::with_capacity(self.auth.preshared.keys.len());
+        for key in &self.auth.preshared.keys {
+            key.id
+                .parse::<PrincipalId>()
+                .context("preshared key identity is invalid")?;
+            validate_environment_name(&key.key_env)?;
+            if !labels.insert(&key.id) || !environments.insert(&key.key_env) {
+                bail!("preshared key identities and environment references must be unique");
+            }
+        }
+        if self
+            .auth
+            .authorization
+            .bindings
+            .iter()
+            .any(|binding| !labels.contains(&binding.principal))
+        {
+            bail!("preshared policy principals must name active preshared key identities");
+        }
+        Ok(())
+    }
+
+    fn validate_authorization(&self) -> Result<()> {
+        let bindings = &self.auth.authorization.bindings;
+        if bindings.is_empty() || bindings.len() > MAXIMUM_POLICY_BINDINGS {
+            bail!("enabled authentication requires between 1 and 1024 policy bindings");
+        }
+        for binding in bindings {
+            binding
+                .principal
+                .parse::<PrincipalId>()
+                .context("policy principal is invalid")?;
+            if binding.actions.is_empty()
+                || binding
+                    .actions
+                    .iter()
+                    .copied()
+                    .collect::<HashSet<_>>()
+                    .len()
+                    != binding.actions.len()
+            {
+                bail!("policy actions must be nonempty and unique");
+            }
+            if binding.stores.is_empty()
+                || binding.stores.iter().collect::<HashSet<_>>().len() != binding.stores.len()
+            {
+                bail!("policy stores must be nonempty and unique");
+            }
+            let wildcard = binding.stores.as_slice() == ["*"];
+            if binding.stores.iter().any(|store| store == "*") && !wildcard {
+                bail!("policy wildcard store cannot be combined with explicit stores");
+            }
+            if !wildcard {
+                for store in &binding.stores {
+                    store
+                        .parse::<StoreId>()
+                        .context("policy store ID is invalid")?;
+                }
+                if binding.actions.iter().copied().any(Action::is_system) {
+                    bail!("system actions require the wildcard store scope");
+                }
+            }
+        }
+        self.authorization_policy()?;
+        Ok(())
     }
 
     fn validate_tls(&self) -> Result<()> {
@@ -556,6 +796,34 @@ fn default_token_key_env() -> String {
     "OPENFGA_TOKEN_KEY".to_owned()
 }
 
+fn default_oidc_algorithms() -> Vec<OidcAlgorithm> {
+    vec![OidcAlgorithm::RS256]
+}
+
+const fn default_oidc_token_bytes() -> usize {
+    8_192
+}
+
+const fn default_oidc_document_bytes() -> usize {
+    256 * 1_024
+}
+
+const fn default_oidc_fetch_timeout_ms() -> u64 {
+    5_000
+}
+
+const fn default_oidc_clock_skew_seconds() -> u64 {
+    30
+}
+
+const fn default_oidc_refresh_seconds() -> u64 {
+    3_600
+}
+
+const fn default_oidc_stale_seconds() -> u64 {
+    86_400
+}
+
 const fn default_depth() -> u32 {
     25
 }
@@ -602,6 +870,9 @@ const fn default_health_interval_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use openfga_auth::Action;
+    use openfga_domain::{Principal, PrincipalKind};
+
     use super::{Profile, ServerConfig, parse};
 
     const VALID: &str = r"
@@ -613,6 +884,31 @@ storage:
   backend: memory
 auth:
   mode: disabled
+transport: {}
+evaluator: {}
+";
+    const VALID_PRESHARED: &str = r"
+profile: production
+listeners:
+  http: 127.0.0.1:8080
+  grpc: 127.0.0.1:8081
+tls:
+  enabled: true
+  certificatePath: /run/openfga/tls.crt
+  privateKeyPath: /run/openfga/tls.key
+storage:
+  backend: memory
+auth:
+  mode: preshared
+  preshared:
+    keys:
+      - id: reader
+        keyEnv: OPENFGA_READER_KEY
+  authorization:
+    bindings:
+      - principal: reader
+        actions: [read]
+        stores: [01ARZ3NDEKTSV4RRFFQ69G5FAV]
 transport: {}
 evaluator: {}
 ";
@@ -633,15 +929,79 @@ evaluator: {}
             .replace("127.0.0.1:8080", "0.0.0.0:8080");
         let config = ServerConfig::from(parse(public.as_bytes())?);
         assert!(config.validate().is_err());
+
+        let mut ignored_oidc = ServerConfig::from(parse(VALID.as_bytes())?);
+        ignored_oidc.auth.oidc.audiences = vec!["silently-ignored".to_owned()];
+        assert!(ignored_oidc.validate().is_err());
         Ok(())
     }
 
     #[test]
     fn test_should_never_serialize_secret_values() -> anyhow::Result<()> {
-        let config = ServerConfig::from(parse(VALID.as_bytes())?);
+        let config = ServerConfig::from(parse(VALID_PRESHARED.as_bytes())?);
+        config.validate()?;
         let rendered = serde_json::to_string(&config)?;
         assert!(rendered.contains("OPENFGA_TOKEN_KEY"));
+        assert!(rendered.contains("OPENFGA_READER_KEY"));
         assert!(!rendered.contains("databasePassword"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_build_default_deny_store_action_policy() -> anyhow::Result<()> {
+        let config = ServerConfig::from(parse(VALID_PRESHARED.as_bytes())?);
+        config.validate()?;
+        let policy = config.authorization_policy()?;
+        let principal = Principal::new(PrincipalKind::PresharedKey, "reader".parse()?);
+        assert!(
+            policy
+                .authorize(
+                    &principal,
+                    Action::Read,
+                    Some("01ARZ3NDEKTSV4RRFFQ69G5FAV".parse()?),
+                )
+                .is_ok()
+        );
+        assert!(
+            policy
+                .authorize(
+                    &principal,
+                    Action::Read,
+                    Some("01ARZ3NDEKTSV4RRFFQ69G5FAW".parse()?),
+                )
+                .is_err()
+        );
+        assert!(
+            policy
+                .authorize(&principal, Action::ListStores, None)
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_reject_preshared_policy_for_inactive_identity() -> anyhow::Result<()> {
+        let input = VALID_PRESHARED.replace("principal: reader", "principal: inactive-reader");
+        let config = ServerConfig::from(parse(input.as_bytes())?);
+        assert!(config.validate().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_validate_oidc_without_network_and_reject_downgrade() -> anyhow::Result<()> {
+        let oidc = VALID_PRESHARED
+            .replace("mode: preshared", "mode: oidc")
+            .replace(
+                "  preshared:\n    keys:\n      - id: reader\n        keyEnv: OPENFGA_READER_KEY\n",
+                "  oidc:\n    issuer: https://issuer.example.com\n    audiences: [openfga]\n    \
+                 authorizedParties: [client]\n    algorithms: [RS256]\n",
+            );
+        let config = ServerConfig::from(parse(oidc.as_bytes())?);
+        config.validate()?;
+
+        let insecure = oidc.replace("https://issuer.example.com", "http://issuer.example.com");
+        let insecure = ServerConfig::from(parse(insecure.as_bytes())?);
+        assert!(insecure.validate().is_err());
         Ok(())
     }
 }

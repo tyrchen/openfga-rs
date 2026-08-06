@@ -2,10 +2,11 @@
 
 use std::{collections::HashMap, fmt, ops::Deref, time::Instant};
 
+use openfga_auth::Action;
 use openfga_check::{CheckError, CheckErrorKind, CheckResolution};
 use openfga_domain::{
     BatchCheckCommand, BatchCheckItem, BatchCheckItems, CheckCommand, ConsistencyPreference,
-    CorrelationId, Deadline, QueryContext, TokenOperation, TypeName,
+    CorrelationId, Deadline, Principal, QueryContext, StoreId, TokenOperation, TypeName,
 };
 use openfga_proto::openfga::v1 as pb;
 use openfga_storage::{
@@ -39,8 +40,10 @@ impl OpenFgaApi {
     #[tracing::instrument(skip_all, fields(operation = "create_store"))]
     pub(crate) async fn create_store(
         &self,
+        principal: &Principal,
         request: pb::CreateStoreRequest,
     ) -> Result<pb::CreateStoreResponse, ApiError> {
+        self.authorize_system(principal, Action::CreateStore)?;
         let record = self
             .services
             .stores
@@ -56,8 +59,10 @@ impl OpenFgaApi {
     #[tracing::instrument(skip_all, fields(operation = "update_store"))]
     pub(crate) async fn update_store(
         &self,
+        principal: &Principal,
         request: pb::UpdateStoreRequest,
     ) -> Result<pb::UpdateStoreResponse, ApiError> {
+        self.authorize_store(principal, Action::UpdateStore, &request.store_id)?;
         let record = self
             .services
             .stores
@@ -74,8 +79,10 @@ impl OpenFgaApi {
     #[tracing::instrument(skip_all, fields(operation = "get_store"))]
     pub(crate) async fn get_store(
         &self,
+        principal: &Principal,
         request: pb::GetStoreRequest,
     ) -> Result<pb::GetStoreResponse, ApiError> {
+        self.authorize_store(principal, Action::GetStore, &request.store_id)?;
         let record = self
             .services
             .stores
@@ -91,8 +98,10 @@ impl OpenFgaApi {
     #[tracing::instrument(skip_all, fields(operation = "delete_store"))]
     pub(crate) async fn delete_store(
         &self,
+        principal: &Principal,
         request: pb::DeleteStoreRequest,
     ) -> Result<pb::DeleteStoreResponse, ApiError> {
+        self.authorize_store(principal, Action::DeleteStore, &request.store_id)?;
         self.services
             .stores
             .delete(
@@ -107,8 +116,10 @@ impl OpenFgaApi {
     #[tracing::instrument(skip_all, fields(operation = "list_stores"))]
     pub(crate) async fn list_stores(
         &self,
+        principal: &Principal,
         request: pb::ListStoresRequest,
     ) -> Result<pb::ListStoresResponse, ApiError> {
+        self.authorize_system(principal, Action::ListStores)?;
         let filter = if request.name.is_empty() {
             StoreFilter::all()
         } else {
@@ -151,8 +162,14 @@ impl OpenFgaApi {
     #[tracing::instrument(skip_all, fields(operation = "write_authorization_model"))]
     pub(crate) async fn write_authorization_model(
         &self,
+        principal: &Principal,
         request: pb::WriteAuthorizationModelRequest,
     ) -> Result<pb::WriteAuthorizationModelResponse, ApiError> {
+        self.authorize_store(
+            principal,
+            Action::WriteAuthorizationModel,
+            &request.store_id,
+        )?;
         let store_id = convert::store_id(&request.store_id)?;
         let definition = convert::model_definition(&request, &self.config.limits)?;
         let model = self
@@ -173,8 +190,14 @@ impl OpenFgaApi {
     #[tracing::instrument(skip_all, fields(operation = "read_authorization_model"))]
     pub(crate) async fn read_authorization_model(
         &self,
+        principal: &Principal,
         request: pb::ReadAuthorizationModelRequest,
     ) -> Result<pb::ReadAuthorizationModelResponse, ApiError> {
+        self.authorize_store(
+            principal,
+            Action::ReadAuthorizationModels,
+            &request.store_id,
+        )?;
         let model = self
             .services
             .models
@@ -193,8 +216,14 @@ impl OpenFgaApi {
     #[tracing::instrument(skip_all, fields(operation = "read_authorization_models"))]
     pub(crate) async fn read_authorization_models(
         &self,
+        principal: &Principal,
         request: pb::ReadAuthorizationModelsRequest,
     ) -> Result<pb::ReadAuthorizationModelsResponse, ApiError> {
+        self.authorize_store(
+            principal,
+            Action::ReadAuthorizationModels,
+            &request.store_id,
+        )?;
         let store_id = convert::store_id(&request.store_id)?;
         let scope = pagination::scope(
             TokenOperation::ReadAuthorizationModels,
@@ -229,8 +258,10 @@ impl OpenFgaApi {
     #[tracing::instrument(skip_all, fields(operation = "write_assertions"))]
     pub(crate) async fn write_assertions(
         &self,
+        principal: &Principal,
         request: pb::WriteAssertionsRequest,
     ) -> Result<pb::WriteAssertionsResponse, ApiError> {
+        self.authorize_store(principal, Action::WriteAssertions, &request.store_id)?;
         let assertions = request
             .assertions
             .into_iter()
@@ -252,8 +283,10 @@ impl OpenFgaApi {
     #[tracing::instrument(skip_all, fields(operation = "read_assertions"))]
     pub(crate) async fn read_assertions(
         &self,
+        principal: &Principal,
         request: pb::ReadAssertionsRequest,
     ) -> Result<pb::ReadAssertionsResponse, ApiError> {
+        self.authorize_store(principal, Action::ReadAssertions, &request.store_id)?;
         let assertions = self
             .services
             .assertions
@@ -277,8 +310,10 @@ impl OpenFgaApi {
     #[tracing::instrument(skip_all, fields(operation = "read"))]
     pub(crate) async fn read(
         &self,
+        principal: &Principal,
         request: pb::ReadRequest,
     ) -> Result<pb::ReadResponse, ApiError> {
+        self.authorize_store(principal, Action::Read, &request.store_id)?;
         let store_id = convert::store_id(&request.store_id)?;
         let filter = convert::tuple_read_filter(request.tuple_key.as_ref(), &self.config.limits)?;
         let scope = pagination::scope(
@@ -315,8 +350,10 @@ impl OpenFgaApi {
     #[tracing::instrument(skip_all, fields(operation = "write"))]
     pub(crate) async fn write(
         &self,
+        principal: &Principal,
         request: pb::WriteRequest,
     ) -> Result<pb::WriteResponse, ApiError> {
+        self.authorize_store(principal, Action::Write, &request.store_id)?;
         let writes = request
             .writes
             .as_ref()
@@ -371,8 +408,10 @@ impl OpenFgaApi {
     #[tracing::instrument(skip_all, fields(operation = "read_changes"))]
     pub(crate) async fn read_changes(
         &self,
+        principal: &Principal,
         request: pb::ReadChangesRequest,
     ) -> Result<pb::ReadChangesResponse, ApiError> {
+        self.authorize_store(principal, Action::ReadChanges, &request.store_id)?;
         let store_id = convert::store_id(&request.store_id)?;
         let object_type = (!request.r#type.is_empty())
             .then(|| TypeName::parse_with_limits(&request.r#type, &self.config.limits))
@@ -418,13 +457,16 @@ impl OpenFgaApi {
     #[tracing::instrument(skip_all, fields(operation = "check"))]
     pub(crate) async fn check(
         &self,
+        principal: &Principal,
         request: pb::CheckRequest,
     ) -> Result<pb::CheckResponse, ApiError> {
+        self.authorize_store(principal, Action::Check, &request.store_id)?;
         let tuple = request
             .tuple_key
             .as_ref()
             .ok_or_else(ApiError::invalid_request)?;
         let query = self.query_context(
+            principal,
             &request.store_id,
             &request.authorization_model_id,
             request.consistency,
@@ -460,9 +502,12 @@ impl OpenFgaApi {
     #[tracing::instrument(skip_all, fields(operation = "batch_check"))]
     pub(crate) async fn batch_check(
         &self,
+        principal: &Principal,
         request: pb::BatchCheckRequest,
     ) -> Result<pb::BatchCheckResponse, ApiError> {
+        self.authorize_store(principal, Action::BatchCheck, &request.store_id)?;
         let query = self.query_context(
+            principal,
             &request.store_id,
             &request.authorization_model_id,
             request.consistency,
@@ -526,6 +571,7 @@ impl OpenFgaApi {
 
     fn query_context(
         &self,
+        principal: &Principal,
         store_id: &str,
         model_id: &str,
         consistency_value: i32,
@@ -539,8 +585,44 @@ impl OpenFgaApi {
             .contextual_tuples(contextual_tuples)
             .condition_context(condition_context)
             .deadline(self.deadline()?)
-            .principal(self.config.principal.clone())
+            .principal(principal.clone())
             .build())
+    }
+
+    pub(crate) fn authorize_store(
+        &self,
+        principal: &Principal,
+        action: Action,
+        store_id: &str,
+    ) -> Result<(), ApiError> {
+        let store_id = convert::store_id(store_id)?;
+        self.authorize(principal, action, Some(store_id))
+    }
+
+    fn authorize_system(&self, principal: &Principal, action: Action) -> Result<(), ApiError> {
+        self.authorize(principal, action, None)
+    }
+
+    fn authorize(
+        &self,
+        principal: &Principal,
+        action: Action,
+        store_id: Option<StoreId>,
+    ) -> Result<(), ApiError> {
+        let result = self
+            .config
+            .authorization_policy
+            .authorize(principal, action, store_id);
+        if result.is_err() {
+            tracing::warn!(
+                principal_kind = ?principal.kind(),
+                action = ?action,
+                resource = if store_id.is_some() { "store" } else { "system" },
+                outcome = "denied",
+                "service authorization denied"
+            );
+        }
+        result.map_err(|_| ApiError::permission_denied())
     }
 
     fn operation_context(

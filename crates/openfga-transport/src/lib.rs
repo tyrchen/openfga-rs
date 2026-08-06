@@ -15,7 +15,7 @@ pub use config::{
     OpenFgaServices, OpenFgaServicesBuilder, TransportConfig, TransportConfigBuilder,
 };
 pub use error::ApiError;
-pub use grpc::grpc_service;
+pub use grpc::{AuthenticatedGrpcService, GrpcAuthenticationInterceptor, grpc_service};
 pub use http::http_router;
 
 #[cfg(test)]

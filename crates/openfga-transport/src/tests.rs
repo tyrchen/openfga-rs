@@ -11,6 +11,7 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode},
 };
+use openfga_auth::{AuthenticationService, AuthorizationPolicy, PresharedKey};
 use openfga_check::CheckBudget;
 use openfga_domain::{
     AuthorizationModelId, FingerprintBuilder, InputLimits, Principal, PrincipalId, PrincipalKind,
@@ -29,6 +30,7 @@ use openfga_storage::{
 };
 use openfga_storage_memory::{MemoryStorage, MemoryStorageConfig};
 use prost::Message;
+use secrecy::SecretString;
 use tower::ServiceExt;
 
 use crate::{ApiError, OpenFgaApi, OpenFgaServices, TransportConfig};
@@ -227,6 +229,9 @@ async fn test_should_execute_every_m2_use_case_through_shared_wire_adapter()
         model_id: MODEL_ID.parse()?,
     });
     let limits = InputLimits::default();
+    let principal_id = "transport-test".parse::<PrincipalId>()?;
+    let principal = Principal::new(PrincipalKind::Development, principal_id.clone());
+    let authentication = AuthenticationService::development(principal_id.clone());
 
     let api = OpenFgaApi::new(
         OpenFgaServices::builder()
@@ -264,10 +269,7 @@ async fn test_should_execute_every_m2_use_case_through_shared_wire_adapter()
             .build(),
         TransportConfig::builder()
             .limits(limits)
-            .principal(Principal::new(
-                PrincipalKind::Development,
-                "transport-test".parse::<PrincipalId>()?,
-            ))
+            .authorization_policy(Arc::new(AuthorizationPolicy::development(principal_id)))
             .token_codec(Arc::new(TokenCodec::new(
                 TokenKey::new("active".parse::<TokenKeyId>()?, vec![7; 32])?,
                 Vec::new(),
@@ -278,7 +280,7 @@ async fn test_should_execute_every_m2_use_case_through_shared_wire_adapter()
             .build(),
     )?;
 
-    let router = crate::http_router(api.clone());
+    let router = crate::http_router(api.clone(), authentication);
     let response = router
         .clone()
         .oneshot(
@@ -297,19 +299,25 @@ async fn test_should_execute_every_m2_use_case_through_shared_wire_adapter()
     assert_eq!(created.id, STORE_ID);
     let grpc_store = OpenFgaService::get_store(
         &api,
-        tonic::Request::new(pb::GetStoreRequest {
-            store_id: STORE_ID.to_owned(),
-        }),
+        authenticated_request(
+            &principal,
+            pb::GetStoreRequest {
+                store_id: STORE_ID.to_owned(),
+            },
+        ),
     )
     .await?
     .into_inner();
     assert_eq!(grpc_store.name, "engineering");
     let updated = OpenFgaService::update_store(
         &api,
-        tonic::Request::new(pb::UpdateStoreRequest {
-            store_id: STORE_ID.to_owned(),
-            name: "authorization".to_owned(),
-        }),
+        authenticated_request(
+            &principal,
+            pb::UpdateStoreRequest {
+                store_id: STORE_ID.to_owned(),
+                name: "authorization".to_owned(),
+            },
+        ),
     )
     .await?
     .into_inner();
@@ -326,6 +334,85 @@ async fn test_should_execute_every_m2_use_case_through_shared_wire_adapter()
         )
         .await?;
     assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+
+    let protected_router = crate::http_router(
+        api.clone(),
+        AuthenticationService::preshared(vec![PresharedKey::new(
+            "transport-test".parse()?,
+            &SecretString::from("transport-test-key-material-with-at-least-32-bytes"),
+        )?])?,
+    );
+    let missing = protected_router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/stores")
+                .header("content-type", "application/json")
+                .body(Body::from("not-json"))?,
+        )
+        .await?;
+    assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        missing.headers().get("www-authenticate"),
+        Some(&axum::http::HeaderValue::from_static("Bearer"))
+    );
+    let missing_body = to_bytes(missing.into_body(), 1_024).await?;
+    let invalid_key = protected_router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/stores/{STORE_ID}"))
+                .header(
+                    "authorization",
+                    "Bearer invalid-key-material-with-at-least-32-bytes",
+                )
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(invalid_key.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        to_bytes(invalid_key.into_body(), 1_024).await?,
+        missing_body
+    );
+    let mut duplicate_headers = Request::builder()
+        .method("GET")
+        .uri(format!("/stores/{STORE_ID}"))
+        .body(Body::empty())?;
+    duplicate_headers.headers_mut().append(
+        axum::http::header::AUTHORIZATION,
+        axum::http::HeaderValue::from_static(
+            "Bearer transport-test-key-material-with-at-least-32-bytes",
+        ),
+    );
+    duplicate_headers.headers_mut().append(
+        axum::http::header::AUTHORIZATION,
+        axum::http::HeaderValue::from_static(
+            "Bearer transport-test-key-material-with-at-least-32-bytes",
+        ),
+    );
+    assert_eq!(
+        protected_router
+            .clone()
+            .oneshot(duplicate_headers)
+            .await?
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let authenticated = protected_router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/stores/{STORE_ID}"))
+                .header(
+                    "authorization",
+                    "Bearer transport-test-key-material-with-at-least-32-bytes",
+                )
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(authenticated.status(), StatusCode::OK);
     let oversized = router
         .clone()
         .oneshot(
@@ -358,13 +445,16 @@ async fn test_should_execute_every_m2_use_case_through_shared_wire_adapter()
     );
     let grpc_deferred = OpenFgaService::expand(
         &api,
-        tonic::Request::new(pb::ExpandRequest {
-            store_id: STORE_ID.to_owned(),
-            tuple_key: None,
-            contextual_tuples: None,
-            authorization_model_id: String::new(),
-            consistency: 0,
-        }),
+        authenticated_request(
+            &principal,
+            pb::ExpandRequest {
+                store_id: STORE_ID.to_owned(),
+                tuple_key: None,
+                contextual_tuples: None,
+                authorization_model_id: String::new(),
+                consistency: 0,
+            },
+        ),
     )
     .await;
     assert!(matches!(
@@ -372,55 +462,92 @@ async fn test_should_execute_every_m2_use_case_through_shared_wire_adapter()
         Err(status) if status.code() == tonic::Code::Unimplemented
     ));
     let stores_page = api
-        .list_stores(pb::ListStoresRequest {
-            page_size: None,
-            continuation_token: String::new(),
-            name: "authorization".to_owned(),
-        })
+        .list_stores(
+            &principal,
+            pb::ListStoresRequest {
+                page_size: None,
+                continuation_token: String::new(),
+                name: "authorization".to_owned(),
+            },
+        )
         .await?;
     assert_eq!(stores_page.stores.len(), 1);
 
-    let model = api.write_authorization_model(model_request()).await?;
+    let outsider = Principal::new(PrincipalKind::PresharedKey, "outsider".parse()?);
+    let existing_denial = api
+        .get_store(
+            &outsider,
+            pb::GetStoreRequest {
+                store_id: STORE_ID.to_owned(),
+            },
+        )
+        .await;
+    let missing_denial = api
+        .get_store(
+            &outsider,
+            pb::GetStoreRequest {
+                store_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX".to_owned(),
+            },
+        )
+        .await;
+    assert!(matches!(existing_denial, Err(error) if error.code() == "forbidden"));
+    assert!(matches!(missing_denial, Err(error) if error.code() == "forbidden"));
+
+    let model = api
+        .write_authorization_model(&principal, model_request())
+        .await?;
     assert_eq!(model.authorization_model_id, MODEL_ID);
     assert!(
-        api.read_authorization_model(pb::ReadAuthorizationModelRequest {
-            store_id: STORE_ID.to_owned(),
-            id: MODEL_ID.to_owned()
-        })
+        api.read_authorization_model(
+            &principal,
+            pb::ReadAuthorizationModelRequest {
+                store_id: STORE_ID.to_owned(),
+                id: MODEL_ID.to_owned()
+            }
+        )
         .await?
         .authorization_model
         .is_some()
     );
     assert_eq!(
-        api.read_authorization_models(pb::ReadAuthorizationModelsRequest {
-            store_id: STORE_ID.to_owned(),
-            page_size: None,
-            continuation_token: String::new()
-        })
+        api.read_authorization_models(
+            &principal,
+            pb::ReadAuthorizationModelsRequest {
+                store_id: STORE_ID.to_owned(),
+                page_size: None,
+                continuation_token: String::new()
+            }
+        )
         .await?
         .authorization_models
         .len(),
         1
     );
 
-    api.write(pb::WriteRequest {
-        store_id: STORE_ID.to_owned(),
-        writes: Some(pb::WriteRequestWrites {
-            tuple_keys: vec![relationship_tuple()],
-            on_duplicate: String::new(),
-        }),
-        deletes: None,
-        authorization_model_id: MODEL_ID.to_owned(),
-    })
+    api.write(
+        &principal,
+        pb::WriteRequest {
+            store_id: STORE_ID.to_owned(),
+            writes: Some(pb::WriteRequestWrites {
+                tuple_keys: vec![relationship_tuple()],
+                on_duplicate: String::new(),
+            }),
+            deletes: None,
+            authorization_model_id: MODEL_ID.to_owned(),
+        },
+    )
     .await?;
     assert_eq!(
-        api.read(pb::ReadRequest {
-            store_id: STORE_ID.to_owned(),
-            tuple_key: None,
-            page_size: None,
-            continuation_token: String::new(),
-            consistency: 0
-        })
+        api.read(
+            &principal,
+            pb::ReadRequest {
+                store_id: STORE_ID.to_owned(),
+                tuple_key: None,
+                page_size: None,
+                continuation_token: String::new(),
+                consistency: 0
+            }
+        )
         .await?
         .tuples
         .len(),
@@ -428,41 +555,47 @@ async fn test_should_execute_every_m2_use_case_through_shared_wire_adapter()
     );
 
     let check = check_request();
-    assert!(api.check(check.clone()).await?.allowed);
+    assert!(api.check(&principal, check.clone()).await?.allowed);
     let batch = api
-        .batch_check(pb::BatchCheckRequest {
-            store_id: STORE_ID.to_owned(),
-            checks: vec![pb::BatchCheckItem {
-                tuple_key: check.tuple_key.clone(),
-                contextual_tuples: None,
-                context: None,
-                correlation_id: "item-1".to_owned(),
-            }],
-            authorization_model_id: MODEL_ID.to_owned(),
-            consistency: 0,
-        })
-        .await?;
-    assert_eq!(batch.result.len(), 1);
-    let duplicate = api
-        .batch_check(pb::BatchCheckRequest {
-            store_id: STORE_ID.to_owned(),
-            checks: vec![
-                pb::BatchCheckItem {
+        .batch_check(
+            &principal,
+            pb::BatchCheckRequest {
+                store_id: STORE_ID.to_owned(),
+                checks: vec![pb::BatchCheckItem {
                     tuple_key: check.tuple_key.clone(),
                     contextual_tuples: None,
                     context: None,
-                    correlation_id: "duplicate".to_owned(),
-                },
-                pb::BatchCheckItem {
-                    tuple_key: check.tuple_key,
-                    contextual_tuples: None,
-                    context: None,
-                    correlation_id: "duplicate".to_owned(),
-                },
-            ],
-            authorization_model_id: MODEL_ID.to_owned(),
-            consistency: 0,
-        })
+                    correlation_id: "item-1".to_owned(),
+                }],
+                authorization_model_id: MODEL_ID.to_owned(),
+                consistency: 0,
+            },
+        )
+        .await?;
+    assert_eq!(batch.result.len(), 1);
+    let duplicate = api
+        .batch_check(
+            &principal,
+            pb::BatchCheckRequest {
+                store_id: STORE_ID.to_owned(),
+                checks: vec![
+                    pb::BatchCheckItem {
+                        tuple_key: check.tuple_key.clone(),
+                        contextual_tuples: None,
+                        context: None,
+                        correlation_id: "duplicate".to_owned(),
+                    },
+                    pb::BatchCheckItem {
+                        tuple_key: check.tuple_key,
+                        contextual_tuples: None,
+                        context: None,
+                        correlation_id: "duplicate".to_owned(),
+                    },
+                ],
+                authorization_model_id: MODEL_ID.to_owned(),
+                consistency: 0,
+            },
+        )
         .await;
     assert!(matches!(duplicate, Err(error) if error.code() == "validation_error"));
 
@@ -476,39 +609,51 @@ async fn test_should_execute_every_m2_use_case_through_shared_wire_adapter()
         contextual_tuples: Vec::new(),
         context: None,
     };
-    api.write_assertions(pb::WriteAssertionsRequest {
-        store_id: STORE_ID.to_owned(),
-        authorization_model_id: MODEL_ID.to_owned(),
-        assertions: vec![assertion],
-    })
+    api.write_assertions(
+        &principal,
+        pb::WriteAssertionsRequest {
+            store_id: STORE_ID.to_owned(),
+            authorization_model_id: MODEL_ID.to_owned(),
+            assertions: vec![assertion],
+        },
+    )
     .await?;
     assert_eq!(
-        api.read_assertions(pb::ReadAssertionsRequest {
-            store_id: STORE_ID.to_owned(),
-            authorization_model_id: MODEL_ID.to_owned()
-        })
+        api.read_assertions(
+            &principal,
+            pb::ReadAssertionsRequest {
+                store_id: STORE_ID.to_owned(),
+                authorization_model_id: MODEL_ID.to_owned()
+            }
+        )
         .await?
         .assertions
         .len(),
         1
     );
     assert_eq!(
-        api.read_changes(pb::ReadChangesRequest {
-            store_id: STORE_ID.to_owned(),
-            r#type: String::new(),
-            page_size: None,
-            continuation_token: String::new(),
-            start_time: None
-        })
+        api.read_changes(
+            &principal,
+            pb::ReadChangesRequest {
+                store_id: STORE_ID.to_owned(),
+                r#type: String::new(),
+                page_size: None,
+                continuation_token: String::new(),
+                start_time: None
+            }
+        )
         .await?
         .changes
         .len(),
         1
     );
 
-    api.delete_store(pb::DeleteStoreRequest {
-        store_id: STORE_ID.to_owned(),
-    })
+    api.delete_store(
+        &principal,
+        pb::DeleteStoreRequest {
+            store_id: STORE_ID.to_owned(),
+        },
+    )
     .await?;
     drop(router);
     drop(api);
@@ -524,6 +669,12 @@ async fn test_should_execute_every_m2_use_case_through_shared_wire_adapter()
     let mut storage = Arc::try_unwrap(storage).map_err(|_| "storage references remain")?;
     storage.stop().await?;
     Ok(())
+}
+
+fn authenticated_request<T>(principal: &Principal, message: T) -> tonic::Request<T> {
+    let mut request = tonic::Request::new(message);
+    request.extensions_mut().insert(principal.clone());
+    request
 }
 
 fn relationship_tuple() -> pb::TupleKey {

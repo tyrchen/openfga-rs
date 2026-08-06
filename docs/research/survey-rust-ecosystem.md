@@ -55,7 +55,7 @@ The compatibility gate is resolved: `cel-interpreter` is retained only as histor
 
 ## Authentication and authorization
 
-Use rustls with the `aws-lc-rs` provider at transport boundaries. OIDC validation needs issuer/audience/subject checks, algorithm allowlisting, bounded discovery/JWKS responses, SSRF-safe issuer/JWKS URLs, background refresh, key rotation, and stale-key policy. `jsonwebtoken` may decode/verify tokens, but discovery and refresh remain project-owned actor behavior. Preshared keys use `secrecy` and constant-time comparison. Unlike upstream's optional unauthenticated mode, production configuration must require an authentication mode; an explicit loopback-only development mode may disable it.
+Use rustls with the `aws-lc-rs` provider at transport boundaries. The implementation selected current `jsonwebtoken 11.0.0` with its AWS-LC backend for asymmetric JWT verification and current `subtle 2.6.1` for fixed-time preshared-key digest comparison. Discovery, public-address DNS validation, per-request DNS pinning, bounded response streaming, refresh supervision, and stale-key policy remain project-owned rather than being delegated to the JWT library. Unlike upstream's optional unauthenticated mode, production configuration requires an authentication mode; only explicit loopback development mode may disable it.
 
 OpenFGA's own access-control-store behavior should be a separate authorization policy layer after authentication. This avoids conflating whether a token is valid with whether that caller may operate on a store.
 

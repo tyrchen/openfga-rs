@@ -9,7 +9,7 @@ use axum::{
     Json, Router,
     body::{Body, to_bytes},
     extract::{
-        DefaultBodyLimit, Path, Query, State,
+        DefaultBodyLimit, Extension, Path, Query, State,
         rejection::{JsonRejection, QueryRejection},
     },
     http::{HeaderName, HeaderValue, Request, StatusCode},
@@ -17,6 +17,8 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
+use openfga_auth::{Action, AuthenticationService};
+use openfga_domain::Principal;
 use openfga_proto::openfga::v1 as pb;
 use serde::Deserialize;
 use tower::limit::ConcurrencyLimitLayer;
@@ -33,7 +35,7 @@ use crate::{ApiError, OpenFgaApi};
 const REQUEST_ID_HEADER: HeaderName = HeaderName::from_static("x-request-id");
 
 /// Builds the bounded HTTP/JSON router for all pinned M2 routes.
-pub fn http_router(api: OpenFgaApi) -> Router {
+pub fn http_router(api: OpenFgaApi, authentication: AuthenticationService) -> Router {
     let body_limit = api.config.maximum_message_bytes;
     let concurrency = api.config.maximum_concurrency;
     let timeout = api.config.request_timeout.duration();
@@ -57,16 +59,17 @@ pub fn http_router(api: OpenFgaApi) -> Router {
         .route("/stores/{store_id}/check", post(check))
         .route("/stores/{store_id}/read", post(read_tuples))
         .route("/stores/{store_id}/write", post(write_tuples))
-        .route("/stores/{store_id}/expand", post(unimplemented))
-        .route("/stores/{store_id}/list-objects", post(unimplemented))
-        .route("/stores/{store_id}/list-users", post(unimplemented))
+        .route("/stores/{store_id}/expand", post(expand))
+        .route("/stores/{store_id}/list-objects", post(list_objects))
+        .route("/stores/{store_id}/list-users", post(list_users))
         .route(
             "/stores/{store_id}/streamed-list-objects",
-            post(unimplemented),
+            post(streamed_list_objects),
         )
         .layer(middleware::from_fn_with_state(body_limit, response_limit))
         .layer(middleware::from_fn_with_state(timeout, request_timeout))
         .layer(ConcurrencyLimitLayer::new(concurrency))
+        .layer(middleware::from_fn_with_state(authentication, authenticate))
         .layer(CatchPanicLayer::custom(|_| {
             ApiError::internal().into_response()
         }))
@@ -81,6 +84,28 @@ pub fn http_router(api: OpenFgaApi) -> Router {
         )))
         .layer(DefaultBodyLimit::max(body_limit))
         .with_state(Arc::new(api))
+}
+
+async fn authenticate(
+    State(authentication): State<AuthenticationService>,
+    mut request: Request<Body>,
+    next: Next,
+) -> Response {
+    let authorization_values = request.headers().get_all(axum::http::header::AUTHORIZATION);
+    let mut authorization_values = authorization_values.iter();
+    let header = authorization_values
+        .next()
+        .and_then(|value| value.to_str().ok());
+    if authorization_values.next().is_some() {
+        return ApiError::unauthenticated().into_response();
+    }
+    match authentication.authenticate(header) {
+        Ok(principal) => {
+            request.extensions_mut().insert(principal);
+            next.run(request).await
+        }
+        Err(error) => ApiError::from(error).into_response(),
+    }
 }
 
 async fn response_limit(
@@ -145,151 +170,177 @@ struct ChangesQuery {
 
 async fn create_store(
     State(api): State<Arc<OpenFgaApi>>,
+    Extension(principal): Extension<Principal>,
     body: Result<Json<pb::CreateStoreRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<pb::CreateStoreResponse>), ApiError> {
-    api.create_store(json(body)?)
+    api.create_store(&principal, json(body)?)
         .await
         .map(|response| (StatusCode::CREATED, Json(response)))
 }
 
 async fn get_store(
     State(api): State<Arc<OpenFgaApi>>,
+    Extension(principal): Extension<Principal>,
     Path(store_id): Path<String>,
 ) -> Result<Json<pb::GetStoreResponse>, ApiError> {
-    api.get_store(pb::GetStoreRequest { store_id })
+    api.get_store(&principal, pb::GetStoreRequest { store_id })
         .await
         .map(Json)
 }
 
 async fn delete_store(
     State(api): State<Arc<OpenFgaApi>>,
+    Extension(principal): Extension<Principal>,
     Path(store_id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    api.delete_store(pb::DeleteStoreRequest { store_id })
+    api.delete_store(&principal, pb::DeleteStoreRequest { store_id })
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn list_stores(
     State(api): State<Arc<OpenFgaApi>>,
+    Extension(principal): Extension<Principal>,
     query_value: Result<Query<ListStoresQuery>, QueryRejection>,
 ) -> Result<Json<pb::ListStoresResponse>, ApiError> {
     let query = query(query_value)?;
-    api.list_stores(pb::ListStoresRequest {
-        page_size: query
-            .page_size
-            .map(|value| pbjson_types::Int32Value { value }),
-        continuation_token: query.continuation_token.unwrap_or_default(),
-        name: query.name.unwrap_or_default(),
-    })
+    api.list_stores(
+        &principal,
+        pb::ListStoresRequest {
+            page_size: query
+                .page_size
+                .map(|value| pbjson_types::Int32Value { value }),
+            continuation_token: query.continuation_token.unwrap_or_default(),
+            name: query.name.unwrap_or_default(),
+        },
+    )
     .await
     .map(Json)
 }
 
 async fn write_authorization_model(
     State(api): State<Arc<OpenFgaApi>>,
+    Extension(principal): Extension<Principal>,
     Path(store_id): Path<String>,
     body: Result<Json<pb::WriteAuthorizationModelRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<pb::WriteAuthorizationModelResponse>), ApiError> {
     let mut request = json(body)?;
     request.store_id = store_id;
-    api.write_authorization_model(request)
+    api.write_authorization_model(&principal, request)
         .await
         .map(|response| (StatusCode::CREATED, Json(response)))
 }
 
 async fn read_authorization_model(
     State(api): State<Arc<OpenFgaApi>>,
+    Extension(principal): Extension<Principal>,
     Path((store_id, id)): Path<(String, String)>,
 ) -> Result<Json<pb::ReadAuthorizationModelResponse>, ApiError> {
-    api.read_authorization_model(pb::ReadAuthorizationModelRequest { store_id, id })
-        .await
-        .map(Json)
+    api.read_authorization_model(
+        &principal,
+        pb::ReadAuthorizationModelRequest { store_id, id },
+    )
+    .await
+    .map(Json)
 }
 
 async fn read_authorization_models(
     State(api): State<Arc<OpenFgaApi>>,
+    Extension(principal): Extension<Principal>,
     Path(store_id): Path<String>,
     query_value: Result<Query<ListQuery>, QueryRejection>,
 ) -> Result<Json<pb::ReadAuthorizationModelsResponse>, ApiError> {
     let query = query(query_value)?;
-    api.read_authorization_models(pb::ReadAuthorizationModelsRequest {
-        store_id,
-        page_size: query
-            .page_size
-            .map(|value| pbjson_types::Int32Value { value }),
-        continuation_token: query.continuation_token.unwrap_or_default(),
-    })
+    api.read_authorization_models(
+        &principal,
+        pb::ReadAuthorizationModelsRequest {
+            store_id,
+            page_size: query
+                .page_size
+                .map(|value| pbjson_types::Int32Value { value }),
+            continuation_token: query.continuation_token.unwrap_or_default(),
+        },
+    )
     .await
     .map(Json)
 }
 
 async fn write_assertions(
     State(api): State<Arc<OpenFgaApi>>,
+    Extension(principal): Extension<Principal>,
     Path((store_id, authorization_model_id)): Path<(String, String)>,
     body: Result<Json<pb::WriteAssertionsRequest>, JsonRejection>,
 ) -> Result<StatusCode, ApiError> {
     let mut request = json(body)?;
     request.store_id = store_id;
     request.authorization_model_id = authorization_model_id;
-    api.write_assertions(request).await?;
+    api.write_assertions(&principal, request).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn read_assertions(
     State(api): State<Arc<OpenFgaApi>>,
+    Extension(principal): Extension<Principal>,
     Path((store_id, authorization_model_id)): Path<(String, String)>,
 ) -> Result<Json<pb::ReadAssertionsResponse>, ApiError> {
-    api.read_assertions(pb::ReadAssertionsRequest {
-        store_id,
-        authorization_model_id,
-    })
+    api.read_assertions(
+        &principal,
+        pb::ReadAssertionsRequest {
+            store_id,
+            authorization_model_id,
+        },
+    )
     .await
     .map(Json)
 }
 
 async fn read_tuples(
     State(api): State<Arc<OpenFgaApi>>,
+    Extension(principal): Extension<Principal>,
     Path(store_id): Path<String>,
     body: Result<Json<pb::ReadRequest>, JsonRejection>,
 ) -> Result<Json<pb::ReadResponse>, ApiError> {
     let mut request = json(body)?;
     request.store_id = store_id;
-    api.read(request).await.map(Json)
+    api.read(&principal, request).await.map(Json)
 }
 
 async fn write_tuples(
     State(api): State<Arc<OpenFgaApi>>,
+    Extension(principal): Extension<Principal>,
     Path(store_id): Path<String>,
     body: Result<Json<pb::WriteRequest>, JsonRejection>,
 ) -> Result<Json<pb::WriteResponse>, ApiError> {
     let mut request = json(body)?;
     request.store_id = store_id;
-    api.write(request).await.map(Json)
+    api.write(&principal, request).await.map(Json)
 }
 
 async fn check(
     State(api): State<Arc<OpenFgaApi>>,
+    Extension(principal): Extension<Principal>,
     Path(store_id): Path<String>,
     body: Result<Json<pb::CheckRequest>, JsonRejection>,
 ) -> Result<Json<pb::CheckResponse>, ApiError> {
     let mut request = json(body)?;
     request.store_id = store_id;
-    api.check(request).await.map(Json)
+    api.check(&principal, request).await.map(Json)
 }
 
 async fn batch_check(
     State(api): State<Arc<OpenFgaApi>>,
+    Extension(principal): Extension<Principal>,
     Path(store_id): Path<String>,
     body: Result<Json<pb::BatchCheckRequest>, JsonRejection>,
 ) -> Result<Json<pb::BatchCheckResponse>, ApiError> {
     let mut request = json(body)?;
     request.store_id = store_id;
-    api.batch_check(request).await.map(Json)
+    api.batch_check(&principal, request).await.map(Json)
 }
 
 async fn read_changes(
     State(api): State<Arc<OpenFgaApi>>,
+    Extension(principal): Extension<Principal>,
     Path(store_id): Path<String>,
     query_value: Result<Query<ChangesQuery>, QueryRejection>,
 ) -> Result<Json<pb::ReadChangesResponse>, ApiError> {
@@ -301,21 +352,62 @@ async fn read_changes(
                 .map_err(|_| ApiError::invalid_request())
         })
         .transpose()?;
-    api.read_changes(pb::ReadChangesRequest {
-        store_id,
-        r#type: query.r#type.unwrap_or_default(),
-        page_size: query
-            .page_size
-            .map(|value| pbjson_types::Int32Value { value }),
-        continuation_token: query.continuation_token.unwrap_or_default(),
-        start_time,
-    })
+    api.read_changes(
+        &principal,
+        pb::ReadChangesRequest {
+            store_id,
+            r#type: query.r#type.unwrap_or_default(),
+            page_size: query
+                .page_size
+                .map(|value| pbjson_types::Int32Value { value }),
+            continuation_token: query.continuation_token.unwrap_or_default(),
+            start_time,
+        },
+    )
     .await
     .map(Json)
 }
 
-async fn unimplemented() -> ApiError {
-    ApiError::unimplemented()
+async fn expand(
+    State(api): State<Arc<OpenFgaApi>>,
+    Extension(principal): Extension<Principal>,
+    Path(store_id): Path<String>,
+) -> Result<(), ApiError> {
+    authorize_unimplemented(&api, &principal, Action::Expand, &store_id)
+}
+
+async fn list_objects(
+    State(api): State<Arc<OpenFgaApi>>,
+    Extension(principal): Extension<Principal>,
+    Path(store_id): Path<String>,
+) -> Result<(), ApiError> {
+    authorize_unimplemented(&api, &principal, Action::ListObjects, &store_id)
+}
+
+async fn streamed_list_objects(
+    State(api): State<Arc<OpenFgaApi>>,
+    Extension(principal): Extension<Principal>,
+    Path(store_id): Path<String>,
+) -> Result<(), ApiError> {
+    authorize_unimplemented(&api, &principal, Action::StreamedListObjects, &store_id)
+}
+
+async fn list_users(
+    State(api): State<Arc<OpenFgaApi>>,
+    Extension(principal): Extension<Principal>,
+    Path(store_id): Path<String>,
+) -> Result<(), ApiError> {
+    authorize_unimplemented(&api, &principal, Action::ListUsers, &store_id)
+}
+
+fn authorize_unimplemented(
+    api: &OpenFgaApi,
+    principal: &Principal,
+    action: Action,
+    store_id: &str,
+) -> Result<(), ApiError> {
+    api.authorize_store(principal, action, store_id)?;
+    Err(ApiError::unimplemented())
 }
 
 fn json<T>(body: Result<Json<T>, JsonRejection>) -> Result<T, ApiError> {
