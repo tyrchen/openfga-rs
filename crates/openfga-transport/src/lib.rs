@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+mod admission;
 mod api;
 mod config;
 mod convert;
@@ -10,6 +11,7 @@ mod grpc;
 mod http;
 mod pagination;
 
+pub use admission::{AdmissionPolicy, AdmissionPolicyBuilder, EndpointClass};
 pub use api::OpenFgaApi;
 pub use config::{
     OpenFgaServices, OpenFgaServicesBuilder, TransportConfig, TransportConfigBuilder,

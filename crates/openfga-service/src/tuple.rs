@@ -89,11 +89,13 @@ impl TupleService {
     ) -> Result<MutationOutcome, ServiceError> {
         validate_mutation_shape(&deletes, &writes, &self.limits)?;
         crate::common::require_store(self.stores.as_ref(), context, store_id).await?;
-        let model =
-            crate::common::resolve_model(self.models.as_ref(), context, store_id, selection)
-                .await?;
-        for tuple in &writes {
-            model.compiled().validate_persistent_tuple(tuple)?;
+        if !writes.is_empty() {
+            let model =
+                crate::common::resolve_model(self.models.as_ref(), context, store_id, selection)
+                    .await?;
+            for tuple in &writes {
+                model.compiled().validate_persistent_tuple(tuple)?;
+            }
         }
         context.check()?;
         let outcome = self

@@ -7,6 +7,8 @@ GO_BASELINE := .tools/openfga-go-$(GO_BASELINE_COMMIT)
 GO_HTTP_ADDR ?= 127.0.0.1:18080
 GO_GRPC_ADDR ?= 127.0.0.1:18082
 RUST_PROBE_ADDR ?= 127.0.0.1:18081
+RUST_HTTP_ADDR ?= 127.0.0.1:18083
+RUST_GRPC_ADDR ?= 127.0.0.1:18084
 FUZZ_TIME ?= 15
 POSTGRES_TEST_URL ?=
 CONFIG ?= config/openfga-development.yaml
@@ -130,6 +132,111 @@ differential-smoke: $(GO_BASELINE) build
 		--go-url "http://$(GO_HTTP_ADDR)/" --rust-url "http://$(RUST_PROBE_ADDR)/"; \
 	npm ci --prefix tests/sdk-smoke-js --ignore-scripts --no-audit --no-fund; \
 	FGA_API_URL="http://$(GO_HTTP_ADDR)" node tests/sdk-smoke-js/smoke.mjs; \
+	npm audit --prefix tests/sdk-smoke-js --audit-level=moderate
+
+phase2-compatibility: $(GO_BASELINE) build
+	@test -n "$(POSTGRES_TEST_URL)" || { echo "POSTGRES_TEST_URL is required" >&2; exit 1; }
+	@set -eu; \
+	phase2_tmp=$$(mktemp -d); \
+	go_pid=""; rust_pid=""; \
+	cleanup() { \
+		test -z "$$go_pid" || kill "$$go_pid" 2>/dev/null || true; \
+		test -z "$$rust_pid" || kill "$$rust_pid" 2>/dev/null || true; \
+		test -z "$$go_pid" || wait "$$go_pid" 2>/dev/null || true; \
+		test -z "$$rust_pid" || wait "$$rust_pid" 2>/dev/null || true; \
+		rm -rf "$$phase2_tmp"; \
+	}; \
+	fingerprint() { \
+		openssl s_client -connect "$$1" -servername localhost </dev/null 2>/dev/null | \
+			openssl x509 -noout -fingerprint -sha256; \
+	}; \
+	trap cleanup EXIT INT TERM; \
+	openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 1 \
+		-subj /CN=localhost -addext subjectAltName=DNS:localhost,IP:127.0.0.1 \
+		-keyout "$$phase2_tmp/tls.key" -out "$$phase2_tmp/tls.crt" >/dev/null 2>&1; \
+	chmod 600 "$$phase2_tmp/tls.key"; \
+	$(GO_BASELINE) run --http-addr $(GO_HTTP_ADDR) --grpc-addr $(GO_GRPC_ADDR) \
+		--playground-enabled=false >"$$phase2_tmp/go.log" 2>&1 & go_pid=$$!; \
+	OPENFGA__PROFILE=production \
+	OPENFGA__LISTENERS__HTTP=$(RUST_HTTP_ADDR) \
+	OPENFGA__LISTENERS__GRPC=$(RUST_GRPC_ADDR) \
+	OPENFGA__TLS__ENABLED=true \
+	OPENFGA__TLS__CERTIFICATE_PATH="$$phase2_tmp/tls.crt" \
+	OPENFGA__TLS__PRIVATE_KEY_PATH="$$phase2_tmp/tls.key" \
+	OPENFGA__TLS__RELOAD_INTERVAL_SECONDS=1 \
+	OPENFGA__STORAGE__BACKEND=postgres \
+	OPENFGA__STORAGE__POSTGRES__MIGRATE_ON_START=true \
+	OPENFGA_DATABASE_URL="$(POSTGRES_TEST_URL)" \
+	OPENFGA_PRESHARED_KEY=phase2-compatibility-preshared-key-material \
+	OPENFGA_TOKEN_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= \
+	$(CARGO) run --quiet -p openfga-server -- run \
+		--config config/openfga-preshared-development.yaml \
+		>"$$phase2_tmp/rust.log" 2>&1 & rust_pid=$$!; \
+	for endpoint in "http://$(GO_HTTP_ADDR)/healthz" "https://$(RUST_HTTP_ADDR)/readyz"; do \
+		attempt=0; \
+		until curl --insecure --fail --silent "$$endpoint" >/dev/null; do \
+			if ! kill -0 "$$go_pid" 2>/dev/null || ! kill -0 "$$rust_pid" 2>/dev/null; then \
+				echo "a Phase 2 compatibility server exited before readiness" >&2; \
+				tail -100 "$$phase2_tmp/go.log" "$$phase2_tmp/rust.log" >&2; \
+				exit 1; \
+			fi; \
+			attempt=$$((attempt + 1)); \
+			if test "$$attempt" -ge 150; then \
+				echo "Phase 2 server did not become ready: $$endpoint" >&2; \
+				tail -100 "$$phase2_tmp/go.log" "$$phase2_tmp/rust.log" >&2; \
+				exit 1; \
+			fi; \
+			sleep 0.1; \
+		done; \
+	done; \
+	before_http=$$(fingerprint "$(RUST_HTTP_ADDR)"); \
+	before_grpc=$$(fingerprint "$(RUST_GRPC_ADDR)"); \
+	test -n "$$before_http"; \
+	test "$$before_http" = "$$before_grpc"; \
+	mv "$$phase2_tmp/tls.key" "$$phase2_tmp/tls.old.key"; \
+	: >"$$phase2_tmp/tls.key"; \
+	attempt=0; \
+	until grep -F "TLS reload rejected" "$$phase2_tmp/rust.log" >/dev/null; do \
+		attempt=$$((attempt + 1)); \
+		test "$$attempt" -lt 50 || { echo "invalid TLS reload was not observed" >&2; exit 1; }; \
+		sleep 0.1; \
+	done; \
+	test "$$(fingerprint "$(RUST_HTTP_ADDR)")" = "$$before_http"; \
+	openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 1 \
+		-subj /CN=localhost -addext subjectAltName=DNS:localhost,IP:127.0.0.1 \
+		-keyout "$$phase2_tmp/tls.next.key" -out "$$phase2_tmp/tls.next.crt" >/dev/null 2>&1; \
+	chmod 600 "$$phase2_tmp/tls.next.key"; \
+	mv "$$phase2_tmp/tls.next.key" "$$phase2_tmp/tls.key"; \
+	mv "$$phase2_tmp/tls.next.crt" "$$phase2_tmp/tls.crt"; \
+	attempt=0; after_http=""; \
+	while test -z "$$after_http" || test "$$after_http" = "$$before_http"; do \
+		after_http=$$(fingerprint "$(RUST_HTTP_ADDR)" || true); \
+		attempt=$$((attempt + 1)); \
+		test "$$attempt" -lt 50 || { echo "valid TLS identity was not reloaded" >&2; exit 1; }; \
+		sleep 0.1; \
+	done; \
+	after_grpc=$$(fingerprint "$(RUST_GRPC_ADDR)"); \
+	test "$$after_http" = "$$after_grpc"; \
+	npm ci --prefix tests/sdk-smoke-js --ignore-scripts --no-audit --no-fund; \
+	FGA_API_URL="http://$(GO_HTTP_ADDR)" node tests/sdk-smoke-js/smoke.mjs \
+		>"$$phase2_tmp/go-sdk.json"; \
+	NODE_EXTRA_CA_CERTS="$$phase2_tmp/tls.crt" \
+	FGA_API_URL="https://$(RUST_HTTP_ADDR)" \
+	FGA_API_TOKEN=phase2-compatibility-preshared-key-material \
+		node tests/sdk-smoke-js/smoke.mjs >"$$phase2_tmp/rust-sdk.json"; \
+	diff -u "$$phase2_tmp/go-sdk.json" "$$phase2_tmp/rust-sdk.json"; \
+	$(CARGO) run --quiet -p phase2-grpc-smoke -- \
+		--go-url "http://$(GO_GRPC_ADDR)" \
+		--rust-url "https://$(RUST_GRPC_ADDR)" \
+		--rust-ca "$$phase2_tmp/tls.crt" \
+		--rust-token phase2-compatibility-preshared-key-material; \
+	test "$$(curl --insecure --silent --output /dev/null --write-out '%{http_code}' \
+		"https://$(RUST_HTTP_ADDR)/stores")" = 401; \
+	$(CARGO) test -p openfga-transport --all-targets; \
+	$(CARGO) test -p openfga-server 'runtime::tests::test_should_'; \
+	kill -TERM "$$rust_pid"; \
+	wait "$$rust_pid"; \
+	rust_pid=""; \
 	npm audit --prefix tests/sdk-smoke-js --audit-level=moderate
 
 cel-baseline: verify-go-tool verify-go-pin
@@ -291,4 +398,4 @@ update-submodule:
 	check-oracle check-proto check-spike \
 	clippy clippy-strict \
 	conformance deny differential-smoke doc fmt fuzz-condition fuzz-domain fuzz-model go-baseline listobjects-spike model-baseline \
-	model-spike postgres-storage proto release sqlx-prepare-check storage-contract test update-submodule verify-go-pin verify-go-tool
+	model-spike phase2-compatibility postgres-storage proto release sqlx-prepare-check storage-contract test update-submodule verify-go-pin verify-go-tool

@@ -17,8 +17,10 @@ This runbook covers configuration validation, secret injection, deployment, and 
 - `auth.mode: disabled` is accepted only with `profile: development` and two loopback listeners.
 - Secret values are never stored in YAML. YAML names the environment variables from which the
   runtime loads them.
-- TLS files use absolute paths without `..`. They, referenced secrets, authorization policy, and
-  OIDC bootstrap state are loaded at startup; changing them requires a coordinated restart.
+- TLS files use absolute paths without `..`. A supervised owner reloads a complete validated
+  certificate/key pair atomically for both listeners; malformed replacements retain the active
+  identity. Other referenced secrets, authorization policy, and OIDC bootstrap state require a
+  coordinated restart.
 - `storage.backend: memory` is volatile. Use PostgreSQL for any data that must survive restart.
 - PostgreSQL starts only against the exact schema version embedded in the binary unless
   `migrateOnStart` is explicitly enabled.
@@ -37,6 +39,7 @@ tls:
   enabled: true
   certificatePath: /run/openfga/tls/tls.crt
   privateKeyPath: /run/openfga/tls/tls.key
+  reloadIntervalSeconds: 30
 storage:
   backend: postgres
   memory:
@@ -70,6 +73,18 @@ transport:
   maximumConcurrency: 1024
   tokenKeyId: primary
   tokenKeyEnv: OPENFGA_TOKEN_KEY
+  tokenVerificationKeys:
+    - id: prior
+      keyEnv: OPENFGA_TOKEN_KEY_PRIOR
+  admission:
+    windowSeconds: 60
+    authenticationAttempts: 20000
+    authenticationFailures: 2000
+    administration: 1000
+    reads: 10000
+    writes: 2000
+    checks: 20000
+    enumeration: 1000
 evaluator:
   depth: 25
   dispatches: 10000
@@ -97,7 +112,8 @@ primary.
 | --- | --- | --- |
 | `storage.postgres.primaryUrlEnv` | PostgreSQL URL for the writable primary | New process/pool required |
 | `storage.postgres.replicaUrlEnv` | Optional read-only replica URL | New process/pool required |
-| `transport.tokenKeyEnv` | Standard-base64 encoding of 32–64 random bytes | Existing continuation tokens become invalid because this release loads one active token key |
+| `transport.tokenKeyEnv` | Standard-base64 encoding of the active 32–64-byte signing key | New tokens use this key ID |
+| `transport.tokenVerificationKeys[].keyEnv` | Standard-base64 encoding of prior 32–64-byte keys | Existing tokens remain valid during a bounded overlap window |
 | `auth.preshared.keys[].keyEnv` | 32–256 ASCII-graphic bytes from a CSPRNG-backed secret | Follow the overlap procedure in the authentication runbook |
 
 Environment-reference names must be 1–128 bytes, begin with an uppercase ASCII letter, and
@@ -110,7 +126,8 @@ configuration, logs, tickets, or shell history.
 | Area | Important constraints |
 | --- | --- |
 | PostgreSQL | `maxConnections` is 1–65,536; `minConnections` cannot exceed it; acquisition and statement timeouts are 1 ms–5 minutes; tuple mutations are 1–5,000 |
-| Transport | page size is 1–100,000; timeout is 1 ms–5 minutes; token TTL is 1 second–720 hours; message size is 1–16 MiB; concurrency is 1–65,536 |
+| TLS | reload interval is 1–3,600 seconds; each complete pair is bounded and validated before one atomic publication to HTTP and gRPC |
+| Transport | page size is 1–100; timeout is 1 ms–5 minutes; token TTL is 1 second–720 hours; message size is 1–16 MiB; concurrency is 1–65,536; admission rates are 1–1,000,000 per 1–3,600-second window |
 | Evaluator | every budget is positive; depth ≤1,000, dispatches/items/cost ≤1,000,000, datastore queries ≤100,000, reads ≤1,024, batch concurrency ≤1,000 |
 | Telemetry | `logFormat` is `pretty` or `json`; the log filter must parse; export timeout is 1 ms–1 minute; OTLP is a credential-free HTTP(S) origin without path/query/fragment |
 | Shutdown | drain timeout is 1 ms–5 minutes; health interval is 1 ms–1 minute |
@@ -162,6 +179,23 @@ These overrides are configuration values, not the separately referenced secret v
 6. Send `SIGTERM`/`SIGINT` for shutdown. The process marks itself unready, stops through its
    supervisor, drains for `shutdown.drainTimeoutMs`, joins owned actors, flushes telemetry, and
    closes storage.
+
+## Continuation-token key rotation
+
+1. Add the new secret and move the current `tokenKeyId`/`tokenKeyEnv` pair into
+   `tokenVerificationKeys`.
+2. Configure the new key as the active pair and restart. New tokens use it while tokens signed by
+   the prior key continue to verify.
+3. Retain prior keys for at least `tokenTtlSeconds` plus deployment and clock skew, then remove them
+   in a later coordinated restart. Key IDs must be unique and the total key set is capped at 16.
+
+## TLS rotation
+
+Replace the certificate and key files as one filesystem-level deployment unit. Within
+`tls.reloadIntervalSeconds`, the owner bounded-reads both files, validates the pair, and atomically
+publishes one rustls configuration to new HTTP and gRPC connections. A partial or malformed update
+is rejected and the prior identity remains active; inspect the generic reload warning and repair
+the files without restarting or weakening TLS.
 
 ## Rollback
 

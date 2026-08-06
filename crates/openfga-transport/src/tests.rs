@@ -199,6 +199,63 @@ fn test_should_bind_continuation_tokens_to_the_exact_query_scope() -> Result<(),
 }
 
 #[test]
+fn test_should_enforce_pinned_page_size_range() -> Result<(), Box<dyn Error>> {
+    let limits = InputLimits::default();
+    let codec = TokenCodec::new(
+        TokenKey::new("active".parse()?, vec![9; 32])?,
+        Vec::new(),
+        &limits,
+    )?;
+    let scope = crate::pagination::scope(
+        TokenOperation::ListStores,
+        crate::pagination::GLOBAL_SCOPE_STORE,
+        FingerprintBuilder::new("all-stores").finish(),
+    );
+    let default_size = NonZeroU32::new(50).ok_or("invalid default page size")?;
+
+    for invalid in [-1, 0, 101] {
+        let error = crate::pagination::page_options(
+            Some(invalid),
+            "",
+            &scope,
+            &codec,
+            &limits,
+            default_size,
+        )
+        .err()
+        .ok_or("invalid page size unexpectedly accepted")?;
+        assert_eq!(error.code(), "page_size_invalid");
+    }
+    let maximum =
+        crate::pagination::page_options(Some(100), "", &scope, &codec, &limits, default_size)?;
+    assert_eq!(maximum.maximum_results(), 100);
+    Ok(())
+}
+
+#[test]
+fn test_should_preserve_field_specific_tuple_validation_reasons() {
+    let limits = InputLimits::default();
+    let oversized_object = format!("document:{}", "x".repeat(257));
+    let object_error =
+        super::convert::tuple_key(&oversized_object, "viewer", "user:anne", &limits).err();
+    assert!(matches!(object_error, Some(error) if error.code() == "object_too_long"));
+
+    let oversized_relation = "r".repeat(51);
+    let relation_error = super::convert::tuple_key(
+        "document:roadmap",
+        &oversized_relation,
+        "user:anne",
+        &limits,
+    )
+    .err();
+    assert!(matches!(relation_error, Some(error) if error.code() == "relation_too_long"));
+
+    let user_error =
+        super::convert::tuple_key("document:roadmap", "viewer", "invalid-user", &limits).err();
+    assert!(matches!(user_error, Some(error) if error.code() == "invalid_user"));
+}
+
+#[test]
 fn test_should_cancel_in_flight_work_when_request_guard_drops() {
     let guard = super::api::RequestCancellation::new();
     let token = guard.token();
@@ -288,7 +345,7 @@ async fn test_should_execute_every_m2_use_case_through_shared_wire_adapter()
                 .method("POST")
                 .uri("/stores")
                 .header("content-type", "application/json")
-                .body(Body::from(r#"{"name":"engineering"}"#))?,
+                .body(Body::from(r#"{"name":"authorization"}"#))?,
         )
         .await?;
     assert_eq!(response.status(), StatusCode::CREATED);
@@ -308,8 +365,8 @@ async fn test_should_execute_every_m2_use_case_through_shared_wire_adapter()
     )
     .await?
     .into_inner();
-    assert_eq!(grpc_store.name, "engineering");
-    let updated = OpenFgaService::update_store(
+    assert_eq!(grpc_store.name, "authorization");
+    let update = OpenFgaService::update_store(
         &api,
         authenticated_request(
             &principal,
@@ -319,9 +376,8 @@ async fn test_should_execute_every_m2_use_case_through_shared_wire_adapter()
             },
         ),
     )
-    .await?
-    .into_inner();
-    assert_eq!(updated.name, "authorization");
+    .await;
+    assert!(matches!(update, Err(status) if status.code() == tonic::Code::Unimplemented));
 
     let invalid = router
         .clone()
@@ -334,6 +390,39 @@ async fn test_should_execute_every_m2_use_case_through_shared_wire_adapter()
         )
         .await?;
     assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+    for (uri, expected_code) in [
+        ("/stores?page_size=0".to_owned(), "page_size_invalid"),
+        ("/stores/short".to_owned(), "store_id_invalid_length"),
+    ] {
+        let response = router
+            .clone()
+            .oneshot(Request::get(uri).body(Body::empty())?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = serde_json::from_slice::<serde_json::Value>(
+            &to_bytes(response.into_body(), 1_024).await?,
+        )?;
+        assert_eq!(
+            body.get("code").and_then(serde_json::Value::as_str),
+            Some(expected_code)
+        );
+    }
+    let missing_tuple = router
+        .clone()
+        .oneshot(
+            Request::post(format!("/stores/{STORE_ID}/check"))
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))?,
+        )
+        .await?;
+    assert_eq!(missing_tuple.status(), StatusCode::BAD_REQUEST);
+    let body = serde_json::from_slice::<serde_json::Value>(
+        &to_bytes(missing_tuple.into_body(), 1_024).await?,
+    )?;
+    assert_eq!(
+        body.get("code").and_then(serde_json::Value::as_str),
+        Some("tuple_key_value_not_specified"),
+    );
 
     let protected_router = crate::http_router(
         api.clone(),

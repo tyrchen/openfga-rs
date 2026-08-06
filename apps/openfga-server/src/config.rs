@@ -3,6 +3,7 @@
 use std::{
     collections::{BTreeSet, HashSet},
     net::SocketAddr,
+    num::NonZeroU32,
     path::{Component, Path, PathBuf},
     time::Duration,
 };
@@ -13,6 +14,7 @@ use openfga_auth::{
     Action, AuthorizationPolicy, OidcAlgorithm, OidcConfig, PolicyBinding, StoreScope,
 };
 use openfga_domain::{Limit, PrincipalId, RequestTimeout, StoreId, TokenKeyId};
+use openfga_transport::AdmissionPolicy;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 
@@ -23,6 +25,8 @@ const MAXIMUM_SHUTDOWN_DURATION: Duration = Duration::from_mins(5);
 const MAXIMUM_HEALTH_INTERVAL: Duration = Duration::from_mins(1);
 const MAXIMUM_REQUEST_TIMEOUT: Duration = Duration::from_mins(5);
 const MAXIMUM_AUTH_KEYS: usize = 32;
+const MAXIMUM_TOKEN_KEYS: usize = 16;
+const MAXIMUM_PAGE_SIZE: u32 = 100;
 const MAXIMUM_POLICY_BINDINGS: usize = 1_024;
 pub(crate) const DEVELOPMENT_PRINCIPAL_ID: &str = "openfga-development-runtime";
 
@@ -55,7 +59,7 @@ pub(crate) struct ListenerConfig {
     pub(crate) grpc: SocketAddr,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct TlsConfig {
     #[serde(default)]
@@ -64,6 +68,25 @@ pub(crate) struct TlsConfig {
     pub(crate) certificate_path: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) private_key_path: Option<PathBuf>,
+    #[serde(default = "default_tls_reload_interval_seconds")]
+    pub(crate) reload_interval_seconds: u64,
+}
+
+impl TlsConfig {
+    pub(crate) const fn reload_interval(&self) -> Duration {
+        Duration::from_secs(self.reload_interval_seconds)
+    }
+}
+
+impl Default for TlsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            certificate_path: None,
+            private_key_path: None,
+            reload_interval_seconds: default_tls_reload_interval_seconds(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -248,6 +271,53 @@ pub(crate) struct TransportPolicy {
     pub(crate) token_key_id: String,
     #[serde(default = "default_token_key_env")]
     pub(crate) token_key_env: String,
+    #[serde(default)]
+    pub(crate) token_verification_keys: Vec<TokenKeyConfig>,
+    #[serde(default)]
+    pub(crate) admission: AdmissionConfig,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct TokenKeyConfig {
+    pub(crate) id: String,
+    pub(crate) key_env: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct AdmissionConfig {
+    #[serde(default = "default_rate_window_seconds")]
+    pub(crate) window_seconds: u64,
+    #[serde(default = "default_authentication_attempts")]
+    pub(crate) authentication_attempts: u32,
+    #[serde(default = "default_authentication_failures")]
+    pub(crate) authentication_failures: u32,
+    #[serde(default = "default_administration_rate")]
+    pub(crate) administration: u32,
+    #[serde(default = "default_read_rate")]
+    pub(crate) reads: u32,
+    #[serde(default = "default_write_rate")]
+    pub(crate) writes: u32,
+    #[serde(default = "default_check_rate")]
+    pub(crate) checks: u32,
+    #[serde(default = "default_enumeration_rate")]
+    pub(crate) enumeration: u32,
+}
+
+impl Default for AdmissionConfig {
+    fn default() -> Self {
+        Self {
+            window_seconds: default_rate_window_seconds(),
+            authentication_attempts: default_authentication_attempts(),
+            authentication_failures: default_authentication_failures(),
+            administration: default_administration_rate(),
+            reads: default_read_rate(),
+            writes: default_write_rate(),
+            checks: default_check_rate(),
+            enumeration: default_enumeration_rate(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -403,6 +473,26 @@ impl ServerConfig {
     pub(crate) fn request_timeout(&self) -> Result<RequestTimeout> {
         RequestTimeout::new(Duration::from_millis(self.transport.request_timeout_ms))
             .context("request timeout is outside the domain safety range")
+    }
+
+    pub(crate) fn admission_policy(&self) -> Result<AdmissionPolicy> {
+        let policy = &self.transport.admission;
+        Ok(AdmissionPolicy::builder()
+            .window(Duration::from_secs(policy.window_seconds))
+            .authentication_attempts(nonzero_rate(
+                policy.authentication_attempts,
+                "authentication attempt",
+            )?)
+            .authentication_failures(nonzero_rate(
+                policy.authentication_failures,
+                "authentication failure",
+            )?)
+            .administration(nonzero_rate(policy.administration, "administration")?)
+            .reads(nonzero_rate(policy.reads, "read")?)
+            .writes(nonzero_rate(policy.writes, "write")?)
+            .checks(nonzero_rate(policy.checks, "check")?)
+            .enumeration(nonzero_rate(policy.enumeration, "enumeration")?)
+            .build())
     }
 
     pub(crate) const fn drain_timeout(&self) -> Duration {
@@ -569,7 +659,7 @@ impl ServerConfig {
             self.tls.certificate_path.as_deref(),
             self.tls.private_key_path.as_deref(),
         ) {
-            (false, None, None) => Ok(()),
+            (false, None, None) => {}
             (false, _, _) => bail!("TLS paths cannot be set while TLS is disabled"),
             (true, Some(certificate), Some(key)) => {
                 validate_absolute_path(certificate, "TLS certificate")?;
@@ -577,10 +667,13 @@ impl ServerConfig {
                 if certificate == key {
                     bail!("TLS certificate and private key paths must differ");
                 }
-                Ok(())
             }
             (true, _, _) => bail!("TLS requires certificatePath and privateKeyPath"),
         }
+        if !(1..=3_600).contains(&self.tls.reload_interval_seconds) {
+            bail!("TLS reload interval must be between 1 and 3600 seconds");
+        }
+        Ok(())
     }
 
     fn validate_storage(&self) -> Result<()> {
@@ -616,8 +709,10 @@ impl ServerConfig {
     }
 
     fn validate_transport(&self) -> Result<()> {
-        if self.transport.default_page_size == 0 || self.transport.default_page_size > 100_000 {
-            bail!("default page size must be between 1 and 100000");
+        if self.transport.default_page_size == 0
+            || self.transport.default_page_size > MAXIMUM_PAGE_SIZE
+        {
+            bail!("default page size must be between 1 and 100");
         }
         self.request_timeout()?;
         if self.transport.token_ttl_seconds == 0
@@ -631,11 +726,45 @@ impl ServerConfig {
         if !(1..=65_536).contains(&self.transport.maximum_concurrency) {
             bail!("maximum concurrency must be between 1 and 65536");
         }
-        self.transport
-            .token_key_id
-            .parse::<TokenKeyId>()
-            .context("continuation token key ID is invalid")?;
-        validate_environment_name(&self.transport.token_key_env)
+        let mut key_ids = BTreeSet::new();
+        key_ids.insert(
+            self.transport
+                .token_key_id
+                .parse::<TokenKeyId>()
+                .context("continuation token signing key ID is invalid")?,
+        );
+        validate_environment_name(&self.transport.token_key_env)?;
+        if self.transport.token_verification_keys.len() >= MAXIMUM_TOKEN_KEYS {
+            bail!("continuation token verification key count must be at most 15");
+        }
+        for key in &self.transport.token_verification_keys {
+            let id = key
+                .id
+                .parse::<TokenKeyId>()
+                .context("continuation token verification key ID is invalid")?;
+            if !key_ids.insert(id) {
+                bail!("continuation token key IDs must be unique");
+            }
+            validate_environment_name(&key.key_env)?;
+        }
+        if !(1..=3_600).contains(&self.transport.admission.window_seconds) {
+            bail!("admission rate window must be between 1 and 3600 seconds");
+        }
+        if [
+            self.transport.admission.authentication_attempts,
+            self.transport.admission.authentication_failures,
+            self.transport.admission.administration,
+            self.transport.admission.reads,
+            self.transport.admission.writes,
+            self.transport.admission.checks,
+            self.transport.admission.enumeration,
+        ]
+        .into_iter()
+        .any(|rate| !(1..=1_000_000).contains(&rate))
+        {
+            bail!("admission rates must be between 1 and 1000000 per window");
+        }
+        Ok(())
     }
 
     fn validate_evaluator(&self) -> Result<()> {
@@ -725,6 +854,10 @@ fn validate_environment_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+fn nonzero_rate(value: u32, label: &str) -> Result<NonZeroU32> {
+    NonZeroU32::new(value).with_context(|| format!("{label} rate must be nonzero"))
+}
+
 fn validate_absolute_path(path: &Path, label: &str) -> Result<()> {
     if !path.is_absolute()
         || path
@@ -746,6 +879,10 @@ fn bounded_duration(value_ms: u64, maximum: Duration, label: &str) -> Result<Dur
 
 const fn default_actor_capacity() -> usize {
     256
+}
+
+const fn default_tls_reload_interval_seconds() -> u64 {
+    30
 }
 
 fn default_primary_url_env() -> String {
@@ -794,6 +931,38 @@ fn default_token_key_id() -> String {
 
 fn default_token_key_env() -> String {
     "OPENFGA_TOKEN_KEY".to_owned()
+}
+
+const fn default_rate_window_seconds() -> u64 {
+    60
+}
+
+const fn default_authentication_attempts() -> u32 {
+    20_000
+}
+
+const fn default_authentication_failures() -> u32 {
+    2_000
+}
+
+const fn default_administration_rate() -> u32 {
+    1_000
+}
+
+const fn default_read_rate() -> u32 {
+    10_000
+}
+
+const fn default_write_rate() -> u32 {
+    2_000
+}
+
+const fn default_check_rate() -> u32 {
+    20_000
+}
+
+const fn default_enumeration_rate() -> u32 {
+    1_000
 }
 
 fn default_oidc_algorithms() -> Vec<OidcAlgorithm> {
@@ -983,6 +1152,38 @@ evaluator: {}
     fn test_should_reject_preshared_policy_for_inactive_identity() -> anyhow::Result<()> {
         let input = VALID_PRESHARED.replace("principal: reader", "principal: inactive-reader");
         let config = ServerConfig::from(parse(input.as_bytes())?);
+        assert!(config.validate().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_validate_overlapping_continuation_token_keys() -> anyhow::Result<()> {
+        let input = VALID_PRESHARED.replace(
+            "transport: {}",
+            "transport:\n  tokenKeyId: current\n  tokenKeyEnv: OPENFGA_TOKEN_CURRENT\n  \
+             tokenVerificationKeys:\n    - id: prior\n      keyEnv: OPENFGA_TOKEN_PRIOR",
+        );
+        let config = ServerConfig::from(parse(input.as_bytes())?);
+        config.validate()?;
+
+        let duplicate = input.replace("- id: prior", "- id: current");
+        let duplicate = ServerConfig::from(parse(duplicate.as_bytes())?);
+        assert!(duplicate.validate().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_reject_transport_limits_outside_public_contract() -> anyhow::Result<()> {
+        let mut config = ServerConfig::from(parse(VALID.as_bytes())?);
+        config.transport.default_page_size = 101;
+        assert!(config.validate().is_err());
+
+        config.transport.default_page_size = 100;
+        config.transport.admission.authentication_attempts = 0;
+        assert!(config.validate().is_err());
+
+        config.transport.admission.authentication_attempts = 1;
+        config.tls.reload_interval_seconds = 0;
         assert!(config.validate().is_err());
         Ok(())
     }

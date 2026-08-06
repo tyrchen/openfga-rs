@@ -4,7 +4,7 @@ use std::{
     env, fmt,
     net::SocketAddr,
     num::{NonZeroU32, NonZeroUsize},
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -40,14 +40,15 @@ use secrecy::SecretString;
 use serde::Serialize;
 use tokio::{
     io::AsyncReadExt,
-    sync::watch,
+    sync::{mpsc, watch},
     task::JoinSet,
     time::{MissedTickBehavior, timeout},
 };
-use tokio_stream::wrappers::TcpListenerStream;
-use tonic::transport::{Identity, Server, ServerTlsConfig};
+use tokio_rustls::{TlsAcceptor, server::TlsStream};
+use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
+use tonic::transport::Server;
 use tonic_health::{ServingStatus, server::HealthReporter};
-use tower::limit::ConcurrencyLimitLayer;
+use tower::limit::{ConcurrencyLimitLayer, GlobalConcurrencyLimitLayer};
 use tower_http::limit::RequestBodyLimitLayer;
 
 use crate::config::{AuthMode, DEVELOPMENT_PRINCIPAL_ID, ServerConfig, StorageBackend};
@@ -82,18 +83,23 @@ impl HealthState {
     }
 }
 
+#[derive(Clone)]
 struct TlsMaterial {
-    certificate: Vec<u8>,
-    private_key: Vec<u8>,
     http_config: axum_server::tls_rustls::RustlsConfig,
+    certificate_path: PathBuf,
+    private_key_path: PathBuf,
+    read_timeout: Duration,
+    reload_interval: Duration,
 }
 
 impl fmt::Debug for TlsMaterial {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("TlsMaterial")
-            .field("certificate_bytes", &self.certificate.len())
+            .field("certificate_path", &self.certificate_path)
             .field("private_key", &"[REDACTED]")
+            .field("read_timeout", &self.read_timeout)
+            .field("reload_interval", &self.reload_interval)
             .finish_non_exhaustive()
     }
 }
@@ -186,6 +192,10 @@ pub(crate) async fn run(config: ServerConfig) -> Result<()> {
             Ok(())
         });
     }
+    if let Some(material) = tls.clone() {
+        let actor_shutdown = shutdown_rx.clone();
+        tasks.spawn(async move { material.run_reloader(actor_shutdown).await });
+    }
     spawn_http(
         &mut tasks,
         http_listener,
@@ -193,6 +203,7 @@ pub(crate) async fn run(config: ServerConfig) -> Result<()> {
             .merge(health_router(Arc::clone(&health_state))),
         tls.as_ref(),
         shutdown_rx.clone(),
+        config.drain_timeout() / 2,
     )?;
     spawn_grpc(
         &mut tasks,
@@ -315,9 +326,9 @@ async fn assemble(config: &ServerConfig) -> Result<RuntimeAssembly> {
             (services, StorageOwner::Postgres(storage), health)
         }
     };
-    let token_key = load_token_key(config)?;
+    let (token_key, verification_keys) = load_token_keys(config)?;
     let token_codec = Arc::new(
-        TokenCodec::new(token_key, Vec::new(), &limits)
+        TokenCodec::new(token_key, verification_keys, &limits)
             .context("failed to create continuation token codec")?,
     );
     let authorization_policy = Arc::new(config.authorization_policy()?);
@@ -332,6 +343,7 @@ async fn assemble(config: &ServerConfig) -> Result<RuntimeAssembly> {
         .token_ttl(Duration::from_secs(config.transport.token_ttl_seconds))
         .maximum_message_bytes(config.transport.maximum_message_bytes)
         .maximum_concurrency(config.transport.maximum_concurrency)
+        .admission_policy(config.admission_policy()?)
         .build();
     let api = OpenFgaApi::new(services, transport)
         .map_err(anyhow::Error::msg)
@@ -462,13 +474,27 @@ fn check_budget(config: &ServerConfig) -> Result<CheckBudget> {
         .build())
 }
 
-fn load_token_key(config: &ServerConfig) -> Result<TokenKey> {
+fn load_token_keys(config: &ServerConfig) -> Result<(TokenKey, Vec<TokenKey>)> {
     let encoded = load_secret_string(&config.transport.token_key_env)?;
     let bytes = BASE64_STANDARD
         .decode(encoded.as_bytes())
         .context("continuation token key must be standard base64")?;
-    TokenKey::new(config.transport.token_key_id.parse()?, bytes)
-        .context("continuation token key must decode to 32 through 64 bytes")
+    let signing_key = TokenKey::new(config.transport.token_key_id.parse()?, bytes)
+        .context("continuation token signing key must decode to 32 through 64 bytes")?;
+    let verification_keys = config
+        .transport
+        .token_verification_keys
+        .iter()
+        .map(|key| {
+            let encoded = load_secret_string(&key.key_env)?;
+            let bytes = BASE64_STANDARD
+                .decode(encoded.as_bytes())
+                .context("continuation token verification key must be standard base64")?;
+            TokenKey::new(key.id.parse()?, bytes)
+                .context("continuation token verification key must decode to 32 through 64 bytes")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((signing_key, verification_keys))
 }
 
 fn load_secret(name: &str) -> Result<SecretString> {
@@ -507,28 +533,76 @@ async fn load_tls(config: &ServerConfig) -> Result<Option<TlsMaterial>> {
         .private_key_path
         .as_deref()
         .context("TLS private key path is missing")?;
-    let duration = config.request_timeout()?.duration();
-    let certificate = timeout(duration, read_bounded_file(certificate_path))
-        .await
-        .context("TLS certificate read timed out")??;
-    let private_key = timeout(duration, read_bounded_file(private_key_path))
-        .await
-        .context("TLS private key read timed out")??;
-    let http_config =
-        axum_server::tls_rustls::RustlsConfig::from_pem(certificate.clone(), private_key.clone())
-            .await
-            .context("HTTP TLS material is invalid")?;
-    let _grpc_validation = Server::builder()
-        .tls_config(
-            ServerTlsConfig::new()
-                .identity(Identity::from_pem(certificate.clone(), private_key.clone())),
-        )
-        .context("gRPC TLS material is invalid")?;
+    let read_timeout = config.request_timeout()?.duration();
+    let http_config = load_tls_pair(certificate_path, private_key_path, read_timeout).await?;
     Ok(Some(TlsMaterial {
-        certificate,
-        private_key,
         http_config,
+        certificate_path: certificate_path.to_owned(),
+        private_key_path: private_key_path.to_owned(),
+        read_timeout,
+        reload_interval: config.tls.reload_interval(),
     }))
+}
+
+async fn load_tls_pair(
+    certificate_path: &Path,
+    private_key_path: &Path,
+    maximum: Duration,
+) -> Result<axum_server::tls_rustls::RustlsConfig> {
+    let reads = async {
+        tokio::try_join!(
+            read_bounded_file(certificate_path),
+            read_bounded_file(private_key_path),
+        )
+    };
+    let (certificate, private_key) = timeout(maximum, reads)
+        .await
+        .context("TLS material read timed out")??;
+    axum_server::tls_rustls::RustlsConfig::from_pem(certificate, private_key)
+        .await
+        .context("TLS certificate and private key pair is invalid")
+}
+
+impl TlsMaterial {
+    async fn run_reloader(self, mut shutdown: watch::Receiver<bool>) -> Result<()> {
+        let mut ticker = tokio::time::interval(self.reload_interval);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let _initial_tick = ticker.tick().await;
+        loop {
+            tokio::select! {
+                result = shutdown.changed() => {
+                    if result.is_err() || *shutdown.borrow() {
+                        return Ok(());
+                    }
+                }
+                _ = ticker.tick() => {
+                    match self.reload_once().await {
+                        Ok(()) => {
+                            tracing::info!("TLS certificate and private key reloaded atomically");
+                        }
+                        Err(error) => {
+                            tracing::warn!(error = %error, "TLS reload rejected; retaining the active identity");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn reload_once(&self) -> Result<()> {
+        let candidate = load_tls_pair(
+            &self.certificate_path,
+            &self.private_key_path,
+            self.read_timeout,
+        )
+        .await?;
+        self.publish(&candidate);
+        Ok(())
+    }
+
+    fn publish(&self, candidate: &axum_server::tls_rustls::RustlsConfig) {
+        self.http_config.reload_from_config(candidate.get_inner());
+    }
 }
 
 async fn read_bounded_file(path: &Path) -> Result<Vec<u8>> {
@@ -595,6 +669,7 @@ fn spawn_http(
     router: Router,
     tls: Option<&TlsMaterial>,
     shutdown: watch::Receiver<bool>,
+    graceful_timeout: Duration,
 ) -> Result<()> {
     let listener = listener
         .into_std()
@@ -603,7 +678,7 @@ fn spawn_http(
     let shutdown_handle = handle.clone();
     let shutdown = async move {
         wait_for_shutdown(shutdown).await;
-        shutdown_handle.graceful_shutdown(None);
+        shutdown_handle.graceful_shutdown(Some(graceful_timeout));
     };
     if let Some(tls) = tls {
         let rustls = tls.http_config.clone();
@@ -660,16 +735,30 @@ where
     H::Future: Send + 'static,
 {
     let mut server = Server::builder()
+        .layer(GlobalConcurrencyLimitLayer::new(
+            config.transport.maximum_concurrency,
+        ))
         .timeout(config.request_timeout()?.duration())
         .concurrency_limit_per_connection(config.transport.maximum_concurrency)
         .load_shed(true);
     if let Some(tls) = tls {
-        server = server
-            .tls_config(ServerTlsConfig::new().identity(Identity::from_pem(
-                tls.certificate.clone(),
-                tls.private_key.clone(),
-            )))
-            .context("gRPC TLS material is invalid")?;
+        let incoming = spawn_grpc_tls_incoming(
+            tasks,
+            listener,
+            tls.clone(),
+            shutdown.clone(),
+            config.request_timeout()?.duration(),
+            config.transport.maximum_concurrency.min(1_024),
+        );
+        tasks.spawn(async move {
+            server
+                .add_service(health_service)
+                .add_service(grpc_service(transport.api, transport.authentication))
+                .serve_with_incoming_shutdown(incoming, wait_for_shutdown(shutdown))
+                .await
+                .context("gRPC listener failed")
+        });
+        return Ok(());
     }
     let incoming = TcpListenerStream::new(listener);
     tasks.spawn(async move {
@@ -681,6 +770,65 @@ where
             .context("gRPC listener failed")
     });
     Ok(())
+}
+
+fn spawn_grpc_tls_incoming(
+    tasks: &mut JoinSet<Result<()>>,
+    listener: tokio::net::TcpListener,
+    tls: TlsMaterial,
+    mut shutdown: watch::Receiver<bool>,
+    handshake_timeout: Duration,
+    maximum_handshakes: usize,
+) -> ReceiverStream<Result<TlsStream<tokio::net::TcpStream>, std::io::Error>> {
+    let capacity = maximum_handshakes.max(1);
+    let (sender, receiver) = mpsc::channel(capacity);
+    tasks.spawn(async move {
+        let mut handshakes = JoinSet::new();
+        loop {
+            tokio::select! {
+                result = shutdown.changed() => {
+                    if result.is_err() || *shutdown.borrow() {
+                        handshakes.abort_all();
+                        while handshakes.join_next().await.is_some() {}
+                        return Ok(());
+                    }
+                }
+                accepted = listener.accept(), if handshakes.len() < capacity => {
+                    let (stream, _peer) = accepted.context("gRPC TCP accept failed")?;
+                    let acceptor = TlsAcceptor::from(tls.http_config.get_inner());
+                    handshakes.spawn(async move {
+                        timeout(handshake_timeout, acceptor.accept(stream))
+                            .await
+                            .context("gRPC TLS handshake timed out")?
+                            .context("gRPC TLS handshake failed")
+                    });
+                }
+                Some(result) = handshakes.join_next(), if !handshakes.is_empty() => {
+                    match result {
+                        Ok(Ok(stream)) => match sender.try_send(Ok(stream)) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                tracing::warn!("gRPC TLS admission queue is full");
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => return Ok(()),
+                        },
+                        Ok(Err(error)) => {
+                            tracing::debug!(error = %error, "gRPC TLS connection rejected");
+                        }
+                        Err(error) if error.is_panic() => {
+                            return Err(anyhow::Error::new(error)
+                                .context("gRPC TLS handshake task panicked"));
+                        }
+                        Err(error) => {
+                            return Err(anyhow::Error::new(error)
+                                .context("gRPC TLS handshake task was cancelled"));
+                        }
+                    }
+                }
+            }
+        }
+    });
+    ReceiverStream::new(receiver)
 }
 
 fn spawn_health_monitor(
@@ -832,12 +980,28 @@ async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::{
+        path::PathBuf,
+        sync::{Arc, atomic::Ordering},
+        time::Duration,
+    };
 
-    use axum::{body::Body, http::Request};
+    use anyhow::Context as _;
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+        routing::get,
+    };
+    use rustls::server::ResolvesServerCertUsingSni;
+    use tokio::{
+        io::{AsyncReadExt as _, AsyncWriteExt as _},
+        sync::{mpsc, watch},
+        task::JoinSet,
+        time::timeout,
+    };
     use tower::ServiceExt;
 
-    use super::{HealthState, health_router};
+    use super::{HealthState, TlsMaterial, drain_tasks, health_router, spawn_http};
 
     #[tokio::test]
     async fn test_should_report_readiness_transitions() -> anyhow::Result<()> {
@@ -858,5 +1022,85 @@ mod tests {
         assert_eq!(ready.status(), axum::http::StatusCode::OK);
         tokio::time::timeout(Duration::from_secs(1), async {}).await?;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_should_publish_tls_atomically_and_retain_identity_on_invalid_reload()
+    -> anyhow::Result<()> {
+        let active = empty_tls_config()?;
+        let material = TlsMaterial {
+            http_config: active.clone(),
+            certificate_path: PathBuf::from("/dev/null"),
+            private_key_path: PathBuf::from("/dev/null"),
+            read_timeout: Duration::from_secs(1),
+            reload_interval: Duration::from_secs(30),
+        };
+        let health = HealthState::new();
+        let _previous = health.set_ready(true);
+        let before = active.get_inner();
+
+        assert!(material.reload_once().await.is_err());
+        assert!(Arc::ptr_eq(&before, &active.get_inner()));
+        assert!(health.ready.load(Ordering::Acquire));
+
+        let candidate = empty_tls_config()?;
+        material.publish(&candidate);
+        assert!(!Arc::ptr_eq(&before, &active.get_inner()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_should_bound_shutdown_with_an_in_flight_client() -> anyhow::Result<()> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let (entered_tx, mut entered_rx) = mpsc::channel(1);
+        let router = axum::Router::new().route(
+            "/slow",
+            get(move || {
+                let entered_tx = entered_tx.clone();
+                async move {
+                    let _send_result = entered_tx.send(()).await;
+                    std::future::pending::<StatusCode>().await
+                }
+            }),
+        );
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut tasks = JoinSet::new();
+        spawn_http(
+            &mut tasks,
+            listener,
+            router,
+            None,
+            shutdown_rx,
+            Duration::from_millis(25),
+        )?;
+
+        let mut client = tokio::net::TcpStream::connect(address).await?;
+        client
+            .write_all(b"GET /slow HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await?;
+        entered_rx
+            .recv()
+            .await
+            .context("request was not admitted")?;
+        shutdown_tx.send(true)?;
+
+        drain_tasks(&mut tasks, Duration::from_millis(100)).await?;
+        assert!(tasks.is_empty());
+        let mut byte = [0_u8; 1];
+        let closed = timeout(Duration::from_secs(1), client.read(&mut byte)).await?;
+        assert!(matches!(closed, Ok(0) | Err(_)));
+        Ok(())
+    }
+
+    fn empty_tls_config() -> anyhow::Result<axum_server::tls_rustls::RustlsConfig> {
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let config = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()?
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(ResolvesServerCertUsingSni::new()));
+        Ok(axum_server::tls_rustls::RustlsConfig::from_config(
+            Arc::new(config),
+        ))
     }
 }

@@ -228,6 +228,45 @@ async fn exercise_tuples_assertions_and_changes(
     assert_eq!(duplicate.kind(), ServiceErrorKind::InvalidRequest);
     assert_two_tuple_pages(tuples, context, store_id).await?;
 
+    exercise_assertions(assertions, context, store_id, model_id, &anne).await?;
+    assert_two_change_pages(changes, context, store_id).await?;
+
+    let invalid = tuples
+        .write(
+            context,
+            store_id,
+            ModelSelection::Latest,
+            Vec::new(),
+            vec![tuple("document:roadmap#viewer@group:engineering")?],
+            TupleWriteOptions::default(),
+        )
+        .await
+        .err()
+        .ok_or("model-incompatible tuple unexpectedly persisted")?;
+    assert_eq!(invalid.kind(), ServiceErrorKind::InvalidRequest);
+
+    let nonexistent_model = "01ARZ3NDEKTSV4RRFFQ69G5FAX".parse()?;
+    let deleted = tuples
+        .write(
+            context,
+            store_id,
+            ModelSelection::Explicit(nonexistent_model),
+            vec![anne.key().clone()],
+            Vec::new(),
+            TupleWriteOptions::default(),
+        )
+        .await?;
+    assert_eq!(deleted.change_ids().len(), 1);
+    Ok(())
+}
+
+async fn exercise_assertions(
+    assertions: &AssertionService,
+    context: &OperationContext,
+    store_id: StoreId,
+    model_id: AuthorizationModelId,
+    anne: &RelationshipTuple,
+) -> Result<(), Box<dyn Error>> {
     let assertion = Assertion::new(
         anne.key().clone(),
         true,
@@ -267,21 +306,6 @@ async fn exercise_tuples_assertions_and_changes(
         .await
         .err()
         .ok_or("invalid contextual assertion unexpectedly persisted")?;
-    assert_eq!(invalid.kind(), ServiceErrorKind::InvalidRequest);
-    assert_two_change_pages(changes, context, store_id).await?;
-
-    let invalid = tuples
-        .write(
-            context,
-            store_id,
-            ModelSelection::Latest,
-            Vec::new(),
-            vec![tuple("document:roadmap#viewer@group:engineering")?],
-            TupleWriteOptions::default(),
-        )
-        .await
-        .err()
-        .ok_or("model-incompatible tuple unexpectedly persisted")?;
     assert_eq!(invalid.kind(), ServiceErrorKind::InvalidRequest);
     Ok(())
 }

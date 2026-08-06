@@ -15,6 +15,7 @@ use crate::ApiError;
 
 /// Global sentinel used only in the separately tagged `ListStores` token scope.
 pub(crate) const GLOBAL_SCOPE_STORE: StoreId = StoreId::from_ulid(ulid::Ulid::nil());
+const MAXIMUM_PAGE_SIZE: u32 = 100;
 
 pub(crate) fn scope(
     operation: TokenOperation,
@@ -33,10 +34,13 @@ pub(crate) fn page_options(
     default_size: NonZeroU32,
 ) -> Result<PageOptions, ApiError> {
     let size = match requested {
-        None | Some(0) => default_size,
+        None => default_size,
         Some(value) => {
-            NonZeroU32::new(u32::try_from(value).map_err(|_| ApiError::invalid_request())?)
-                .ok_or_else(ApiError::invalid_request)?
+            let value = u32::try_from(value).map_err(|_| ApiError::invalid_page_size())?;
+            if value > MAXIMUM_PAGE_SIZE {
+                return Err(ApiError::invalid_page_size());
+            }
+            NonZeroU32::new(value).ok_or_else(ApiError::invalid_page_size)?
         }
     };
     let after = if token.is_empty() {

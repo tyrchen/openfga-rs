@@ -21,13 +21,15 @@ fail-closed recovery over bypassing authentication, schema checks, TLS, budgets,
 | Signal | Fail-safe behavior | Operator action |
 | --- | --- | --- |
 | Configuration/TLS/secret invalid | Startup fails before API listener readiness | Fix the referenced value; validate config; do not weaken profile/TLS/auth |
+| TLS reload invalid | The replacement pair is rejected and both listeners retain the last valid identity | Repair and atomically replace both files; verify the next reload event and new connection certificate |
 | PostgreSQL unreachable at startup | Assembly fails; listeners do not become ready | Check DNS/network/TLS/credentials/pool limits and primary role |
 | Schema `fresh`/`pending`/`tooNew` or checksum mismatch | PostgreSQL backend refuses service | Follow the migration runbook; never edit metadata/checksums |
 | Primary outage after startup | Readiness probe fails; storage requests return redacted failures | Remove from admission, restore primary service, verify schema and write/read probes |
 | Replica unavailable or beyond lag ceiling | Latency-preferring reads fall back to primary | Check replay lag and primary capacity; do not raise the lag ceiling without consistency analysis |
 | OIDC unavailable at startup | Discovery/JWKS bootstrap fails; no listeners | Validate issuer, public DNS answers, CA chain, allowlist, and provider documents |
 | OIDC refresh failing | Last verified keys remain until stale grace; after that readiness fails and auth is unavailable | Restore provider/network before grace expires; do not extend grace during an unexplained key event |
-| Preshared authentication failures spike | Invalid requests get a generic 401 | Check client rollout and active key labels; rotate through overlap, never log/compare raw keys |
+| Preshared authentication failures spike | Invalid requests get a generic 401 until the bounded failure bucket sheds excess attempts | Check client rollout and active key labels; rotate through overlap, never log/compare raw keys |
+| Admission rate exceeded | Requests fail with a bounded 429/resource-exhausted response before expensive work | Identify the authentication/principal/endpoint class; adjust only from measured legitimate demand |
 | Authorization denials spike | Requests fail before store lookup with generic 403 | Compare reviewed bindings/actions/stores and deployment revision; do not add wildcard as a diagnostic shortcut |
 | Request timeout/resource limit | Bounded request fails; cancellation propagates to owned work | Identify load/input class, inspect pool and evaluator budgets, shed traffic; do not remove ceilings during incident response |
 | Supervised task exits or panics | Runtime supervisor initiates shutdown; no silent partial service | Preserve panic-safe logs, drain/restart only after identifying the task and trigger |

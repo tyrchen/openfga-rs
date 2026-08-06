@@ -9,9 +9,12 @@ use openfga_service::{
 };
 use typed_builder::TypedBuilder;
 
+use crate::AdmissionPolicy;
+
 const MAXIMUM_MESSAGE_BYTES: usize = 16 * 1_024 * 1_024;
 const MAXIMUM_CONCURRENCY: usize = 65_536;
 const MAXIMUM_TOKEN_TTL: Duration = Duration::from_hours(720);
+const MAXIMUM_PAGE_SIZE: u32 = 100;
 
 /// Complete service set consumed by the `OpenFGA` transport adapters.
 #[derive(Clone, Debug, TypedBuilder)]
@@ -53,6 +56,9 @@ pub struct TransportConfig {
     /// Maximum concurrent requests admitted by the HTTP adapter.
     #[builder(default = 1_024)]
     pub(crate) maximum_concurrency: usize,
+    /// Authentication and per-principal endpoint rate policy.
+    #[builder(default = AdmissionPolicy::builder().build())]
+    pub(crate) admission_policy: AdmissionPolicy,
 }
 
 const fn trusted_page_size(value: u32) -> NonZeroU32 {
@@ -69,8 +75,10 @@ impl TransportConfig {
     ///
     /// Returns a static diagnostic code when a transport ceiling is invalid.
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.default_page_size.get() > self.limits.results() {
-            return Err("default_page_size_exceeds_result_limit");
+        if self.default_page_size.get() > self.limits.results()
+            || self.default_page_size.get() > MAXIMUM_PAGE_SIZE
+        {
+            return Err("default_page_size_exceeds_endpoint_limit");
         }
         if self.token_ttl.as_secs() == 0 || self.token_ttl > MAXIMUM_TOKEN_TTL {
             return Err("token_ttl_out_of_range");
@@ -81,6 +89,7 @@ impl TransportConfig {
         if !(1..=MAXIMUM_CONCURRENCY).contains(&self.maximum_concurrency) {
             return Err("maximum_concurrency_out_of_range");
         }
+        self.admission_policy.validate()?;
         Ok(())
     }
 }
@@ -97,6 +106,7 @@ impl fmt::Debug for TransportConfig {
             .field("token_ttl", &self.token_ttl)
             .field("maximum_message_bytes", &self.maximum_message_bytes)
             .field("maximum_concurrency", &self.maximum_concurrency)
+            .field("admission_policy", &self.admission_policy)
             .finish_non_exhaustive()
     }
 }

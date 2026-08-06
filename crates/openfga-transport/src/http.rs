@@ -30,7 +30,7 @@ use tower_http::{
     trace::TraceLayer,
 };
 
-use crate::{ApiError, OpenFgaApi};
+use crate::{ApiError, EndpointClass, OpenFgaApi, admission::AdmissionControl};
 
 const REQUEST_ID_HEADER: HeaderName = HeaderName::from_static("x-request-id");
 
@@ -39,6 +39,11 @@ pub fn http_router(api: OpenFgaApi, authentication: AuthenticationService) -> Ro
     let body_limit = api.config.maximum_message_bytes;
     let concurrency = api.config.maximum_concurrency;
     let timeout = api.config.request_timeout.duration();
+    let admission = api.admission.clone();
+    let authentication = AuthenticationState {
+        authentication,
+        admission: admission.clone(),
+    };
     Router::new()
         .route("/stores", get(list_stores).post(create_store))
         .route("/stores/{store_id}", delete(delete_store).get(get_store))
@@ -68,12 +73,13 @@ pub fn http_router(api: OpenFgaApi, authentication: AuthenticationService) -> Ro
         )
         .layer(middleware::from_fn_with_state(body_limit, response_limit))
         .layer(middleware::from_fn_with_state(timeout, request_timeout))
-        .layer(ConcurrencyLimitLayer::new(concurrency))
+        .layer(middleware::from_fn_with_state(admission, admit_principal))
         .layer(middleware::from_fn_with_state(authentication, authenticate))
+        .layer(ConcurrencyLimitLayer::new(concurrency))
         .layer(CatchPanicLayer::custom(|_| {
             ApiError::internal().into_response()
         }))
-        .layer(TraceLayer::new_for_http())
+        .layer(TraceLayer::new_for_http().make_span_with(request_span))
         .layer(PropagateHeaderLayer::new(REQUEST_ID_HEADER))
         .layer(SetRequestIdLayer::new(
             REQUEST_ID_HEADER,
@@ -86,25 +92,81 @@ pub fn http_router(api: OpenFgaApi, authentication: AuthenticationService) -> Ro
         .with_state(Arc::new(api))
 }
 
+fn request_span<B>(request: &Request<B>) -> tracing::Span {
+    tracing::info_span!(
+        "http_request",
+        method = %request.method(),
+        path = request.uri().path(),
+    )
+}
+
+#[derive(Clone, Debug)]
+struct AuthenticationState {
+    authentication: AuthenticationService,
+    admission: AdmissionControl,
+}
+
 async fn authenticate(
-    State(authentication): State<AuthenticationService>,
+    State(state): State<AuthenticationState>,
     mut request: Request<Body>,
     next: Next,
 ) -> Response {
+    if let Err(error) = state.admission.admit_authentication() {
+        return error.into_response();
+    }
     let authorization_values = request.headers().get_all(axum::http::header::AUTHORIZATION);
     let mut authorization_values = authorization_values.iter();
     let header = authorization_values
         .next()
         .and_then(|value| value.to_str().ok());
     if authorization_values.next().is_some() {
-        return ApiError::unauthenticated().into_response();
+        return match state.admission.record_authentication_failure() {
+            Ok(()) => ApiError::unauthenticated().into_response(),
+            Err(overloaded) => overloaded.into_response(),
+        };
     }
-    match authentication.authenticate(header) {
+    match state.authentication.authenticate(header) {
         Ok(principal) => {
             request.extensions_mut().insert(principal);
             next.run(request).await
         }
-        Err(error) => ApiError::from(error).into_response(),
+        Err(error) => match state.admission.record_authentication_failure() {
+            Ok(()) => ApiError::from(error).into_response(),
+            Err(overloaded) => overloaded.into_response(),
+        },
+    }
+}
+
+async fn admit_principal(
+    State(admission): State<AdmissionControl>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let Some(principal) = request.extensions().get::<Principal>() else {
+        return ApiError::unauthenticated().into_response();
+    };
+    let class = endpoint_class(request.method(), request.uri().path());
+    match admission.admit_principal(principal, class) {
+        Ok(()) => next.run(request).await,
+        Err(error) => error.into_response(),
+    }
+}
+
+fn endpoint_class(_method: &axum::http::Method, path: &str) -> EndpointClass {
+    if path.ends_with("/check") || path.ends_with("/batch-check") {
+        EndpointClass::Check
+    } else if path.ends_with("/write") {
+        EndpointClass::Write
+    } else if path.ends_with("/read") || path.ends_with("/changes") {
+        EndpointClass::Read
+    } else if path.ends_with("/expand")
+        || path.ends_with("/list-objects")
+        || path.ends_with("/streamed-list-objects")
+        || path.ends_with("/list-users")
+    {
+        EndpointClass::Enumeration
+    } else {
+        EndpointClass::Administration
     }
 }
 
@@ -424,4 +486,73 @@ fn query<T>(query: Result<Query<T>, QueryRejection>) -> Result<T, ApiError> {
     query
         .map(|Query(value)| value)
         .map_err(|_| ApiError::invalid_request())
+}
+
+#[cfg(test)]
+mod trace_tests {
+    use std::{
+        io::{self, Write},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+    };
+
+    use axum::http::Request;
+    use tracing_subscriber::fmt::{self, format::FmtSpan};
+
+    use super::request_span;
+
+    #[derive(Clone, Debug)]
+    struct CanaryWriter {
+        leaked: Arc<AtomicBool>,
+    }
+
+    impl Write for CanaryWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            if buffer
+                .windows(b"secret-continuation-token".len())
+                .any(|window| window == b"secret-continuation-token")
+            {
+                self.leaked.store(true, Ordering::SeqCst);
+            }
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> fmt::MakeWriter<'writer> for CanaryWriter {
+        type Writer = Self;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn test_should_never_record_query_tokens_in_request_spans()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let leaked = Arc::new(AtomicBool::new(false));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(CanaryWriter {
+                leaked: Arc::clone(&leaked),
+            })
+            .with_span_events(FmtSpan::NEW)
+            .finish();
+        let request =
+            Request::get("/stores?continuation_token=secret-continuation-token&page_size=10")
+                .body(())?;
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = request_span(&request);
+            let _entered = span.enter();
+            tracing::info!("request admitted");
+        });
+
+        assert!(!leaked.load(Ordering::SeqCst));
+        Ok(())
+    }
 }

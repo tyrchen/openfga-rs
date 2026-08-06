@@ -4,6 +4,7 @@ listeners:
   grpc: 127.0.0.1:8081
 tls:
   enabled: false
+  reloadIntervalSeconds: 30
 storage:
   backend: memory
   memory:
@@ -27,6 +28,16 @@ transport:
   maximumConcurrency: 1024
   tokenKeyId: primary
   tokenKeyEnv: OPENFGA_TOKEN_KEY
+  tokenVerificationKeys: []
+  admission:
+    windowSeconds: 60
+    authenticationAttempts: 20000
+    authenticationFailures: 2000
+    administration: 1000
+    reads: 10000
+    writes: 2000
+    checks: 20000
+    enumeration: 1000
 evaluator:
   depth: 25
   dispatches: 10000

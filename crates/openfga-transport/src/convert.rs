@@ -8,8 +8,9 @@ use std::{
 use openfga_condition::{ConditionDefinition, ParameterType, ParameterTypeRef};
 use openfga_domain::{
     AuthorizationModelId, ConditionBinding, ConditionContext, ConditionName, ConditionReference,
-    ContextValue, ContextualTuples, InputLimits, ModelSelection, ObjectRef, ParameterName,
-    RelationName, RelationshipTuple, StoreId, SubjectRef, TupleKey, TypeName,
+    ContextValue, ContextualTuples, DomainError, InputLimits, ModelSelection, ObjectRef,
+    ParameterName, ParseKind, RelationName, RelationshipTuple, StoreId, SubjectRef, TupleKey,
+    TypeName, ValidationReason,
 };
 use openfga_model::{
     AuthorizationModelDefinition, ConditionSource, DirectRestrictionSource, RelationSource,
@@ -30,7 +31,7 @@ use crate::ApiError;
 const MAXIMUM_REWRITE_DEPTH: usize = 64;
 
 pub(crate) fn store_id(value: &str) -> Result<StoreId, ApiError> {
-    value.parse().map_err(|_| ApiError::invalid_request())
+    value.parse().map_err(|_| ApiError::invalid_store_id())
 }
 
 pub(crate) fn model_selection(value: &str) -> Result<ModelSelection, ApiError> {
@@ -40,12 +41,14 @@ pub(crate) fn model_selection(value: &str) -> Result<ModelSelection, ApiError> {
         value
             .parse::<AuthorizationModelId>()
             .map(ModelSelection::Explicit)
-            .map_err(|_| ApiError::invalid_request())
+            .map_err(|error| ApiError::invalid_model_id(error.kind() == ParseKind::TooLong))
     }
 }
 
 pub(crate) fn model_id(value: &str) -> Result<AuthorizationModelId, ApiError> {
-    value.parse().map_err(|_| ApiError::invalid_request())
+    value.parse().map_err(|error: openfga_domain::ParseError| {
+        ApiError::invalid_model_id(error.kind() == ParseKind::TooLong)
+    })
 }
 
 pub(crate) fn tuple_key(
@@ -55,11 +58,22 @@ pub(crate) fn tuple_key(
     limits: &InputLimits,
 ) -> Result<TupleKey, ApiError> {
     Ok(TupleKey::new(
-        ObjectRef::parse_with_limits(object, limits).map_err(|_| ApiError::invalid_request())?,
+        ObjectRef::parse_with_limits(object, limits)
+            .map_err(|error| ApiError::invalid_object(domain_parse_too_long(&error)))?,
         RelationName::parse_with_limits(relation, limits)
-            .map_err(|_| ApiError::invalid_request())?,
-        SubjectRef::parse_with_limits(user, limits).map_err(|_| ApiError::invalid_request())?,
+            .map_err(|error| ApiError::invalid_relation(error.kind() == ParseKind::TooLong))?,
+        SubjectRef::parse_with_limits(user, limits).map_err(|_| ApiError::invalid_user())?,
     ))
+}
+
+fn domain_parse_too_long(error: &DomainError) -> bool {
+    matches!(
+        error,
+        DomainError::Parse(error) if error.kind() == ParseKind::TooLong
+    ) || matches!(
+        error,
+        DomainError::Validation(error) if error.reason() == ValidationReason::TooLarge
+    )
 }
 
 pub(crate) fn relationship_tuple(
@@ -383,18 +397,6 @@ pub(crate) fn create_store_response(
     })
 }
 
-pub(crate) fn update_store_response(
-    record: &StoreRecord,
-) -> Result<pb::UpdateStoreResponse, ApiError> {
-    let value = store(record)?;
-    Ok(pb::UpdateStoreResponse {
-        id: value.id,
-        name: value.name,
-        created_at: value.created_at,
-        updated_at: value.updated_at,
-    })
-}
-
 pub(crate) fn get_store_response(record: &StoreRecord) -> Result<pb::GetStoreResponse, ApiError> {
     let value = store(record)?;
     Ok(pb::GetStoreResponse {
@@ -467,7 +469,7 @@ pub(crate) fn domain_assertion(
     value: pb::Assertion,
     limits: &InputLimits,
 ) -> Result<Assertion, ApiError> {
-    let tuple = value.tuple_key.ok_or_else(ApiError::invalid_request)?;
+    let tuple = value.tuple_key.ok_or_else(ApiError::missing_tuple_key)?;
     let contextual = value
         .contextual_tuples
         .into_iter()

@@ -15,7 +15,9 @@ use openfga_storage::{
 };
 
 use crate::{
-    ApiError, OpenFgaServices, TransportConfig, convert,
+    ApiError, OpenFgaServices, TransportConfig,
+    admission::AdmissionControl,
+    convert,
     pagination::{self, GLOBAL_SCOPE_STORE},
 };
 
@@ -24,6 +26,7 @@ use crate::{
 pub struct OpenFgaApi {
     pub(crate) services: OpenFgaServices,
     pub(crate) config: TransportConfig,
+    pub(crate) admission: AdmissionControl,
 }
 
 impl OpenFgaApi {
@@ -34,7 +37,12 @@ impl OpenFgaApi {
     /// Returns a static configuration diagnostic when policy is inconsistent.
     pub fn new(services: OpenFgaServices, config: TransportConfig) -> Result<Self, &'static str> {
         config.validate()?;
-        Ok(Self { services, config })
+        let admission = AdmissionControl::new(config.admission_policy)?;
+        Ok(Self {
+            services,
+            config,
+            admission,
+        })
     }
 
     #[tracing::instrument(skip_all, fields(operation = "create_store"))]
@@ -54,26 +62,6 @@ impl OpenFgaApi {
             .await
             .map_err(ApiError::from)?;
         convert::create_store_response(&record)
-    }
-
-    #[tracing::instrument(skip_all, fields(operation = "update_store"))]
-    pub(crate) async fn update_store(
-        &self,
-        principal: &Principal,
-        request: pb::UpdateStoreRequest,
-    ) -> Result<pb::UpdateStoreResponse, ApiError> {
-        self.authorize_store(principal, Action::UpdateStore, &request.store_id)?;
-        let record = self
-            .services
-            .stores
-            .update(
-                &*self.operation_context(ConsistencyPreference::HigherConsistency)?,
-                convert::store_id(&request.store_id)?,
-                StoreName::new(request.name).map_err(|_| ApiError::invalid_request())?,
-            )
-            .await
-            .map_err(ApiError::from)?;
-        convert::update_store_response(&record)
     }
 
     #[tracing::instrument(skip_all, fields(operation = "get_store"))]
@@ -464,7 +452,7 @@ impl OpenFgaApi {
         let tuple = request
             .tuple_key
             .as_ref()
-            .ok_or_else(ApiError::invalid_request)?;
+            .ok_or_else(ApiError::missing_tuple_key)?;
         let query = self.query_context(
             principal,
             &request.store_id,
@@ -518,7 +506,7 @@ impl OpenFgaApi {
             .checks
             .into_iter()
             .map(|item| {
-                let tuple = item.tuple_key.ok_or_else(ApiError::invalid_request)?;
+                let tuple = item.tuple_key.ok_or_else(ApiError::missing_tuple_key)?;
                 Ok(BatchCheckItem::new(
                     item.correlation_id
                         .parse::<CorrelationId>()
@@ -715,6 +703,7 @@ impl fmt::Debug for OpenFgaApi {
             .debug_struct("OpenFgaApi")
             .field("services", &self.services)
             .field("config", &self.config)
+            .field("admission", &self.admission)
             .finish_non_exhaustive()
     }
 }

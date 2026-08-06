@@ -31,11 +31,61 @@ impl ApiError {
     /// Creates a request validation failure without retaining hostile input.
     #[must_use]
     pub const fn invalid_request() -> Self {
+        Self::validation("validation_error", "the request is invalid")
+    }
+
+    pub(crate) const fn invalid_store_id() -> Self {
+        Self::validation(
+            "store_id_invalid_length",
+            "store_id must be a canonical 26-character ULID",
+        )
+    }
+
+    pub(crate) const fn invalid_page_size() -> Self {
+        Self::validation("page_size_invalid", "page_size must be between 1 and 100")
+    }
+
+    pub(crate) const fn missing_tuple_key() -> Self {
+        Self::validation("tuple_key_value_not_specified", "tuple_key is required")
+    }
+
+    pub(crate) const fn invalid_object(too_long: bool) -> Self {
+        if too_long {
+            Self::validation("object_too_long", "object exceeds its byte limit")
+        } else {
+            Self::validation("object_invalid_pattern", "object has an invalid format")
+        }
+    }
+
+    pub(crate) const fn invalid_relation(too_long: bool) -> Self {
+        if too_long {
+            Self::validation("relation_too_long", "relation exceeds its byte limit")
+        } else {
+            Self::validation("validation_error", "relation has an invalid format")
+        }
+    }
+
+    pub(crate) const fn invalid_user() -> Self {
+        Self::validation("invalid_user", "user has an invalid format")
+    }
+
+    pub(crate) const fn invalid_model_id(too_long: bool) -> Self {
+        if too_long {
+            Self::validation(
+                "authorization_model_id_too_long",
+                "authorization_model_id exceeds its byte limit",
+            )
+        } else {
+            Self::validation("validation_error", "authorization_model_id is invalid")
+        }
+    }
+
+    const fn validation(code: &'static str, message: &'static str) -> Self {
         Self::new(
             StatusCode::BAD_REQUEST,
             Code::InvalidArgument,
-            "validation_error",
-            "the request is invalid",
+            code,
+            message,
         )
     }
 
@@ -124,6 +174,15 @@ impl ApiError {
         )
     }
 
+    pub(crate) const fn overloaded() -> Self {
+        Self::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            Code::ResourceExhausted,
+            "throttled_timeout_error",
+            "the request rate limit was exceeded",
+        )
+    }
+
     const fn new(
         http_status: StatusCode,
         grpc_code: Code,
@@ -191,9 +250,24 @@ impl From<ServiceError> for ApiError {
                 "the request conflicts with current state",
             ),
             ServiceErrorKind::InvalidContinuation => Self::invalid_continuation(),
-            ServiceErrorKind::InvalidRequest | ServiceErrorKind::Condition => {
-                Self::invalid_request()
-            }
+            ServiceErrorKind::InvalidRequest | ServiceErrorKind::Condition => match error.code() {
+                "tuple_write_empty" => Self::validation(
+                    "invalid_write_input",
+                    "at least one tuple write or delete is required",
+                ),
+                "duplicate_tuple_in_write" => Self::validation(
+                    "cannot_allow_duplicate_tuples_in_one_request",
+                    "duplicate tuples are not allowed in one request",
+                ),
+                "invalid_authorization_model" => Self::validation(
+                    "invalid_authorization_model",
+                    "the authorization model is invalid",
+                ),
+                "invalid_tuple" | "invalid_relationship_tuple" | "invalid_query_tuple" => {
+                    Self::validation("invalid_tuple", "the tuple is invalid")
+                }
+                _ => Self::invalid_request(),
+            },
             ServiceErrorKind::ResourceExhausted => Self::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Code::ResourceExhausted,

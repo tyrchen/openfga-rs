@@ -1629,6 +1629,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tonic",
  "tonic-health",
@@ -1726,6 +1727,7 @@ dependencies = [
  "tower",
  "tower-http 0.7.0",
  "tracing",
+ "tracing-subscriber",
  "typed-builder",
  "ulid",
 ]
@@ -1894,6 +1896,20 @@ dependencies = [
  "fixedbitset",
  "hashbrown 0.15.5",
  "indexmap",
+]
+
+[[package]]
+name = "phase2-grpc-smoke"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "openfga-proto",
+ "pbjson-types",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tonic",
 ]
 
 [[package]]

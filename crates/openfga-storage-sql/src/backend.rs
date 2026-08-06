@@ -100,7 +100,11 @@ impl PostgresStorage {
         }
         verify_schema(&primary).await?;
         let replica = match &config.replica_url {
-            Some(url) => Some(connect_pool(&config, url.expose_secret()).await?),
+            Some(url) => {
+                let pool = connect_pool(&config, url.expose_secret()).await?;
+                verify_schema(&pool).await?;
+                Some(pool)
+            }
             None => None,
         };
         Ok(Self {
@@ -1153,6 +1157,7 @@ pub(crate) async fn connect_pool(
     config: &PostgresStorageConfig,
     url: &str,
 ) -> Result<PgPool, StorageError> {
+    validate_url_query_keys(url)?;
     let options =
         PgConnectOptions::from_str(url).map_err(|error| map_sqlx(error, "postgres_url_invalid"))?;
     let statement_timeout = format!("{}ms", config.statement_timeout.as_millis().max(1));
@@ -1173,6 +1178,60 @@ pub(crate) async fn connect_pool(
         .connect_with(options)
         .await
         .map_err(|error| map_sqlx(error, "postgres_connect_failed"))
+}
+
+fn validate_url_query_keys(url: &str) -> Result<(), StorageError> {
+    let Some((_, query_and_fragment)) = url.split_once('?') else {
+        return Ok(());
+    };
+    let query = query_and_fragment
+        .split_once('#')
+        .map_or(query_and_fragment, |(query, _)| query);
+    for parameter in query.split('&').filter(|parameter| !parameter.is_empty()) {
+        let key = parameter.split_once('=').map_or(parameter, |(key, _)| key);
+        let accepted = matches!(
+            key,
+            "sslmode"
+                | "ssl-mode"
+                | "sslrootcert"
+                | "ssl-root-cert"
+                | "ssl-ca"
+                | "sslcert"
+                | "ssl-cert"
+                | "sslkey"
+                | "ssl-key"
+                | "statement-cache-capacity"
+                | "host"
+                | "hostaddr"
+                | "port"
+                | "dbname"
+                | "user"
+                | "password"
+                | "application_name"
+                | "options"
+        ) || valid_scoped_option(key);
+        if !accepted {
+            return Err(StorageError::new(
+                StorageErrorKind::Integrity,
+                "postgres_url_parameter_not_allowed",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn valid_scoped_option(key: &str) -> bool {
+    let Some(option) = key
+        .strip_prefix("options[")
+        .and_then(|value| value.strip_suffix(']'))
+    else {
+        return false;
+    };
+    !option.is_empty()
+        && option.len() <= 128
+        && option
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
 }
 
 async fn verify_schema(pool: &PgPool) -> Result<(), StorageError> {
@@ -1847,4 +1906,41 @@ fn internal_conversion(
     code: &'static str,
 ) -> impl FnOnce(std::num::TryFromIntError) -> StorageError {
     move |error| StorageError::with_source(StorageErrorKind::Internal, code, error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_url_query_keys;
+
+    #[test]
+    fn test_should_reject_unknown_dsn_parameters_without_retaining_values()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let error = validate_url_query_keys(
+            "postgresql://user@localhost/openfga?unknown=database-secret-canary",
+        )
+        .err()
+        .ok_or("unknown PostgreSQL URL parameter was accepted")?;
+        let diagnostic = format!("{error:?} {error}");
+
+        assert_eq!(error.code(), "postgres_url_parameter_not_allowed");
+        assert!(!diagnostic.contains("database-secret-canary"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_accept_only_sqlx_supported_dsn_parameters() {
+        assert!(
+            validate_url_query_keys(
+                "postgresql://user@localhost/openfga?sslmode=require&application_name=openfga&\
+                 options[search_path]=public",
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_url_query_keys(
+                "postgresql://user@localhost/openfga?unkn%6fwn=database-secret-canary",
+            )
+            .is_err()
+        );
+    }
 }

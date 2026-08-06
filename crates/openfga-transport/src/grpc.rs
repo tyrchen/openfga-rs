@@ -6,9 +6,11 @@ use openfga_proto::openfga::v1::{
     self as pb,
     open_fga_service_server::{OpenFgaService, OpenFgaServiceServer},
 };
-use tonic::{Request, Response, Status, codegen::InterceptedService, service::Interceptor};
+use tonic::{
+    GrpcMethod, Request, Response, Status, codegen::InterceptedService, service::Interceptor,
+};
 
-use crate::{ApiError, OpenFgaApi};
+use crate::{ApiError, EndpointClass, OpenFgaApi, admission::AdmissionControl};
 
 /// An authenticated bounded Tonic service adapter.
 pub type AuthenticatedGrpcService =
@@ -18,20 +20,40 @@ pub type AuthenticatedGrpcService =
 #[derive(Clone, Debug)]
 pub struct GrpcAuthenticationInterceptor {
     authentication: AuthenticationService,
+    admission: AdmissionControl,
 }
 
 impl Interceptor for GrpcAuthenticationInterceptor {
     fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, Status> {
+        self.admission
+            .admit_authentication()
+            .map_err(Status::from)?;
         let values = request.metadata().get_all("authorization");
         let mut values = values.iter();
         let header = values.next().and_then(|value| value.to_str().ok());
         if values.next().is_some() {
+            self.admission
+                .record_authentication_failure()
+                .map_err(Status::from)?;
             return Err(ApiError::unauthenticated().into());
         }
-        let principal = self
-            .authentication
-            .authenticate(header)
-            .map_err(ApiError::from)
+        let principal = match self.authentication.authenticate(header) {
+            Ok(principal) => principal,
+            Err(error) => {
+                self.admission
+                    .record_authentication_failure()
+                    .map_err(Status::from)?;
+                return Err(Status::from(ApiError::from(error)));
+            }
+        };
+        let class = request
+            .extensions()
+            .get::<GrpcMethod<'_>>()
+            .map_or(EndpointClass::Administration, |method| {
+                grpc_endpoint_class(method.method())
+            });
+        self.admission
+            .admit_principal(&principal, class)
             .map_err(Status::from)?;
         request.extensions_mut().insert(principal);
         Ok(request)
@@ -45,10 +67,29 @@ pub fn grpc_service(
     authentication: AuthenticationService,
 ) -> AuthenticatedGrpcService {
     let maximum = api.config.maximum_message_bytes;
+    let admission = api.admission.clone();
     let service = OpenFgaServiceServer::new(api)
         .max_decoding_message_size(maximum)
         .max_encoding_message_size(maximum);
-    InterceptedService::new(service, GrpcAuthenticationInterceptor { authentication })
+    InterceptedService::new(
+        service,
+        GrpcAuthenticationInterceptor {
+            authentication,
+            admission,
+        },
+    )
+}
+
+fn grpc_endpoint_class(method: &str) -> EndpointClass {
+    match method {
+        "Check" | "BatchCheck" => EndpointClass::Check,
+        "Write" => EndpointClass::Write,
+        "Read" | "ReadChanges" => EndpointClass::Read,
+        "Expand" | "ListObjects" | "StreamedListObjects" | "ListUsers" => {
+            EndpointClass::Enumeration
+        }
+        _ => EndpointClass::Administration,
+    }
 }
 
 macro_rules! unary {
@@ -157,7 +198,13 @@ impl OpenFgaService for OpenFgaApi {
         &self,
         request: Request<pb::UpdateStoreRequest>,
     ) -> Result<Response<pb::UpdateStoreResponse>, Status> {
-        unary!(self, request, update_store)
+        authorize_unimplemented(
+            self,
+            &request,
+            Action::UpdateStore,
+            &request.get_ref().store_id,
+        )?;
+        Err(crate::ApiError::unimplemented().into())
     }
 
     async fn delete_store(
@@ -245,6 +292,7 @@ mod tests {
     use tonic::{Request, service::Interceptor};
 
     use super::GrpcAuthenticationInterceptor;
+    use crate::{AdmissionPolicy, admission::AdmissionControl};
 
     const KEY: &str = "grpc-test-preshared-key-material-with-32-bytes";
 
@@ -255,7 +303,10 @@ mod tests {
             "grpc-client".parse()?,
             &SecretString::from(KEY),
         )?])?;
-        let mut interceptor = GrpcAuthenticationInterceptor { authentication };
+        let mut interceptor = GrpcAuthenticationInterceptor {
+            authentication,
+            admission: AdmissionControl::new(AdmissionPolicy::builder().build())?,
+        };
 
         let missing = interceptor.call(Request::new(()));
         assert!(matches!(
