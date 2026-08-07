@@ -1045,11 +1045,10 @@ async fn list_users(
     Extension(principal): Extension<Principal>,
     Path(store_id): Path<String>,
     body: Result<Json<pb::ListUsersRequest>, JsonRejection>,
-) -> Result<(), ApiError> {
+) -> Result<Json<pb::ListUsersResponse>, ApiError> {
     let mut request = json(body)?;
     request.store_id.clone_from(&store_id);
-    ApiError::validate_list_users(&request)?;
-    authorize_unimplemented(&api, &principal, Action::ListUsers, &store_id)
+    api.list_users(&principal, request).await.map(Json)
 }
 
 fn authorize_unimplemented(

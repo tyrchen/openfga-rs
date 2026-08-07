@@ -1,7 +1,7 @@
 //! Reverse-candidate traversal over the actor-owned storage contract.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     error::Error,
     num::NonZeroU32,
     sync::{
@@ -15,19 +15,22 @@ use async_trait::async_trait;
 use openfga_check::{
     BatchCheckOutcome, CheckBudget, CheckError, CheckEvaluator, CheckOutcome, DirectCheckEvaluator,
 };
+use openfga_condition::{ConditionDefinition, ParameterType};
 use openfga_domain::{
-    AuthorizationModelId, BatchCheckCommand, CheckCommand, ConditionContext, ConsistencyPreference,
-    ContextualTuples, Deadline, InputLimits, Limit, ListControl, ListObjectsCommand,
-    ModelSelection, Principal, PrincipalKind, QueryContext, RelationshipTuple, RequestTimeout,
-    StoreId, TupleKey,
+    AuthorizationModelId, BatchCheckCommand, CheckCommand, ConditionBinding, ConditionContext,
+    ConditionReference, ConsistencyPreference, ContextValue, ContextualTuples, Deadline,
+    InputLimits, Limit, ListControl, ListObjectsCommand, ListUsersCommand, ModelSelection,
+    Principal, PrincipalKind, QueryContext, RelationshipTuple, RequestTimeout, StoreId, TupleKey,
+    UserTypeFilter, UserTypeFilters,
 };
 use openfga_list::{
-    Candidate, CandidateBudget, DirectListObjectsEngine, ListErrorKind, ListObjectsBudget,
-    ListObjectsEngine, ReverseCandidateTraversal,
+    Candidate, CandidateBudget, DirectListObjectsEngine, DirectListUsersEngine, ListErrorKind,
+    ListObjectsBudget, ListObjectsEngine, ListUsersBudget, ListUsersEngine,
+    ReverseCandidateTraversal,
 };
 use openfga_model::{
-    AuthorizationModelSource, CompiledModel, DirectRestrictionSource, ModelCompiler,
-    RelationSource, RestrictionKindSource, RewriteSource, TypeDefinitionSource,
+    AuthorizationModelSource, CompiledModel, ConditionSource, DirectRestrictionSource,
+    ModelCompiler, RelationSource, RestrictionKindSource, RewriteSource, TypeDefinitionSource,
 };
 use openfga_storage::{
     OperationContext, StorageCancellationToken, StoreName, StoreWriter, TupleReader,
@@ -280,6 +283,255 @@ async fn test_should_cancel_and_join_residual_checks_when_stream_is_dropped()
     Ok(())
 }
 
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the rewrite compatibility matrix shares one immutable model and tuple fixture"
+)]
+async fn test_should_list_filtered_users_across_rewrites_conditions_wildcards_and_cycles()
+-> Result<(), Box<dyn Error>> {
+    let storage = memory_storage().await?;
+    write_tuples(
+        storage.as_ref(),
+        vec![
+            tuple("document:direct#viewer@user:alice")?,
+            tuple("document:wild#viewer@user:*")?,
+            tuple("document:computed#owner@user:alice")?,
+            tuple("document:userset#viewer@group:eng#member")?,
+            tuple("document:nested#viewer@group:leads#member")?,
+            tuple("group:eng#member@user:alice")?,
+            tuple("group:leads#member@group:eng#member")?,
+            tuple("group:cycle#member@group:cycle#member")?,
+            tuple("document:cycle#viewer@group:cycle#member")?,
+            tuple("document:ttu#parent@folder:roadmap")?,
+            tuple("folder:roadmap#viewer@user:alice")?,
+            tuple("document:intersection#owner@user:*")?,
+            tuple("document:intersection#editor@user:alice")?,
+            tuple("document:included#owner@user:alice")?,
+            tuple("document:excluded#viewer@user:alice")?,
+            tuple("document:excluded#banned@user:alice")?,
+            tuple("document:public#viewer@user:*")?,
+            tuple("document:public#banned@user:alice")?,
+            conditional_tuple("document:conditional#conditional@user:alice", 10)?,
+            conditional_tuple("document:blocked#conditional@user:alice", 100)?,
+            tuple("document:bounded#viewer@user:alice")?,
+            tuple("document:bounded#viewer@user:bob")?,
+        ],
+    )
+    .await?;
+    let model = ModelCompiler::default().compile(&model()?)?;
+    let tuple_reader: Arc<dyn TupleReader> = storage.clone();
+    let engine = DirectListUsersEngine::default();
+    let user_filter = UserTypeFilter::new("user".parse()?, None);
+    for (object, relation, expected) in [
+        ("document:direct", "viewer", vec!["user:alice"]),
+        ("document:wild", "viewer", vec!["user:*"]),
+        ("document:computed", "viewer", vec!["user:alice"]),
+        ("document:userset", "viewer", vec!["user:alice"]),
+        ("document:nested", "viewer", vec!["user:alice"]),
+        ("document:cycle", "viewer", Vec::new()),
+        ("document:ttu", "viewer", vec!["user:alice"]),
+        ("document:intersection", "both", vec!["user:alice"]),
+        ("document:included", "allowed", vec!["user:alice"]),
+        ("document:excluded", "allowed", Vec::new()),
+        ("document:public", "allowed", vec!["user:*"]),
+        ("document:conditional", "conditional", vec!["user:alice"]),
+        ("document:blocked", "conditional", Vec::new()),
+    ] {
+        let outcome = engine
+            .list_users(
+                &users_command(
+                    object,
+                    relation,
+                    vec![user_filter.clone()],
+                    ContextualTuples::empty(),
+                    ConditionContext::empty(),
+                )?,
+                Arc::clone(&model),
+                Arc::clone(&tuple_reader),
+                ListUsersBudget::default(),
+                StorageCancellationToken::new(),
+            )
+            .await?;
+        assert_eq!(
+            outcome
+                .users()
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            expected,
+            "unexpected users for {object}#{relation}",
+        );
+    }
+
+    let userset_filter = UserTypeFilter::new("group".parse()?, Some("member".parse()?));
+    let outcome = engine
+        .list_users(
+            &users_command(
+                "document:userset",
+                "viewer",
+                vec![userset_filter],
+                ContextualTuples::empty(),
+                ConditionContext::empty(),
+            )?,
+            Arc::clone(&model),
+            Arc::clone(&tuple_reader),
+            ListUsersBudget::default(),
+            StorageCancellationToken::new(),
+        )
+        .await?;
+    assert_eq!(
+        outcome
+            .users()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        vec!["group:eng#member"],
+    );
+
+    let contextual = ContextualTuples::new(
+        vec![tuple("document:contextual-users#viewer@user:alice")?],
+        &InputLimits::default(),
+    )?;
+    let outcome = engine
+        .list_users(
+            &users_command(
+                "document:contextual-users",
+                "viewer",
+                vec![user_filter.clone()],
+                contextual,
+                ConditionContext::empty(),
+            )?,
+            Arc::clone(&model),
+            Arc::clone(&tuple_reader),
+            ListUsersBudget::default(),
+            StorageCancellationToken::new(),
+        )
+        .await?;
+    assert_eq!(
+        outcome
+            .users()
+            .first()
+            .ok_or("contextual ListUsers result was empty")?
+            .to_string(),
+        "user:alice",
+    );
+
+    let budget = ListUsersBudget::builder()
+        .subjects(Limit::<100_000>::new(1)?)
+        .build();
+    let error = engine
+        .list_users(
+            &users_command(
+                "document:bounded",
+                "viewer",
+                vec![user_filter],
+                ContextualTuples::empty(),
+                ConditionContext::empty(),
+            )?,
+            model,
+            tuple_reader,
+            budget,
+            StorageCancellationToken::new(),
+        )
+        .await
+        .err()
+        .ok_or("ListUsers subject ceiling unexpectedly returned a partial result")?;
+    assert_eq!(error.kind(), ListErrorKind::SubjectExceeded);
+
+    shutdown(storage).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_should_enforce_list_users_controls_and_combine_multiple_filters()
+-> Result<(), Box<dyn Error>> {
+    let storage = memory_storage().await?;
+    write_tuples(
+        storage.as_ref(),
+        vec![
+            tuple("document:controls#viewer@user:alice")?,
+            tuple("document:controls#viewer@user:bob")?,
+            tuple("document:controls#viewer@group:eng#member")?,
+            tuple("group:eng#member@user:alice")?,
+        ],
+    )
+    .await?;
+    let model = ModelCompiler::default().compile(&model()?)?;
+    let tuple_reader: Arc<dyn TupleReader> = storage.clone();
+    let engine = DirectListUsersEngine::default();
+    let user_filter = UserTypeFilter::new("user".parse()?, None);
+    let userset_filter = UserTypeFilter::new("group".parse()?, Some("member".parse()?));
+
+    let outcome = engine
+        .list_users(
+            &users_command(
+                "document:controls",
+                "viewer",
+                vec![user_filter.clone(), userset_filter],
+                ContextualTuples::empty(),
+                ConditionContext::empty(),
+            )?,
+            Arc::clone(&model),
+            Arc::clone(&tuple_reader),
+            ListUsersBudget::default(),
+            StorageCancellationToken::new(),
+        )
+        .await?;
+    assert_eq!(
+        outcome
+            .users()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        vec!["user:alice", "user:bob", "group:eng#member"],
+    );
+
+    let outcome = engine
+        .list_users(
+            &users_command_with_limit(
+                "document:controls",
+                "viewer",
+                vec![user_filter.clone()],
+                ContextualTuples::empty(),
+                ConditionContext::empty(),
+                1,
+            )?,
+            Arc::clone(&model),
+            Arc::clone(&tuple_reader),
+            ListUsersBudget::default(),
+            StorageCancellationToken::new(),
+        )
+        .await?;
+    assert_eq!(outcome.users().len(), 1);
+    assert_eq!(outcome.metadata().results(), 1);
+    assert!(outcome.metadata().truncated());
+
+    let cancellation = StorageCancellationToken::new();
+    cancellation.cancel();
+    let error = engine
+        .list_users(
+            &users_command(
+                "document:controls",
+                "viewer",
+                vec![user_filter],
+                ContextualTuples::empty(),
+                ConditionContext::empty(),
+            )?,
+            model,
+            tuple_reader,
+            ListUsersBudget::default(),
+            cancellation,
+        )
+        .await
+        .err()
+        .ok_or("cancelled ListUsers unexpectedly completed")?;
+    assert_eq!(error.kind(), ListErrorKind::Cancelled);
+
+    shutdown(storage).await?;
+    Ok(())
+}
+
 #[derive(Debug, Default)]
 struct BlockingCheckEvaluator {
     active: AtomicUsize,
@@ -331,23 +583,7 @@ fn command(
     relation: &str,
     contextual_tuples: ContextualTuples,
 ) -> Result<ListObjectsCommand, Box<dyn Error>> {
-    let query = QueryContext::builder()
-        .store_id(STORE_ID.parse::<StoreId>()?)
-        .model_selection(ModelSelection::Explicit(
-            MODEL_ID.parse::<AuthorizationModelId>()?,
-        ))
-        .consistency(ConsistencyPreference::HigherConsistency)
-        .contextual_tuples(contextual_tuples)
-        .condition_context(ConditionContext::empty())
-        .deadline(Deadline::from_timeout(
-            Instant::now(),
-            RequestTimeout::new(Duration::from_secs(5))?,
-        )?)
-        .principal(Principal::new(
-            PrincipalKind::Internal,
-            "phase3-tests".parse()?,
-        ))
-        .build();
+    let query = query_context(contextual_tuples, ConditionContext::empty())?;
     Ok(ListObjectsCommand::new(
         query,
         "document".parse()?,
@@ -359,6 +595,67 @@ fn command(
             &InputLimits::default(),
         )?,
     ))
+}
+
+fn users_command(
+    object: &str,
+    relation: &str,
+    filters: Vec<UserTypeFilter>,
+    contextual_tuples: ContextualTuples,
+    condition_context: ConditionContext,
+) -> Result<ListUsersCommand, Box<dyn Error>> {
+    users_command_with_limit(
+        object,
+        relation,
+        filters,
+        contextual_tuples,
+        condition_context,
+        100,
+    )
+}
+
+fn users_command_with_limit(
+    object: &str,
+    relation: &str,
+    filters: Vec<UserTypeFilter>,
+    contextual_tuples: ContextualTuples,
+    condition_context: ConditionContext,
+    maximum_results: u32,
+) -> Result<ListUsersCommand, Box<dyn Error>> {
+    Ok(ListUsersCommand::new(
+        query_context(contextual_tuples, condition_context)?,
+        object.parse()?,
+        relation.parse()?,
+        UserTypeFilters::new(filters, &InputLimits::default())?,
+        ListControl::new(
+            NonZeroU32::new(maximum_results).ok_or("result limit was zero")?,
+            None,
+            &InputLimits::default(),
+        )?,
+    ))
+}
+
+fn query_context(
+    contextual_tuples: ContextualTuples,
+    condition_context: ConditionContext,
+) -> Result<QueryContext, Box<dyn Error>> {
+    Ok(QueryContext::builder()
+        .store_id(STORE_ID.parse::<StoreId>()?)
+        .model_selection(ModelSelection::Explicit(
+            MODEL_ID.parse::<AuthorizationModelId>()?,
+        ))
+        .consistency(ConsistencyPreference::HigherConsistency)
+        .contextual_tuples(contextual_tuples)
+        .condition_context(condition_context)
+        .deadline(Deadline::from_timeout(
+            Instant::now(),
+            RequestTimeout::new(Duration::from_secs(5))?,
+        )?)
+        .principal(Principal::new(
+            PrincipalKind::Internal,
+            "phase3-tests".parse()?,
+        ))
+        .build())
 }
 
 async fn memory_storage() -> Result<Arc<MemoryStorage>, Box<dyn Error>> {
@@ -407,6 +704,17 @@ fn tuple(value: &str) -> Result<RelationshipTuple, Box<dyn Error>> {
     Ok(RelationshipTuple::unconditional(value.parse::<TupleKey>()?))
 }
 
+fn conditional_tuple(value: &str, x: i64) -> Result<RelationshipTuple, Box<dyn Error>> {
+    let context = ConditionContext::new(
+        BTreeMap::from([("x".parse()?, ContextValue::Int(x))]),
+        &InputLimits::default(),
+    )?;
+    Ok(RelationshipTuple::new(
+        value.parse()?,
+        ConditionReference::Conditional(ConditionBinding::new("under_limit".parse()?, context)),
+    ))
+}
+
 fn model() -> Result<AuthorizationModelSource, Box<dyn Error>> {
     let user = type_source("user", Vec::new())?;
     let group = type_source(
@@ -431,7 +739,11 @@ fn model() -> Result<AuthorizationModelSource, Box<dyn Error>> {
     let document = type_source(
         "document",
         vec![
-            relation("owner", RewriteSource::Direct, vec![object("user")?])?,
+            relation(
+                "owner",
+                RewriteSource::Direct,
+                vec![object("user")?, wildcard("user")?],
+            )?,
             relation("editor", RewriteSource::Direct, vec![object("user")?])?,
             relation("banned", RewriteSource::Direct, vec![object("user")?])?,
             relation("parent", RewriteSource::Direct, vec![object("folder")?])?,
@@ -461,6 +773,11 @@ fn model() -> Result<AuthorizationModelSource, Box<dyn Error>> {
                 },
                 Vec::new(),
             )?,
+            relation(
+                "conditional",
+                RewriteSource::Direct,
+                vec![conditional_object("user", "under_limit")?],
+            )?,
         ],
     )?;
     Ok(AuthorizationModelSource::new(
@@ -468,7 +785,14 @@ fn model() -> Result<AuthorizationModelSource, Box<dyn Error>> {
         MODEL_ID.parse()?,
         "1.1".to_owned(),
         vec![user, group, folder, document],
-        Vec::new(),
+        vec![ConditionSource::new(
+            "under_limit".parse()?,
+            ConditionDefinition::new(
+                "under_limit".parse()?,
+                "x < 50".to_owned(),
+                BTreeMap::from([("x".parse()?, ParameterType::int())]),
+            ),
+        )],
     ))
 }
 
@@ -500,6 +824,17 @@ fn wildcard(subject_type: &str) -> Result<DirectRestrictionSource, Box<dyn Error
         subject_type.parse()?,
         RestrictionKindSource::Wildcard,
         None,
+    ))
+}
+
+fn conditional_object(
+    subject_type: &str,
+    condition: &str,
+) -> Result<DirectRestrictionSource, Box<dyn Error>> {
+    Ok(DirectRestrictionSource::new(
+        subject_type.parse()?,
+        RestrictionKindSource::Object,
+        Some(condition.parse()?),
     ))
 }
 

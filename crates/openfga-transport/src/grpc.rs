@@ -469,14 +469,14 @@ impl OpenFgaService for OpenFgaApi {
         &self,
         request: Request<pb::ListUsersRequest>,
     ) -> Result<Response<pb::ListUsersResponse>, Status> {
-        let _permit = validate_unimplemented(
+        unary!(
             self,
-            &request,
-            Action::ListUsers,
-            &request.get_ref().store_id,
+            request,
+            list_users,
             EndpointClass::Enumeration,
-        )?;
-        Err(Status::unimplemented("method ListUsers not implemented"))
+            Action::ListUsers,
+            Some(request.get_ref().store_id.as_str())
+        )
     }
 }
 

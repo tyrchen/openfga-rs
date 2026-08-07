@@ -15,6 +15,7 @@ mod common;
 mod error;
 mod identifier;
 mod list_objects;
+mod list_users;
 mod model;
 mod store;
 mod tuple;
@@ -31,6 +32,7 @@ pub use identifier::{
     SystemIdentifierSourceConfig,
 };
 pub use list_objects::{ListObjectsService, ResolvedListObjectsModel};
+pub use list_users::{ListUsersService, ResolvedListUsersModel};
 pub use model::{ModelPublication, ModelService};
 pub use store::StoreService;
 pub use tuple::{ResolvedTupleWriteModel, TupleContextSizePolicy, TupleService};

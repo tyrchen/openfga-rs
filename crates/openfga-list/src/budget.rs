@@ -110,3 +110,65 @@ impl Default for ListObjectsBudget {
         Self::builder().build()
     }
 }
+
+/// Independent finite ceilings for one `ListUsers` expansion.
+#[derive(Clone, Copy, Debug, TypedBuilder)]
+#[non_exhaustive]
+pub struct ListUsersBudget {
+    #[builder(default = trusted_limit::<1_000>(25))]
+    depth: Limit<1_000>,
+    #[builder(default = trusted_limit::<1_000_000>(10_000))]
+    dispatches: Limit<1_000_000>,
+    #[builder(default = trusted_limit::<100_000>(1_000))]
+    datastore_queries: Limit<100_000>,
+    #[builder(default = trusted_limit::<1_000_000>(10_000))]
+    tuple_items: Limit<1_000_000>,
+    #[builder(default = trusted_limit::<100_000>(10_000))]
+    subjects: Limit<100_000>,
+    #[builder(default = trusted_limit::<1_000_000>(100_000))]
+    condition_cost: Limit<1_000_000>,
+}
+
+impl ListUsersBudget {
+    /// Returns the maximum recursive userset depth.
+    #[must_use]
+    pub const fn maximum_depth(self) -> u32 {
+        self.depth.get()
+    }
+
+    /// Returns the maximum rewrite and userset dispatch count.
+    #[must_use]
+    pub const fn maximum_dispatches(self) -> u32 {
+        self.dispatches.get()
+    }
+
+    /// Returns the maximum number of forward datastore reads.
+    #[must_use]
+    pub const fn maximum_datastore_queries(self) -> u32 {
+        self.datastore_queries.get()
+    }
+
+    /// Returns the maximum number of stored and contextual tuples inspected.
+    #[must_use]
+    pub const fn maximum_tuple_items(self) -> u32 {
+        self.tuple_items.get()
+    }
+
+    /// Returns the maximum symbolic members or exclusions retained by one set.
+    #[must_use]
+    pub const fn maximum_subjects(self) -> u32 {
+        self.subjects.get()
+    }
+
+    /// Returns the maximum cumulative CEL condition evaluation cost.
+    #[must_use]
+    pub const fn maximum_condition_cost(self) -> u32 {
+        self.condition_cost.get()
+    }
+}
+
+impl Default for ListUsersBudget {
+    fn default() -> Self {
+        Self::builder().build()
+    }
+}

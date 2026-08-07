@@ -3,12 +3,14 @@
 use std::fmt;
 
 use openfga_check::{CheckError, CheckErrorKind};
+use openfga_condition::EvaluationError;
 use openfga_model::{ModelLookupError, TupleValidationError};
 use openfga_storage::{StorageError, StorageErrorKind};
 use thiserror::Error;
 
 /// Stable reverse-enumeration failure category.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum ListErrorKind {
     /// The selected model does not own or describe the query.
     InvalidModel,
@@ -24,6 +26,10 @@ pub enum ListErrorKind {
     TupleItemExceeded,
     /// The distinct intermediate-candidate ceiling was exhausted.
     CandidateExceeded,
+    /// The symbolic subject-set ceiling was exhausted.
+    SubjectExceeded,
+    /// The cumulative condition evaluation cost was exhausted.
+    ConditionCostExceeded,
     /// Tuple storage is temporarily unavailable.
     StorageUnavailable,
     /// The request deadline elapsed.
@@ -38,6 +44,8 @@ pub enum ListErrorKind {
 enum ListErrorSource {
     #[error(transparent)]
     Check(CheckError),
+    #[error(transparent)]
+    Condition(EvaluationError),
     #[error(transparent)]
     Storage(StorageError),
     #[error(transparent)]
@@ -70,6 +78,14 @@ impl ListError {
             kind: ListErrorKind::InvalidModel,
             code,
             source: Some(ListErrorSource::Model(source)),
+        }
+    }
+
+    pub(crate) const fn condition(code: &'static str, source: EvaluationError) -> Self {
+        Self {
+            kind: ListErrorKind::InvalidTuple,
+            code,
+            source: Some(ListErrorSource::Condition(source)),
         }
     }
 

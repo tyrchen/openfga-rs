@@ -1581,10 +1581,12 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "openfga-check",
+ "openfga-condition",
  "openfga-domain",
  "openfga-model",
  "openfga-storage",
  "openfga-storage-memory",
+ "proptest",
  "thiserror 2.0.19",
  "tokio",
  "tokio-stream",

@@ -42,6 +42,7 @@ pub(crate) struct ServerConfig {
     pub(crate) transport: TransportPolicy,
     pub(crate) evaluator: EvaluatorPolicy,
     pub(crate) list_objects: ListObjectsPolicy,
+    pub(crate) list_users: ListUsersPolicy,
     pub(crate) telemetry: TelemetryConfig,
     pub(crate) shutdown: ShutdownConfig,
 }
@@ -379,6 +380,36 @@ impl Default for ListObjectsPolicy {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ListUsersPolicy {
+    #[serde(default = "default_depth")]
+    pub(crate) depth: u32,
+    #[serde(default = "default_dispatches")]
+    pub(crate) dispatches: u32,
+    #[serde(default = "default_candidate_datastore_queries")]
+    pub(crate) datastore_queries: u32,
+    #[serde(default = "default_tuple_items")]
+    pub(crate) tuple_items: u32,
+    #[serde(default = "default_candidates")]
+    pub(crate) subjects: u32,
+    #[serde(default = "default_condition_cost")]
+    pub(crate) condition_cost: u32,
+}
+
+impl Default for ListUsersPolicy {
+    fn default() -> Self {
+        Self {
+            depth: default_depth(),
+            dispatches: default_dispatches(),
+            datastore_queries: default_candidate_datastore_queries(),
+            tuple_items: default_tuple_items(),
+            subjects: default_candidates(),
+            condition_cost: default_condition_cost(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) enum LogFormat {
@@ -443,6 +474,8 @@ struct RawServerConfig {
     #[serde(default)]
     list_objects: ListObjectsPolicy,
     #[serde(default)]
+    list_users: ListUsersPolicy,
+    #[serde(default)]
     telemetry: TelemetryConfig,
     #[serde(default)]
     shutdown: ShutdownConfig,
@@ -459,6 +492,7 @@ impl From<RawServerConfig> for ServerConfig {
             transport: raw.transport,
             evaluator: raw.evaluator,
             list_objects: raw.list_objects,
+            list_users: raw.list_users,
             telemetry: raw.telemetry,
             shutdown: raw.shutdown,
         }
@@ -500,6 +534,7 @@ impl ServerConfig {
         self.validate_transport()?;
         self.validate_evaluator()?;
         self.validate_list_objects()?;
+        self.validate_list_users()?;
         self.validate_database_concurrency()?;
         self.validate_telemetry()?;
         bounded_duration(
@@ -854,6 +889,21 @@ impl ServerConfig {
             .context("ListObjects residual concurrency is invalid")?;
         Limit::<1_024>::new(self.list_objects.stream_buffer)
             .context("ListObjects stream buffer is invalid")?;
+        Ok(())
+    }
+
+    fn validate_list_users(&self) -> Result<()> {
+        Limit::<1_000>::new(self.list_users.depth).context("ListUsers depth is invalid")?;
+        Limit::<1_000_000>::new(self.list_users.dispatches)
+            .context("ListUsers dispatch limit is invalid")?;
+        Limit::<100_000>::new(self.list_users.datastore_queries)
+            .context("ListUsers datastore query limit is invalid")?;
+        Limit::<1_000_000>::new(self.list_users.tuple_items)
+            .context("ListUsers tuple item limit is invalid")?;
+        Limit::<100_000>::new(self.list_users.subjects)
+            .context("ListUsers subject limit is invalid")?;
+        Limit::<1_000_000>::new(self.list_users.condition_cost)
+            .context("ListUsers condition cost is invalid")?;
         Ok(())
     }
 
@@ -1295,6 +1345,10 @@ evaluator: {}
         assert!(config.validate().is_err());
 
         config.list_objects.stream_buffer = 16;
+        config.list_users.subjects = 0;
+        assert!(config.validate().is_err());
+
+        config.list_users.subjects = 10_000;
         config.tls.reload_interval_seconds = 0;
         assert!(config.validate().is_err());
         Ok(())

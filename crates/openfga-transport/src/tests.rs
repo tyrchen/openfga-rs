@@ -19,7 +19,7 @@ use openfga_domain::{
     AuthorizationModelId, FingerprintBuilder, InputLimits, Principal, PrincipalId, PrincipalKind,
     RequestTimeout, StoreId, TokenCodec, TokenKey, TokenKeyId, TokenOperation,
 };
-use openfga_list::ListObjectsBudget;
+use openfga_list::{ListObjectsBudget, ListUsersBudget};
 use openfga_model::ModelCompiler;
 use openfga_proto::openfga::{
     v1 as pb,
@@ -27,8 +27,8 @@ use openfga_proto::openfga::{
 };
 use openfga_service::{
     AssertionService, ChangeService, CheckService, IdentifierSource, IdentifierSourceError,
-    ListObjectsService, ModelPublication, ModelService, ServiceClock, ServiceError, StoreService,
-    TupleService,
+    ListObjectsService, ListUsersService, ModelPublication, ModelService, ServiceClock,
+    ServiceError, StoreService, TupleService,
 };
 use openfga_storage::{
     AssertionReader, AssertionWriter, ChangeReader, ModelReader, ModelWriter, OperationContext,
@@ -141,9 +141,15 @@ fn test_runtime(maximum_message_bytes: usize) -> Result<TestRuntime, Box<dyn Err
                 CheckBudget::default(),
             ))
             .list_objects(ListObjectsService::direct(
+                Arc::clone(&models),
+                Arc::clone(&tuples),
+                ListObjectsBudget::default(),
+                limits.clone(),
+            ))
+            .list_users(ListUsersService::direct(
                 models,
                 tuples,
-                ListObjectsBudget::default(),
+                ListUsersBudget::default(),
                 limits.clone(),
             ))
             .build(),
@@ -1781,6 +1787,27 @@ async fn test_should_execute_implemented_use_cases_through_shared_wire_adapter()
         "document:roadmap",
     );
 
+    let listed_users = api.list_users(&principal, list_users_request()).await?;
+    assert_eq!(listed_users.users.len(), 1);
+    assert!(matches!(
+        listed_users.users.first().and_then(|user| user.user.as_ref()),
+        Some(pb::user::User::Object(user))
+            if user.r#type == "user" && user.id == "anne"
+    ));
+    let response = router
+        .clone()
+        .oneshot(
+            Request::post(format!("/stores/{STORE_ID}/list-users"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&list_users_request())?))?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let listed_users = serde_json::from_slice::<pb::ListUsersResponse>(
+        &to_bytes(response.into_body(), 1_024).await?,
+    )?;
+    assert_eq!(listed_users.users.len(), 1);
+
     let assertion = pb::Assertion {
         tuple_key: Some(pb::AssertionTupleKey {
             object: "document:roadmap".to_owned(),
@@ -1891,14 +1918,14 @@ async fn assert_grpc_endpoint_admission(
     authentication: AuthenticationService,
 ) -> Result<(), Box<dyn Error>> {
     let one = NonZeroU32::MIN;
-    let two = NonZeroU32::new(2).ok_or("enumeration admission limit was zero")?;
+    let three = NonZeroU32::new(3).ok_or("enumeration admission limit was zero")?;
     api.admission = crate::admission::AdmissionControl::new(
         AdmissionPolicy::builder()
             .administration(one)
             .reads(one)
             .writes(one)
             .checks(one)
-            .enumeration(two)
+            .enumeration(three)
             .build(),
     )?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -1986,6 +2013,8 @@ async fn assert_grpc_endpoint_admission(
             "document:roadmap",
         );
         assert!(listed_stream.message().await?.is_none());
+        let listed_users = client.list_users(list_users_request()).await?.into_inner();
+        assert_eq!(listed_users.users.len(), 1);
         let error = client
             .list_objects(list_objects_request())
             .await
@@ -2346,6 +2375,25 @@ fn streamed_list_objects_request() -> pb::StreamedListObjectsRequest {
         contextual_tuples: request.contextual_tuples,
         context: request.context,
         consistency: request.consistency,
+    }
+}
+
+fn list_users_request() -> pb::ListUsersRequest {
+    pb::ListUsersRequest {
+        store_id: STORE_ID.to_owned(),
+        authorization_model_id: MODEL_ID.to_owned(),
+        object: Some(pb::Object {
+            r#type: "document".to_owned(),
+            id: "roadmap".to_owned(),
+        }),
+        relation: "viewer".to_owned(),
+        user_filters: vec![pb::UserTypeFilter {
+            r#type: "user".to_owned(),
+            relation: String::new(),
+        }],
+        contextual_tuples: Vec::new(),
+        context: None,
+        consistency: 0,
     }
 }
 

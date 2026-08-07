@@ -8,9 +8,9 @@ use std::{
 use openfga_condition::{ConditionDefinition, ParameterType, ParameterTypeRef};
 use openfga_domain::{
     AuthorizationModelId, ConditionBinding, ConditionContext, ConditionName, ConditionReference,
-    ContextValue, ContextualTuples, DomainError, InputLimits, ModelSelection, ObjectRef,
+    ContextValue, ContextualTuples, DomainError, InputLimits, ModelSelection, ObjectId, ObjectRef,
     ParameterName, ParseKind, RelationName, RelationshipTuple, StoreId, SubjectRef, TupleKey,
-    TypeName, ValidationReason,
+    TypeName, UserTypeFilter, ValidationReason,
 };
 use openfga_model::{
     AuthorizationModelDefinition, ConditionParameterTypeError, ConditionSource,
@@ -61,6 +61,50 @@ pub(crate) fn relation_name(value: &str, limits: &InputLimits) -> Result<Relatio
 
 pub(crate) fn subject_ref(value: &str, limits: &InputLimits) -> Result<SubjectRef, ApiError> {
     SubjectRef::parse_with_limits(value, limits).map_err(|_| ApiError::invalid_user())
+}
+
+pub(crate) fn object_ref(
+    object_type: &str,
+    object_id: &str,
+    limits: &InputLimits,
+) -> Result<ObjectRef, ApiError> {
+    let object_type = TypeName::parse_with_limits(object_type, limits)
+        .map_err(|_| ApiError::invalid_request())?;
+    let object_id =
+        ObjectId::parse_with_limits(object_id, limits).map_err(|_| ApiError::invalid_request())?;
+    ObjectRef::new(object_type, object_id, limits).map_err(|_| ApiError::invalid_request())
+}
+
+pub(crate) fn user_type_filter(
+    filter: &pb::UserTypeFilter,
+    limits: &InputLimits,
+) -> Result<UserTypeFilter, ApiError> {
+    let relation = (!filter.relation.is_empty())
+        .then(|| relation_name(&filter.relation, limits))
+        .transpose()?;
+    Ok(UserTypeFilter::new(
+        type_name(&filter.r#type, limits)?,
+        relation,
+    ))
+}
+
+pub(crate) fn user(subject: &SubjectRef) -> Result<pb::User, ApiError> {
+    let user = match subject {
+        SubjectRef::Object(object) => pb::user::User::Object(pb::Object {
+            r#type: object.object_type().to_string(),
+            id: object.object_id().to_string(),
+        }),
+        SubjectRef::Userset(userset) => pb::user::User::Userset(pb::UsersetUser {
+            r#type: userset.object().object_type().to_string(),
+            id: userset.object().object_id().to_string(),
+            relation: userset.relation().to_string(),
+        }),
+        SubjectRef::TypedWildcard(object_type) => pb::user::User::Wildcard(pb::TypedWildcard {
+            r#type: object_type.to_string(),
+        }),
+        _ => return Err(ApiError::internal()),
+    };
+    Ok(pb::User { user: Some(user) })
 }
 
 pub(crate) fn tuple_key(

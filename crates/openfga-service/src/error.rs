@@ -468,11 +468,13 @@ impl From<ListError> for ServiceError {
             | ListErrorKind::DispatchExceeded
             | ListErrorKind::DatastoreQueryExceeded
             | ListErrorKind::TupleItemExceeded
-            | ListErrorKind::CandidateExceeded => ServiceErrorKind::ResourceExhausted,
+            | ListErrorKind::CandidateExceeded
+            | ListErrorKind::SubjectExceeded
+            | ListErrorKind::ConditionCostExceeded => ServiceErrorKind::ResourceExhausted,
             ListErrorKind::StorageUnavailable => ServiceErrorKind::Unavailable,
             ListErrorKind::Timeout => ServiceErrorKind::Timeout,
             ListErrorKind::Cancelled => ServiceErrorKind::Cancelled,
-            ListErrorKind::Internal => ServiceErrorKind::Internal,
+            _ => ServiceErrorKind::Internal,
         };
         let code = source.code();
         Self {

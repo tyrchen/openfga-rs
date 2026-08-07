@@ -7,8 +7,7 @@ use std::{
 };
 
 use openfga_domain::{
-    ConditionReference, InputLimits, ListObjectsCommand, ModelSelection, ObjectRef, SubjectRef,
-    UsersetRef,
+    ConditionReference, InputLimits, ListObjectsCommand, ObjectRef, SubjectRef, UsersetRef,
 };
 use openfga_model::{CompiledModel, NodeId, RelationId, RestrictionKind, RewriteNode};
 use openfga_storage::{
@@ -16,7 +15,7 @@ use openfga_storage::{
     TupleReader,
 };
 
-use crate::{CandidateBudget, ListError, ListErrorKind};
+use crate::{CandidateBudget, ListError, ListErrorKind, common::validate_query_model};
 
 /// One canonical object discovered by conservative reverse traversal.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -137,7 +136,7 @@ impl ReverseCandidateTraversal {
         budget: CandidateBudget,
         cancellation: StorageCancellationToken,
     ) -> Result<CandidateSet, ListError> {
-        validate_model(command, &model)?;
+        validate_query_model(command.query(), &model)?;
         for tuple in command.query().contextual_tuples().as_slice() {
             model.validate_relationship_tuple(tuple)?;
         }
@@ -774,26 +773,6 @@ impl<'a> Traversal<'a> {
             ));
         }
         Ok(())
-    }
-}
-
-fn validate_model(command: &ListObjectsCommand, model: &CompiledModel) -> Result<(), ListError> {
-    if model.store_id() != &command.query().store_id() {
-        return Err(ListError::new(
-            ListErrorKind::InvalidModel,
-            "list_model_store_mismatch",
-        ));
-    }
-    match command.query().model_selection() {
-        ModelSelection::Explicit(model_id) if model.model_id() != &model_id => Err(ListError::new(
-            ListErrorKind::InvalidModel,
-            "list_model_id_mismatch",
-        )),
-        ModelSelection::Explicit(_) | ModelSelection::Latest => Ok(()),
-        _ => Err(ListError::new(
-            ListErrorKind::InvalidModel,
-            "list_model_selection_unsupported",
-        )),
     }
 }
 

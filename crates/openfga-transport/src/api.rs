@@ -14,8 +14,8 @@ use openfga_auth::Action;
 use openfga_check::{CheckError, CheckErrorKind, CheckResolution};
 use openfga_domain::{
     BatchCheckCommand, BatchCheckItem, BatchCheckItems, CheckCommand, ConsistencyPreference,
-    CorrelationId, Deadline, ListControl, ListObjectsCommand, ModelSelection, Principal,
-    QueryContext, StoreId, TokenOperation, TypeName,
+    CorrelationId, Deadline, ListControl, ListObjectsCommand, ListUsersCommand, ModelSelection,
+    Principal, QueryContext, StoreId, TokenOperation, TypeName, UserTypeFilters,
 };
 use openfga_list::ListObjectsStream;
 use openfga_proto::openfga::v1 as pb;
@@ -875,6 +875,85 @@ impl OpenFgaApi {
             ListControl::new(maximum_results, None, &self.config.limits)
                 .map_err(|_| ApiError::invalid_request())?,
         ))
+    }
+
+    #[tracing::instrument(skip_all, fields(operation = "list_users"))]
+    pub(crate) async fn list_users(
+        &self,
+        principal: &Principal,
+        request: pb::ListUsersRequest,
+    ) -> Result<pb::ListUsersResponse, ApiError> {
+        self.preauthorize(principal, Action::ListUsers, Some(&request.store_id))?;
+        ApiError::validate_list_users(&request)?;
+        self.authorize_store(principal, Action::ListUsers, &request.store_id)?;
+        let store_id = convert::store_id(&request.store_id)?;
+        let model_selection = convert::model_selection(&request.authorization_model_id)?;
+        let consistency = consistency(request.consistency)?;
+        let deadline = self.deadline()?;
+        let cancellation = RequestCancellation::new();
+        let model = self
+            .services
+            .list_users
+            .resolve_transport_model(
+                store_id,
+                model_selection,
+                consistency,
+                deadline,
+                cancellation.token(),
+            )
+            .await
+            .map_err(ApiError::from)?;
+        let Some(object) = request.object else {
+            return Err(ApiError::invalid_request());
+        };
+        let query = QueryContext::builder()
+            .store_id(store_id)
+            .model_selection(model_selection)
+            .consistency(consistency)
+            .contextual_tuples(convert::contextual_tuples_for_wire_semantics(
+                Some(pb::ContextualTupleKeys {
+                    tuple_keys: request.contextual_tuples,
+                }),
+                &self.config.limits,
+                self.config.maximum_message_bytes,
+            )?)
+            .condition_context(convert::condition_context_for_wire_semantics(
+                request.context,
+                &self.config.limits,
+                self.config.maximum_message_bytes,
+            )?)
+            .deadline(deadline)
+            .principal(principal.clone())
+            .build();
+        let filters = request
+            .user_filters
+            .into_iter()
+            .map(|filter| convert::user_type_filter(&filter, &self.config.limits))
+            .collect::<Result<Vec<_>, _>>()?;
+        let maximum_results =
+            NonZeroU32::new(self.config.limits.results()).ok_or_else(ApiError::invalid_request)?;
+        let command = ListUsersCommand::new(
+            query,
+            convert::object_ref(&object.r#type, &object.id, &self.config.limits)?,
+            convert::relation_name(&request.relation, &self.config.limits)?,
+            UserTypeFilters::new(filters, &self.config.limits)
+                .map_err(|_| ApiError::invalid_request())?,
+            ListControl::new(maximum_results, None, &self.config.limits)
+                .map_err(|_| ApiError::invalid_request())?,
+        );
+        let outcome = self
+            .services
+            .list_users
+            .list_users_resolved(&command, model, cancellation.token())
+            .await
+            .map_err(ApiError::from)?;
+        Ok(pb::ListUsersResponse {
+            users: outcome
+                .users()
+                .iter()
+                .map(convert::user)
+                .collect::<Result<Vec<_>, _>>()?,
+        })
     }
 
     pub(crate) fn authorize_store(
