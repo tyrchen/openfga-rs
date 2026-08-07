@@ -1245,6 +1245,8 @@ pub(crate) fn go_fixture_tuples() -> Vec<Value> {
     vec![
         json!({"object": "document:direct", "relation": "viewer", "user": "user:anne"}),
         json!({"object": "document:wild", "relation": "viewer", "user": "user:*"}),
+        json!({"object": "document:wild-plus", "relation": "viewer", "user": "user:*"}),
+        json!({"object": "document:wild-plus", "relation": "viewer", "user": "user:will"}),
         json!({"object": "document:userset", "relation": "viewer", "user": "group:eng#member"}),
         json!({"object": "group:eng", "relation": "member", "user": "user:bob"}),
         json!({"object": "document:computed", "relation": "owner", "user": "user:anne"}),

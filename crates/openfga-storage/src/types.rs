@@ -4,7 +4,8 @@ use std::{collections::BTreeSet, fmt, num::NonZeroU32, sync::Arc, time::SystemTi
 
 use openfga_domain::{
     AuthorizationModelId, ChangeId, ConditionContext, ConditionName, ContextualTuples, InputLimits,
-    ObjectId, ObjectRef, RelationName, RelationshipTuple, StoreId, SubjectRef, TupleKey, TypeName,
+    Limit, ObjectId, ObjectRef, RelationName, RelationshipTuple, StoreId, SubjectRef, TupleKey,
+    TypeName,
 };
 use openfga_model::{AuthorizationModelSource, CompiledModel};
 
@@ -547,7 +548,7 @@ impl ConditionFilter {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct ReadOptions {
-    maximum_results: NonZeroU32,
+    maximum_results: Limit<100_000>,
 }
 
 impl ReadOptions {
@@ -563,13 +564,26 @@ impl ReadOptions {
                 "tuple_read_result_limit",
             ));
         }
+        let maximum_results = Limit::new(maximum_results.get()).map_err(|error| {
+            StorageError::with_source(
+                StorageErrorKind::ResourceExhausted,
+                "tuple_read_result_limit",
+                error,
+            )
+        })?;
         Ok(Self { maximum_results })
+    }
+
+    /// Creates storage read options from an independently validated internal limit.
+    #[must_use]
+    pub const fn from_limit(maximum_results: Limit<100_000>) -> Self {
+        Self { maximum_results }
     }
 
     /// Returns the maximum number of owned tuples.
     #[must_use]
     pub const fn maximum_results(self) -> usize {
-        self.maximum_results.get() as usize
+        self.maximum_results.as_usize()
     }
 }
 
@@ -981,8 +995,12 @@ impl PageOptions {
     /// Creates a first-page request from an already validated read ceiling.
     #[must_use]
     pub const fn from_read_options(options: ReadOptions) -> Self {
+        let maximum_results = match NonZeroU32::new(options.maximum_results.get()) {
+            Some(maximum_results) => maximum_results,
+            None => NonZeroU32::MIN,
+        };
         Self {
-            maximum_results: options.maximum_results,
+            maximum_results,
             after: None,
         }
     }

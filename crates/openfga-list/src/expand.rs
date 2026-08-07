@@ -7,14 +7,13 @@ use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
     future::Future,
-    num::NonZeroU32,
     pin::Pin,
     sync::Arc,
 };
 
 use async_trait::async_trait;
 use openfga_domain::{
-    ExpandCommand, InputLimits, ObjectRef, RelationshipTuple, SubjectRef, UsersetRef,
+    ExpandCommand, InputLimits, Limit, ObjectRef, RelationshipTuple, SubjectRef, UsersetRef,
 };
 use openfga_model::{CompiledModel, NodeId, RelationId, RewriteNode};
 use openfga_storage::{
@@ -270,10 +269,9 @@ impl<'a> Evaluator<'a> {
         input_limits: InputLimits,
         operation: OperationContext,
     ) -> Result<Self, ListError> {
-        let maximum_per_read = budget.maximum_tuple_items().min(input_limits.results());
-        let maximum_per_read = NonZeroU32::new(maximum_per_read)
-            .ok_or_else(|| internal("expand_forward_read_limit_zero"))?;
-        let read_options = ReadOptions::new(maximum_per_read, &input_limits)?;
+        let maximum_per_read = Limit::<100_000>::new(budget.maximum_tuple_items().min(100_000))
+            .map_err(|_| internal("expand_forward_read_limit_invalid"))?;
+        let read_options = ReadOptions::from_limit(maximum_per_read);
         Ok(Self {
             command,
             model,
@@ -494,12 +492,6 @@ impl<'a> Evaluator<'a> {
         while let Some(row) = stream.next_item() {
             self.operation.check().map_err(ListError::from)?;
             rows.push(row?);
-        }
-        if rows.len() == self.read_options.maximum_results() {
-            return Err(ListError::new(
-                ListErrorKind::TupleItemExceeded,
-                "expand_forward_read_may_be_truncated",
-            ));
         }
         let contextual = self
             .command

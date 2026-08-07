@@ -6,7 +6,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     future::Future,
-    num::NonZeroU32,
     pin::Pin,
     sync::Arc,
 };
@@ -14,8 +13,8 @@ use std::{
 use async_trait::async_trait;
 use openfga_condition::{CancellationCheck, EvaluationBudget, EvaluationErrorKind};
 use openfga_domain::{
-    ConditionReference, InputLimits, ListUsersCommand, ObjectRef, RelationshipTuple, SubjectRef,
-    UserTypeFilter, UsersetRef,
+    ConditionReference, InputLimits, Limit, ListUsersCommand, ObjectRef, RelationshipTuple,
+    SubjectRef, UserTypeFilter, UsersetRef,
 };
 use openfga_model::{CompiledModel, NodeId, RelationId, RewriteNode};
 use openfga_storage::{
@@ -266,10 +265,9 @@ impl<'a> Evaluator<'a> {
         input_limits: InputLimits,
         operation: OperationContext,
     ) -> Result<Self, ListError> {
-        let maximum_per_read = budget.maximum_tuple_items().min(input_limits.results());
-        let maximum_per_read = NonZeroU32::new(maximum_per_read)
-            .ok_or_else(|| internal("list_users_forward_read_limit_zero"))?;
-        let read_options = ReadOptions::new(maximum_per_read, &input_limits)?;
+        let maximum_per_read = Limit::<100_000>::new(budget.maximum_tuple_items().min(100_000))
+            .map_err(|_| internal("list_users_forward_read_limit_invalid"))?;
+        let read_options = ReadOptions::from_limit(maximum_per_read);
         Ok(Self {
             command,
             model,
@@ -440,7 +438,10 @@ impl<'a> Evaluator<'a> {
                     SubjectRef::TypedWildcard(_)
                         if filter_matches(&filter, tuple.key().subject()) =>
                     {
-                        set = set.union(SymbolicSet::Cofinite(BTreeSet::new()));
+                        set = set.union(SymbolicSet::Cofinite {
+                            excluded: BTreeSet::new(),
+                            included: BTreeSet::new(),
+                        });
                     }
                     subject if filter_matches(&filter, subject) => {
                         set = set.union(SymbolicSet::singleton(subject.clone()));
@@ -592,27 +593,24 @@ impl<'a> Evaluator<'a> {
         while let Some(row) = stream.next_item() {
             rows.push(row?);
         }
-        if rows.len() == self.read_options.maximum_results() {
-            return Err(ListError::new(
-                ListErrorKind::TupleItemExceeded,
-                "list_users_forward_read_may_be_truncated",
-            ));
-        }
-        rows.extend(
-            self.command
-                .query()
-                .contextual_tuples()
-                .as_slice()
-                .iter()
-                .filter(|tuple| {
-                    tuple.key().object() == &object && tuple.key().relation() == &relation_name
-                })
-                .cloned(),
-        );
-        self.charge_tuple_items(rows.len())?;
-        for tuple in &rows {
-            self.model.validate_relationship_tuple(tuple)?;
-        }
+        let contextual = self
+            .command
+            .query()
+            .contextual_tuples()
+            .as_slice()
+            .iter()
+            .filter(|tuple| {
+                tuple.key().object() == &object && tuple.key().relation() == &relation_name
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        self.charge_tuple_items(
+            rows.len()
+                .checked_add(contextual.len())
+                .ok_or_else(tuple_items_exceeded)?,
+        )?;
+        rows.retain(|tuple| self.model.validate_relationship_tuple(tuple).is_ok());
+        rows.extend(contextual);
         let rows = Arc::<[RelationshipTuple]>::from(rows);
         self.tuple_cache.insert(key, Arc::clone(&rows));
         Ok(rows)
@@ -757,7 +755,10 @@ impl Expansion {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum SymbolicSet<T: Ord> {
     Finite(BTreeSet<T>),
-    Cofinite(BTreeSet<T>),
+    Cofinite {
+        excluded: BTreeSet<T>,
+        included: BTreeSet<T>,
+    },
 }
 
 impl<T: Ord> SymbolicSet<T> {
@@ -775,14 +776,37 @@ impl<T: Ord> SymbolicSet<T> {
                 left.append(&mut right);
                 Self::Finite(left)
             }
-            (Self::Cofinite(mut excluded), Self::Finite(included))
-            | (Self::Finite(included), Self::Cofinite(mut excluded)) => {
-                excluded.retain(|value| !included.contains(value));
-                Self::Cofinite(excluded)
+            (
+                Self::Cofinite {
+                    mut excluded,
+                    mut included,
+                },
+                Self::Finite(values),
+            )
+            | (
+                Self::Finite(values),
+                Self::Cofinite {
+                    mut excluded,
+                    mut included,
+                },
+            ) => {
+                excluded.retain(|value| !values.contains(value));
+                included.extend(values);
+                Self::Cofinite { excluded, included }
             }
-            (Self::Cofinite(mut left), Self::Cofinite(right)) => {
-                left.retain(|value| right.contains(value));
-                Self::Cofinite(left)
+            (
+                Self::Cofinite {
+                    mut excluded,
+                    mut included,
+                },
+                Self::Cofinite {
+                    excluded: right_excluded,
+                    included: right_included,
+                },
+            ) => {
+                included.extend(right_included);
+                excluded.retain(|value| right_excluded.contains(value));
+                Self::Cofinite { excluded, included }
             }
         }
     }
@@ -793,14 +817,25 @@ impl<T: Ord> SymbolicSet<T> {
                 left.retain(|value| right.contains(value));
                 Self::Finite(left)
             }
-            (Self::Cofinite(excluded), Self::Finite(mut included))
-            | (Self::Finite(mut included), Self::Cofinite(excluded)) => {
+            (Self::Cofinite { excluded, .. }, Self::Finite(mut included))
+            | (Self::Finite(mut included), Self::Cofinite { excluded, .. }) => {
                 included.retain(|value| !excluded.contains(value));
                 Self::Finite(included)
             }
-            (Self::Cofinite(mut left), Self::Cofinite(mut right)) => {
-                left.append(&mut right);
-                Self::Cofinite(left)
+            (
+                Self::Cofinite {
+                    mut excluded,
+                    mut included,
+                },
+                Self::Cofinite {
+                    excluded: right_excluded,
+                    included: right_included,
+                },
+            ) => {
+                excluded.extend(right_excluded);
+                included.extend(right_included);
+                included.retain(|value| !excluded.contains(value));
+                Self::Cofinite { excluded, included }
             }
         }
     }
@@ -811,15 +846,31 @@ impl<T: Ord> SymbolicSet<T> {
                 left.retain(|value| !right.contains(value));
                 Self::Finite(left)
             }
-            (Self::Finite(mut included), Self::Cofinite(excluded)) => {
+            (Self::Finite(mut included), Self::Cofinite { excluded, .. }) => {
                 included.retain(|value| excluded.contains(value));
                 Self::Finite(included)
             }
-            (Self::Cofinite(mut excluded), Self::Finite(mut removed)) => {
+            (
+                Self::Cofinite {
+                    mut excluded,
+                    mut included,
+                },
+                Self::Finite(mut removed),
+            ) => {
+                included.retain(|value| !removed.contains(value));
                 excluded.append(&mut removed);
-                Self::Cofinite(excluded)
+                Self::Cofinite { excluded, included }
             }
-            (Self::Cofinite(left_excluded), Self::Cofinite(mut right_excluded)) => {
+            (
+                Self::Cofinite {
+                    excluded: left_excluded,
+                    ..
+                },
+                Self::Cofinite {
+                    excluded: mut right_excluded,
+                    ..
+                },
+            ) => {
                 right_excluded.retain(|value| !left_excluded.contains(value));
                 Self::Finite(right_excluded)
             }
@@ -828,7 +879,8 @@ impl<T: Ord> SymbolicSet<T> {
 
     fn tracked_len(&self) -> usize {
         match self {
-            Self::Finite(values) | Self::Cofinite(values) => values.len(),
+            Self::Finite(values) => values.len(),
+            Self::Cofinite { excluded, included } => excluded.len().saturating_add(included.len()),
         }
     }
 }
@@ -837,8 +889,13 @@ impl SymbolicSet<SubjectRef> {
     fn into_subjects(self, filter: &UserTypeFilter) -> BTreeSet<SubjectRef> {
         match self {
             Self::Finite(subjects) => subjects,
-            Self::Cofinite(_) => {
-                BTreeSet::from([SubjectRef::TypedWildcard(filter.user_type().clone())])
+            Self::Cofinite {
+                excluded,
+                mut included,
+            } => {
+                included.retain(|subject| !excluded.contains(subject));
+                included.insert(SubjectRef::TypedWildcard(filter.user_type().clone()));
+                included
             }
         }
     }
@@ -900,8 +957,9 @@ const fn condition_cost_exceeded() -> ListError {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::{collections::BTreeSet, error::Error};
 
+    use openfga_domain::{SubjectRef, UserTypeFilter};
     use proptest::prelude::*;
 
     use super::SymbolicSet;
@@ -935,9 +993,48 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_should_preserve_explicit_users_through_wildcard_set_composition()
+    -> Result<(), Box<dyn Error>> {
+        let filter = UserTypeFilter::new("user".parse()?, None);
+        let wildcard = SymbolicSet::Cofinite {
+            excluded: BTreeSet::new(),
+            included: BTreeSet::new(),
+        };
+        let maria = "user:maria".parse::<SubjectRef>()?;
+        let jon = "user:jon".parse::<SubjectRef>()?;
+        let will = "user:will".parse::<SubjectRef>()?;
+
+        let base = wildcard
+            .clone()
+            .union(SymbolicSet::singleton(maria.clone()))
+            .union(SymbolicSet::singleton(jon.clone()));
+        let excluded = SymbolicSet::Finite(BTreeSet::from([jon.clone(), will]));
+        let visible = base.difference(excluded);
+        assert_eq!(
+            visible.clone().into_subjects(&filter),
+            BTreeSet::from([maria.clone(), SubjectRef::TypedWildcard("user".parse()?),]),
+        );
+
+        let intersected = visible.intersection(wildcard.clone());
+        assert_eq!(
+            intersected.into_subjects(&filter),
+            BTreeSet::from([maria, SubjectRef::TypedWildcard("user".parse()?)]),
+        );
+
+        let restored = wildcard
+            .clone()
+            .difference(wildcard.difference(SymbolicSet::singleton(jon.clone())));
+        assert_eq!(restored.into_subjects(&filter), BTreeSet::from([jon]));
+        Ok(())
+    }
+
     fn symbolic(universe: &BTreeSet<u8>, values: &BTreeSet<u8>, wildcard: bool) -> SymbolicSet<u8> {
         if wildcard {
-            SymbolicSet::Cofinite(universe.difference(values).copied().collect())
+            SymbolicSet::Cofinite {
+                excluded: universe.difference(values).copied().collect(),
+                included: BTreeSet::new(),
+            }
         } else {
             SymbolicSet::Finite(values.clone())
         }
@@ -946,7 +1043,9 @@ mod tests {
     fn concrete(universe: &BTreeSet<u8>, set: &SymbolicSet<u8>) -> BTreeSet<u8> {
         match set {
             SymbolicSet::Finite(values) => values.clone(),
-            SymbolicSet::Cofinite(excluded) => universe.difference(excluded).copied().collect(),
+            SymbolicSet::Cofinite { excluded, .. } => {
+                universe.difference(excluded).copied().collect()
+            }
         }
     }
 }

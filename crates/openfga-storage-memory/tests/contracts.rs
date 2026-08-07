@@ -115,7 +115,7 @@ async fn test_should_pass_backend_independent_tuple_contract() -> Result<(), Box
             ConditionFilter::any(),
             &InputLimits::default(),
         )?,
-        read_options(10)?,
+        read_options(2)?,
     );
 
     verify_tuple_contract(&storage, &context, &fixture).await?;

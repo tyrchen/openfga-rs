@@ -54,6 +54,9 @@ listObjects:
   candidateDatastoreQueries: 1000
   candidateTupleItems: 10000
   candidates: 10000
+  residualDispatches: 10000
+  residualDatastoreQueries: 1000
+  residualTupleItems: 10000
   residualConcurrency: 16
   streamBuffer: 16
 listUsers:

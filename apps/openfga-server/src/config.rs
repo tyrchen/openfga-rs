@@ -361,6 +361,12 @@ pub(crate) struct ListObjectsPolicy {
     pub(crate) candidate_tuple_items: u32,
     #[serde(default = "default_candidates")]
     pub(crate) candidates: u32,
+    #[serde(default = "default_dispatches")]
+    pub(crate) residual_dispatches: u32,
+    #[serde(default = "default_candidate_datastore_queries")]
+    pub(crate) residual_datastore_queries: u32,
+    #[serde(default = "default_tuple_items")]
+    pub(crate) residual_tuple_items: u32,
     #[serde(default = "default_residual_concurrency")]
     pub(crate) residual_concurrency: u32,
     #[serde(default = "default_stream_buffer")]
@@ -375,6 +381,9 @@ impl Default for ListObjectsPolicy {
             candidate_datastore_queries: default_candidate_datastore_queries(),
             candidate_tuple_items: default_tuple_items(),
             candidates: default_candidates(),
+            residual_dispatches: default_dispatches(),
+            residual_datastore_queries: default_candidate_datastore_queries(),
+            residual_tuple_items: default_tuple_items(),
             residual_concurrency: default_residual_concurrency(),
             stream_buffer: default_stream_buffer(),
         }
@@ -917,6 +926,12 @@ impl ServerConfig {
             .context("ListObjects candidate tuple item limit is invalid")?;
         Limit::<100_000>::new(self.list_objects.candidates)
             .context("ListObjects candidate limit is invalid")?;
+        Limit::<1_000_000>::new(self.list_objects.residual_dispatches)
+            .context("ListObjects residual dispatch limit is invalid")?;
+        Limit::<100_000>::new(self.list_objects.residual_datastore_queries)
+            .context("ListObjects residual datastore query limit is invalid")?;
+        Limit::<1_000_000>::new(self.list_objects.residual_tuple_items)
+            .context("ListObjects residual tuple item limit is invalid")?;
         Limit::<1_024>::new(self.list_objects.residual_concurrency)
             .context("ListObjects residual concurrency is invalid")?;
         Limit::<1_024>::new(self.list_objects.stream_buffer)

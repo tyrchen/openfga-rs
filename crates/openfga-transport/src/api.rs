@@ -825,12 +825,14 @@ impl OpenFgaApi {
             request.contextual_tuples,
             request.context,
         )?;
-        let cancellation = cancellation.into_token();
-        self.services
+        let stream = self
+            .services
             .list_objects
-            .streamed_list_objects_resolved(&command, model, cancellation)
+            .streamed_list_objects_resolved(&command, model, cancellation.token())
             .await
-            .map_err(ApiError::from)
+            .map_err(ApiError::from)?;
+        cancellation.disarm();
+        Ok(stream)
     }
 
     #[allow(
@@ -1171,9 +1173,8 @@ impl RequestCancellation {
         self.token.clone()
     }
 
-    fn into_token(mut self) -> StorageCancellationToken {
+    fn disarm(mut self) {
         self.armed = false;
-        self.token.clone()
     }
 }
 

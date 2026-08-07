@@ -112,7 +112,7 @@ pub(crate) async fn run(go_url: &str, rust_url: &str) -> Result<()> {
     Ok(())
 }
 
-fn cases() -> [DifferentialCase; 11] {
+fn cases() -> [DifferentialCase; 12] {
     [
         DifferentialCase {
             name: "list_objects_viewer",
@@ -143,6 +143,12 @@ fn cases() -> [DifferentialCase; 11] {
             endpoint: "list-users",
             response_kind: ResponseKind::Json,
             request: list_users_wildcard,
+        },
+        DifferentialCase {
+            name: "list_users_wildcard_with_explicit",
+            endpoint: "list-users",
+            response_kind: ResponseKind::Json,
+            request: list_users_wildcard_with_explicit,
         },
         DifferentialCase {
             name: "list_users_userset",
@@ -317,6 +323,10 @@ fn list_users_direct(model_id: &str) -> Value {
 
 fn list_users_wildcard(model_id: &str) -> Value {
     list_users_request(model_id, "wild", "viewer")
+}
+
+fn list_users_wildcard_with_explicit(model_id: &str) -> Value {
+    list_users_request(model_id, "wild-plus", "viewer")
 }
 
 fn list_users_userset(model_id: &str) -> Value {

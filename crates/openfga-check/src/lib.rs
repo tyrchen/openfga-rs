@@ -30,7 +30,7 @@ mod error;
 mod evaluator;
 mod outcome;
 
-pub use budget::{CheckBudget, CheckBudgetBuilder};
+pub use budget::{CheckBudget, CheckBudgetBuilder, CheckWorkMeter};
 pub use error::{CheckError, CheckErrorKind};
 pub use evaluator::{CheckEvaluator, DirectCheckEvaluator};
 pub use outcome::{

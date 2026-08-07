@@ -127,7 +127,7 @@ async fn verify_management_and_shared_contract(
     verify_tuple_contract(
         storage,
         context,
-        &TupleContractFixture::new(store_id, first.clone(), second, filter, read_options(100)?),
+        &TupleContractFixture::new(store_id, first.clone(), second, filter, read_options(2)?),
     )
     .await?;
     storage

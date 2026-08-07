@@ -431,14 +431,16 @@ impl TupleReader for PostgresStorage {
         push_condition_filter(&mut query, filter.conditions());
         query
             .push(" ORDER BY subject_kind, subject_type, subject_id, subject_relation LIMIT ")
-            .push_bind(result_limit(options.maximum_results())?);
+            .push_bind(page_fetch_limit(options.maximum_results())?);
         let rows = execute(
             context,
             query.build_query_as::<TupleRow>().fetch_all(pool),
             "postgres_read_object_relation_failed",
         )
         .await?;
-        rows_to_stream(rows, |tuple| filter.conditions().matches(tuple.condition()))
+        bounded_rows_to_stream(rows, options.maximum_results(), |tuple| {
+            filter.conditions().matches(tuple.condition())
+        })
     }
 
     async fn read_userset_tuples(
@@ -478,14 +480,16 @@ impl TupleReader for PostgresStorage {
         push_condition_filter(&mut query, filter.conditions());
         query
             .push(" ORDER BY subject_type, subject_relation, subject_id LIMIT ")
-            .push_bind(result_limit(options.maximum_results())?);
+            .push_bind(page_fetch_limit(options.maximum_results())?);
         let rows = execute(
             context,
             query.build_query_as::<TupleRow>().fetch_all(pool),
             "postgres_read_userset_tuples_failed",
         )
         .await?;
-        rows_to_stream(rows, |tuple| filter.conditions().matches(tuple.condition()))
+        bounded_rows_to_stream(rows, options.maximum_results(), |tuple| {
+            filter.conditions().matches(tuple.condition())
+        })
     }
 
     async fn read_reverse_tuples(
@@ -520,14 +524,16 @@ impl TupleReader for PostgresStorage {
                 " ORDER BY subject_kind, subject_type, subject_id, subject_relation, object_id \
                  LIMIT ",
             )
-            .push_bind(result_limit(options.maximum_results())?);
+            .push_bind(page_fetch_limit(options.maximum_results())?);
         let rows = execute(
             context,
             query.build_query_as::<TupleRow>().fetch_all(pool),
             "postgres_read_reverse_tuples_failed",
         )
         .await?;
-        rows_to_stream(rows, |tuple| filter.conditions().matches(tuple.condition()))
+        bounded_rows_to_stream(rows, options.maximum_results(), |tuple| {
+            filter.conditions().matches(tuple.condition())
+        })
     }
 
     async fn tuple_exists(
@@ -1880,6 +1886,20 @@ fn rows_to_stream(
         })
 }
 
+fn bounded_rows_to_stream(
+    rows: Vec<TupleRow>,
+    maximum: usize,
+    predicate: impl Fn(&RelationshipTuple) -> bool,
+) -> Result<TupleStream, StorageError> {
+    if rows.len() > maximum {
+        return Err(StorageError::new(
+            StorageErrorKind::ResourceExhausted,
+            "tuple_snapshot_result_limit",
+        ));
+    }
+    rows_to_stream(rows, predicate)
+}
+
 fn cursor(value: String) -> Result<StorageCursor, StorageError> {
     StorageCursor::new(value.into_bytes())
 }
@@ -1915,15 +1935,6 @@ fn page_fetch_limit(maximum: usize) -> Result<i64, StorageError> {
         StorageError::with_source(
             StorageErrorKind::ResourceExhausted,
             "postgres_page_limit_invalid",
-            error,
-        )
-    })
-}
-fn result_limit(maximum: usize) -> Result<i64, StorageError> {
-    i64::try_from(maximum).map_err(|error| {
-        StorageError::with_source(
-            StorageErrorKind::ResourceExhausted,
-            "postgres_result_limit_invalid",
             error,
         )
     })

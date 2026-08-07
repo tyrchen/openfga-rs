@@ -1,6 +1,6 @@
 //! Independent finite ceilings for enumeration and diagnostic expansion.
 
-use openfga_check::CheckBudget;
+use openfga_check::{CheckBudget, CheckWorkMeter};
 use openfga_domain::Limit;
 use typed_builder::TypedBuilder;
 
@@ -73,6 +73,12 @@ pub struct ListObjectsBudget {
     candidate: CandidateBudget,
     #[builder(default = CheckBudget::default())]
     check: CheckBudget,
+    #[builder(default = trusted_limit::<1_000_000>(10_000))]
+    residual_dispatches: Limit<1_000_000>,
+    #[builder(default = trusted_limit::<100_000>(1_000))]
+    residual_datastore_queries: Limit<100_000>,
+    #[builder(default = trusted_limit::<1_000_000>(10_000))]
+    residual_tuple_items: Limit<1_000_000>,
     #[builder(default = trusted_limit::<1_024>(16))]
     residual_concurrency: Limit<1_024>,
     #[builder(default = trusted_limit::<1_024>(16))]
@@ -90,6 +96,34 @@ impl ListObjectsBudget {
     #[must_use]
     pub const fn check(self) -> CheckBudget {
         self.check
+    }
+
+    /// Returns the aggregate residual-Check dispatch ceiling.
+    #[must_use]
+    pub const fn maximum_residual_dispatches(self) -> u32 {
+        self.residual_dispatches.get()
+    }
+
+    /// Returns the aggregate residual-Check datastore-query ceiling.
+    #[must_use]
+    pub const fn maximum_residual_datastore_queries(self) -> u32 {
+        self.residual_datastore_queries.get()
+    }
+
+    /// Returns the aggregate residual-Check tuple-item ceiling.
+    #[must_use]
+    pub const fn maximum_residual_tuple_items(self) -> u32 {
+        self.residual_tuple_items.get()
+    }
+
+    /// Creates one aggregate meter shared by every residual Check root.
+    #[must_use]
+    pub fn residual_work_meter(self) -> CheckWorkMeter {
+        CheckWorkMeter::new(
+            self.residual_dispatches,
+            self.residual_datastore_queries,
+            self.residual_tuple_items,
+        )
     }
 
     /// Returns maximum concurrent residual Checks.

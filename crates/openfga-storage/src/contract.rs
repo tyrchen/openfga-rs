@@ -1,6 +1,8 @@
 //! Backend-independent storage contract runner for backend test suites.
 
-use openfga_domain::{RelationshipTuple, StoreId};
+use std::num::NonZeroU32;
+
+use openfga_domain::{InputLimits, RelationshipTuple, StoreId};
 use thiserror::Error;
 
 use crate::{
@@ -100,6 +102,16 @@ where
     if tuples.len() != 2 {
         return Err(ContractError::Invariant("forward_tuple_count"));
     }
+    let overflow_options = ReadOptions::new(
+        NonZeroU32::new(1).ok_or(ContractError::Invariant("nonzero_read_limit"))?,
+        &InputLimits::default(),
+    )?;
+    let overflow = backend
+        .read_object_relation(context, fixture.store_id, &fixture.filter, overflow_options)
+        .await;
+    if !matches!(overflow, Err(error) if error.kind() == StorageErrorKind::ResourceExhausted) {
+        return Err(ContractError::Invariant("forward_tuple_overflow"));
+    }
     let duplicate = backend
         .write_tuples(
             context,
@@ -127,7 +139,11 @@ where
     {
         return Err(ContractError::Invariant("delete_visibility"));
     }
-    let page_options = PageOptions::from_read_options(fixture.read_options);
+    let change_read_options = ReadOptions::new(
+        NonZeroU32::new(3).ok_or(ContractError::Invariant("nonzero_change_limit"))?,
+        &InputLimits::default(),
+    )?;
+    let page_options = PageOptions::from_read_options(change_read_options);
     let changes = backend
         .read_changes(
             context,

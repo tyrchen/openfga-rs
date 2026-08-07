@@ -531,6 +531,15 @@ fn list_objects_budget(config: &ServerConfig, check: CheckBudget) -> Result<List
     Ok(ListObjectsBudget::builder()
         .candidate(candidate)
         .check(check)
+        .residual_dispatches(Limit::<1_000_000>::new(
+            config.list_objects.residual_dispatches,
+        )?)
+        .residual_datastore_queries(Limit::<100_000>::new(
+            config.list_objects.residual_datastore_queries,
+        )?)
+        .residual_tuple_items(Limit::<1_000_000>::new(
+            config.list_objects.residual_tuple_items,
+        )?)
         .residual_concurrency(Limit::<1_024>::new(
             config.list_objects.residual_concurrency,
         )?)
@@ -1075,10 +1084,13 @@ mod tests {
     use openfga_check::CheckBudget;
     use openfga_domain::{
         AuthorizationModelId, InputLimits, PrincipalId, RequestTimeout, StoreId, TokenCodec,
-        TokenKey, TokenKeyId,
+        TokenKey, TokenKeyId, TupleKey,
     };
     use openfga_list::{ExpandBudget, ListObjectsBudget, ListUsersBudget};
-    use openfga_model::ModelCompiler;
+    use openfga_model::{
+        AuthorizationModelSource, DirectRestrictionSource, ModelCompiler, RelationSource,
+        RestrictionKindSource, RewriteSource, TypeDefinitionSource,
+    };
     use openfga_proto::openfga::v1::{self as pb, open_fga_service_client::OpenFgaServiceClient};
     use openfga_service::{
         AssertionService, ChangeService, CheckService, ExpandService, IdentifierSource,
@@ -1086,9 +1098,11 @@ mod tests {
         ModelService, ServiceClock, StoreService, TupleService,
     };
     use openfga_storage::{
-        AssertionReader, AssertionWriter, ChangeReader, ModelReader, ModelWriter, OperationContext,
-        Page, PageOptions, StorageCancellationToken, StorageError, StorageErrorKind, StoreReader,
-        StoreWriter, StoredAuthorizationModel, TupleReader, TupleWriter,
+        AssertionReader, AssertionWriter, ChangeReader, ModelReader, ModelWriter,
+        ObjectRelationFilter, OperationContext, Page, PageOptions, ReadOptions, ReverseTupleFilter,
+        StorageCancellationToken, StorageError, StorageErrorKind, StoreReader, StoreWriter,
+        StoredAuthorizationModel, StoredTuple, TupleReadFilter, TupleReader, TupleStream,
+        TupleWriter, UsersetTupleFilter,
     };
     use openfga_storage_memory::{MemoryStorage, MemoryStorageConfig};
     use openfga_transport::{OpenFgaApi, OpenFgaServices, TransportConfig};
@@ -1209,6 +1223,143 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct StaticModelReader {
+        model: Arc<StoredAuthorizationModel>,
+    }
+
+    #[async_trait]
+    impl ModelReader for StaticModelReader {
+        async fn read_model(
+            &self,
+            _context: &OperationContext,
+            _store_id: StoreId,
+            _model_id: AuthorizationModelId,
+        ) -> Result<Arc<StoredAuthorizationModel>, StorageError> {
+            Ok(Arc::clone(&self.model))
+        }
+
+        async fn read_latest_model(
+            &self,
+            _context: &OperationContext,
+            _store_id: StoreId,
+        ) -> Result<Arc<StoredAuthorizationModel>, StorageError> {
+            Ok(Arc::clone(&self.model))
+        }
+
+        async fn list_models(
+            &self,
+            _context: &OperationContext,
+            _store_id: StoreId,
+            _options: &PageOptions,
+        ) -> Result<Page<Arc<StoredAuthorizationModel>>, StorageError> {
+            Err(StorageError::new(
+                StorageErrorKind::Unavailable,
+                "runtime_static_model_list_unsupported",
+            ))
+        }
+    }
+
+    #[derive(Debug)]
+    struct BlockingReverseTupleReader {
+        delegate: Arc<MemoryStorage>,
+        active: Arc<AtomicUsize>,
+        entered: mpsc::Sender<StorageCancellationToken>,
+    }
+
+    #[async_trait]
+    impl TupleReader for BlockingReverseTupleReader {
+        async fn read_tuples(
+            &self,
+            context: &OperationContext,
+            store_id: StoreId,
+            filter: &TupleReadFilter,
+            options: &PageOptions,
+        ) -> Result<Page<StoredTuple>, StorageError> {
+            self.delegate
+                .read_tuples(context, store_id, filter, options)
+                .await
+        }
+
+        async fn read_exact_tuple(
+            &self,
+            context: &OperationContext,
+            store_id: StoreId,
+            key: &TupleKey,
+        ) -> Result<StoredTuple, StorageError> {
+            self.delegate.read_exact_tuple(context, store_id, key).await
+        }
+
+        async fn read_object_relation(
+            &self,
+            context: &OperationContext,
+            store_id: StoreId,
+            filter: &ObjectRelationFilter,
+            options: ReadOptions,
+        ) -> Result<TupleStream, StorageError> {
+            self.delegate
+                .read_object_relation(context, store_id, filter, options)
+                .await
+        }
+
+        async fn read_userset_tuples(
+            &self,
+            context: &OperationContext,
+            store_id: StoreId,
+            filter: &UsersetTupleFilter,
+            options: ReadOptions,
+        ) -> Result<TupleStream, StorageError> {
+            self.delegate
+                .read_userset_tuples(context, store_id, filter, options)
+                .await
+        }
+
+        async fn read_reverse_tuples(
+            &self,
+            context: &OperationContext,
+            _store_id: StoreId,
+            _filter: &ReverseTupleFilter,
+            _options: ReadOptions,
+        ) -> Result<TupleStream, StorageError> {
+            self.active.fetch_add(1, Ordering::AcqRel);
+            let _guard = ActiveWorkGuard(Arc::clone(&self.active));
+            self.entered
+                .send(context.cancellation().clone())
+                .await
+                .map_err(|_| {
+                    StorageError::new(
+                        StorageErrorKind::Unavailable,
+                        "runtime_candidate_cancellation_probe_unavailable",
+                    )
+                })?;
+            context.cancellation().cancelled().await;
+            Err(StorageError::new(
+                StorageErrorKind::Cancelled,
+                "runtime_candidate_cancellation_probe_cancelled",
+            ))
+        }
+
+        async fn tuple_exists(
+            &self,
+            context: &OperationContext,
+            store_id: StoreId,
+            key: &TupleKey,
+        ) -> Result<bool, StorageError> {
+            self.delegate.tuple_exists(context, store_id, key).await
+        }
+
+        async fn count_object_relation(
+            &self,
+            context: &OperationContext,
+            store_id: StoreId,
+            filter: &ObjectRelationFilter,
+        ) -> Result<u64, StorageError> {
+            self.delegate
+                .count_object_relation(context, store_id, filter)
+                .await
+        }
+    }
+
     fn cancellation_api(
         entered: mpsc::Sender<StorageCancellationToken>,
         active: Arc<AtomicUsize>,
@@ -1223,8 +1374,18 @@ mod tests {
         let assertion_reads: Arc<dyn AssertionReader> = storage.clone();
         let assertion_writes: Arc<dyn AssertionWriter> = storage.clone();
         let changes: Arc<dyn ChangeReader> = storage.clone();
-        let blocking_models: Arc<dyn ModelReader> =
-            Arc::new(BlockingModelReader { active, entered });
+        let blocking_models: Arc<dyn ModelReader> = Arc::new(BlockingModelReader {
+            active: Arc::clone(&active),
+            entered: entered.clone(),
+        });
+        let candidate_models: Arc<dyn ModelReader> = Arc::new(StaticModelReader {
+            model: cancellation_model()?,
+        });
+        let blocking_reverse_tuples: Arc<dyn TupleReader> = Arc::new(BlockingReverseTupleReader {
+            delegate: Arc::clone(&storage),
+            active,
+            entered,
+        });
         let identifiers: Arc<dyn IdentifierSource> = Arc::new(FixedIdentifiers {
             store_id: STORE_ID.parse()?,
             model_id: MODEL_ID.parse()?,
@@ -1265,8 +1426,8 @@ mod tests {
                 CheckBudget::default(),
             ))
             .list_objects(ListObjectsService::direct(
-                Arc::clone(&blocking_models),
-                Arc::clone(&tuples),
+                candidate_models,
+                blocking_reverse_tuples,
                 ListObjectsBudget::default(),
                 limits.clone(),
             ))
@@ -1298,6 +1459,36 @@ mod tests {
         )
         .map_err(anyhow::Error::msg)?;
         Ok((api, authentication, storage))
+    }
+
+    fn cancellation_model() -> anyhow::Result<Arc<StoredAuthorizationModel>> {
+        let source = Arc::new(AuthorizationModelSource::new(
+            STORE_ID.parse()?,
+            MODEL_ID.parse()?,
+            "1.1".to_owned(),
+            vec![
+                TypeDefinitionSource::new("user".parse()?, Vec::new()),
+                TypeDefinitionSource::new(
+                    "document".parse()?,
+                    vec![RelationSource::new(
+                        "viewer".parse()?,
+                        RewriteSource::Direct,
+                        vec![DirectRestrictionSource::new(
+                            "user".parse()?,
+                            RestrictionKindSource::Object,
+                            None,
+                        )],
+                    )],
+                ),
+            ],
+            Vec::new(),
+        ));
+        let compiled = ModelCompiler::default().compile(&source)?;
+        Ok(Arc::new(StoredAuthorizationModel::new(
+            source,
+            compiled,
+            SystemTime::UNIX_EPOCH,
+        )?))
     }
 
     async fn wait_for_request_cancellation(

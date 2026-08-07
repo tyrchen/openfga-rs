@@ -104,6 +104,7 @@ impl CheckService {
                 Arc::clone(model.0.compiled()),
                 Arc::clone(&self.tuples),
                 self.budget,
+                None,
                 cancellation,
             )
             .await

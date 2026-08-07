@@ -1,5 +1,10 @@
 //! Finite independent evaluator resource ceilings.
 
+use std::sync::{
+    Arc,
+    atomic::{AtomicU32, Ordering},
+};
+
 use openfga_domain::Limit;
 use typed_builder::TypedBuilder;
 
@@ -81,5 +86,71 @@ impl CheckBudget {
 impl Default for CheckBudget {
     fn default() -> Self {
         Self::builder().build()
+    }
+}
+
+/// Request-scoped work meter shared by multiple independent Check roots.
+///
+/// Each charge is admitted atomically before the evaluator creates the
+/// corresponding dispatch, datastore read, or tuple-processing work. This is
+/// used by enumeration to apply one aggregate residual-Check budget even when
+/// several roots execute concurrently.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct CheckWorkMeter {
+    dispatches: Arc<SharedCounter>,
+    datastore_queries: Arc<SharedCounter>,
+    tuple_items: Arc<SharedCounter>,
+}
+
+impl CheckWorkMeter {
+    /// Creates an empty meter with independent validated ceilings.
+    #[must_use]
+    pub fn new(
+        dispatches: Limit<1_000_000>,
+        datastore_queries: Limit<100_000>,
+        tuple_items: Limit<1_000_000>,
+    ) -> Self {
+        Self {
+            dispatches: Arc::new(SharedCounter::new(dispatches.get())),
+            datastore_queries: Arc::new(SharedCounter::new(datastore_queries.get())),
+            tuple_items: Arc::new(SharedCounter::new(tuple_items.get())),
+        }
+    }
+
+    pub(crate) fn charge_dispatches(&self, amount: u32) -> bool {
+        self.dispatches.charge(amount)
+    }
+
+    pub(crate) fn charge_datastore_queries(&self, amount: u32) -> bool {
+        self.datastore_queries.charge(amount)
+    }
+
+    pub(crate) fn charge_tuple_items(&self, amount: u32) -> bool {
+        self.tuple_items.charge(amount)
+    }
+}
+
+#[derive(Debug)]
+struct SharedCounter {
+    used: AtomicU32,
+    maximum: u32,
+}
+
+impl SharedCounter {
+    const fn new(maximum: u32) -> Self {
+        Self {
+            used: AtomicU32::new(0),
+            maximum,
+        }
+    }
+
+    fn charge(&self, amount: u32) -> bool {
+        self.used
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                used.checked_add(amount)
+                    .filter(|next| *next <= self.maximum)
+            })
+            .is_ok()
     }
 }

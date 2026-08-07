@@ -2,7 +2,6 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    num::NonZeroU32,
     sync::Arc,
     time::Instant,
 };
@@ -13,7 +12,7 @@ use openfga_condition::{
 };
 use openfga_domain::{
     BatchCheckCommand, CheckCommand, ConditionContext, ConditionReference, ConsistencyPreference,
-    ContextualTuples, Deadline, InputLimits, ModelSelection, ObjectRef, RelationName,
+    ContextualTuples, Deadline, InputLimits, Limit, ModelSelection, ObjectRef, RelationName,
     RelationshipTuple, StoreId, SubjectRef, TupleKey,
 };
 use openfga_model::{
@@ -31,7 +30,7 @@ use tokio::{
 
 use crate::{
     BatchCheckOutcome, BatchCheckResult, CheckBudget, CheckError, CheckErrorKind, CheckMetadata,
-    CheckOutcome, CheckResolution,
+    CheckOutcome, CheckResolution, CheckWorkMeter,
 };
 
 type Evaluation = Result<Decision, CheckError>;
@@ -55,6 +54,7 @@ pub trait CheckEvaluator: Send + Sync {
         model: Arc<CompiledModel>,
         tuples: Arc<dyn TupleReader>,
         budget: CheckBudget,
+        work_meter: Option<CheckWorkMeter>,
         cancellation: StorageCancellationToken,
     ) -> Result<CheckOutcome, CheckError>;
 
@@ -106,6 +106,7 @@ impl CheckEvaluator for DirectCheckEvaluator {
         model: Arc<CompiledModel>,
         tuples: Arc<dyn TupleReader>,
         budget: CheckBudget,
+        work_meter: Option<CheckWorkMeter>,
         cancellation: StorageCancellationToken,
     ) -> Result<CheckOutcome, CheckError> {
         let query = command.query();
@@ -123,6 +124,7 @@ impl CheckEvaluator for DirectCheckEvaluator {
             model,
             tuples,
             budget,
+            work_meter,
             self.input_limits.clone(),
             cancellation,
         )
@@ -252,6 +254,7 @@ async fn run_batch(
                     item_model,
                     item_tuples,
                     budget,
+                    None,
                     item_limits,
                     item_cancellation,
                 )
@@ -387,11 +390,20 @@ async fn evaluate_root(
     model: Arc<CompiledModel>,
     tuples: Arc<dyn TupleReader>,
     budget: CheckBudget,
+    work_meter: Option<CheckWorkMeter>,
     input_limits: InputLimits,
     cancellation: StorageCancellationToken,
 ) -> Result<CheckOutcome, CheckError> {
-    let outcome =
-        evaluate_root_inner(input, model, tuples, budget, input_limits, cancellation).await;
+    let outcome = evaluate_root_inner(
+        input,
+        model,
+        tuples,
+        budget,
+        work_meter,
+        input_limits,
+        cancellation,
+    )
+    .await;
     record_root_outcome(&outcome);
     outcome
 }
@@ -401,6 +413,7 @@ async fn evaluate_root_inner(
     model: Arc<CompiledModel>,
     tuples: Arc<dyn TupleReader>,
     budget: CheckBudget,
+    work_meter: Option<CheckWorkMeter>,
     input_limits: InputLimits,
     cancellation: StorageCancellationToken,
 ) -> Result<CheckOutcome, CheckError> {
@@ -414,6 +427,7 @@ async fn evaluate_root_inner(
         model,
         tuples,
         budget,
+        work_meter,
         input_limits,
         operation,
         input.contextual,
@@ -785,6 +799,7 @@ struct Scheduler {
     model: Arc<CompiledModel>,
     tuples: Arc<dyn TupleReader>,
     budget: CheckBudget,
+    work_meter: Option<CheckWorkMeter>,
     input_limits: InputLimits,
     operation: OperationContext,
     contextual: ContextualIndex,
@@ -816,24 +831,28 @@ impl fmt::Debug for Scheduler {
 use std::fmt;
 
 impl Scheduler {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "evaluator capabilities and request-scoped state remain explicit"
+    )]
     fn new(
         model: Arc<CompiledModel>,
         tuples: Arc<dyn TupleReader>,
         budget: CheckBudget,
+        work_meter: Option<CheckWorkMeter>,
         input_limits: InputLimits,
         operation: OperationContext,
         contextual: ContextualIndex,
         condition_context: ConditionContext,
     ) -> Result<Self, CheckError> {
-        let per_read = budget.maximum_tuple_items().min(input_limits.results());
-        let maximum_results =
-            NonZeroU32::new(per_read).ok_or_else(|| internal("tuple_read_limit_zero"))?;
-        let read_options =
-            ReadOptions::new(maximum_results, &input_limits).map_err(CheckError::from)?;
+        let maximum_results = Limit::<100_000>::new(budget.maximum_tuple_items().min(100_000))
+            .map_err(|_| internal("tuple_read_limit_invalid"))?;
+        let read_options = ReadOptions::from_limit(maximum_results);
         Ok(Self {
             model,
             tuples,
             budget,
+            work_meter,
             input_limits,
             operation,
             contextual,
@@ -941,6 +960,13 @@ impl Scheduler {
             .checked_add(1)
             .ok_or_else(dispatch_exceeded)?;
         if self.counters.dispatches > self.budget.maximum_dispatches() {
+            return Err(dispatch_exceeded());
+        }
+        if self
+            .work_meter
+            .as_ref()
+            .is_some_and(|meter| !meter.charge_dispatches(1))
+        {
             return Err(dispatch_exceeded());
         }
         let id = self.slots.len();
@@ -1232,6 +1258,13 @@ impl Scheduler {
         if self.counters.datastore_queries > self.budget.maximum_datastore_queries() {
             return self.complete(work_id, Err(datastore_exceeded()));
         }
+        if self
+            .work_meter
+            .as_ref()
+            .is_some_and(|meter| !meter.charge_datastore_queries(1))
+        {
+            return self.complete(work_id, Err(datastore_exceeded()));
+        }
         let relation = match self.model.relation(relation_id) {
             Ok(relation) => relation,
             Err(source) => {
@@ -1256,12 +1289,21 @@ impl Scheduler {
         let operation = self.operation.clone();
         let store_id = *self.model.store_id();
         let options = self.read_options;
+        let work_meter = self.work_meter.clone();
         self.reads.spawn(async move {
             let result = async {
                 let mut stream = reader
                     .read_object_relation(&operation, store_id, &filter, options)
                     .await
                     .map_err(map_read_error)?;
+                let stored_items =
+                    u32::try_from(stream.remaining()).map_err(|_| tuple_items_exceeded())?;
+                if work_meter
+                    .as_ref()
+                    .is_some_and(|meter| !meter.charge_tuple_items(stored_items))
+                {
+                    return Err(tuple_items_exceeded());
+                }
                 let mut rows = Vec::with_capacity(stream.remaining());
                 for item in &mut stream {
                     rows.push(item.map_err(map_read_error)?);
@@ -1324,6 +1366,7 @@ impl Scheduler {
     }
 
     fn charge_tuple_items(&mut self, stored: usize, contextual: usize) -> Result<(), CheckError> {
+        let contextual_items = u32::try_from(contextual).map_err(|_| tuple_items_exceeded())?;
         let total = stored
             .checked_add(contextual)
             .and_then(|total| u32::try_from(total).ok())
@@ -1334,6 +1377,13 @@ impl Scheduler {
             .checked_add(total)
             .ok_or_else(tuple_items_exceeded)?;
         if self.counters.tuple_items > self.budget.maximum_tuple_items() {
+            return Err(tuple_items_exceeded());
+        }
+        if self
+            .work_meter
+            .as_ref()
+            .is_some_and(|meter| !meter.charge_tuple_items(contextual_items))
+        {
             return Err(tuple_items_exceeded());
         }
         Ok(())

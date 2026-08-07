@@ -13,7 +13,8 @@ use std::{
 
 use async_trait::async_trait;
 use openfga_check::{
-    BatchCheckOutcome, CheckBudget, CheckError, CheckEvaluator, CheckOutcome, DirectCheckEvaluator,
+    BatchCheckOutcome, CheckBudget, CheckError, CheckEvaluator, CheckOutcome, CheckWorkMeter,
+    DirectCheckEvaluator,
 };
 use openfga_condition::{ConditionDefinition, ParameterType};
 use openfga_domain::{
@@ -131,7 +132,13 @@ async fn test_should_mark_ambiguous_candidates_and_fail_closed_on_limits_and_can
         )
         .await?;
     assert_eq!(intersection.candidates().len(), 1);
-    assert!(intersection.candidates()[0].requires_check());
+    assert!(
+        intersection
+            .candidates()
+            .first()
+            .ok_or("intersection candidate was missing")?
+            .requires_check()
+    );
 
     let difference = ReverseCandidateTraversal::default()
         .traverse(
@@ -240,6 +247,156 @@ async fn test_should_residual_check_ambiguous_candidates_for_unary_and_streaming
         streamed.push(item?.to_string());
     }
     assert_eq!(streamed, vec!["document:included"]);
+    shutdown(storage).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_should_enforce_aggregate_residual_check_budgets() -> Result<(), Box<dyn Error>> {
+    let storage = memory_storage().await?;
+    write_tuples(
+        storage.as_ref(),
+        vec![
+            tuple("document:first#viewer@user:alice")?,
+            tuple("document:second#viewer@user:alice")?,
+        ],
+    )
+    .await?;
+    let model = ModelCompiler::default().compile(&model()?)?;
+    let tuple_reader: Arc<dyn TupleReader> = storage.clone();
+    let check = DirectCheckEvaluator::default()
+        .check(
+            &CheckCommand::new(
+                query_context(ContextualTuples::empty(), ConditionContext::empty())?,
+                "document:first#allowed@user:alice".parse()?,
+            ),
+            Arc::clone(&model),
+            Arc::clone(&tuple_reader),
+            CheckBudget::default(),
+            None,
+            StorageCancellationToken::new(),
+        )
+        .await?;
+    let one_check_queries = check.metadata().datastore_queries();
+    let budget = ListObjectsBudget::builder()
+        .residual_datastore_queries(Limit::<100_000>::new(one_check_queries)?)
+        .residual_concurrency(Limit::<1_024>::new(2)?)
+        .build();
+    let evaluator = Arc::new(CountingCheckEvaluator::default());
+    let error = DirectListObjectsEngine::new(InputLimits::default(), evaluator.clone())
+        .list_objects(
+            &command("allowed", ContextualTuples::empty())?,
+            model,
+            tuple_reader,
+            budget,
+            StorageCancellationToken::new(),
+        )
+        .await
+        .err()
+        .ok_or("aggregate residual query budget unexpectedly succeeded")?;
+    assert_eq!(error.kind(), ListErrorKind::DatastoreQueryExceeded);
+    assert!(evaluator.completed.load(Ordering::SeqCst) < 2);
+    shutdown(storage).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_should_filter_stale_tuples_and_separate_public_result_caps_from_reads()
+-> Result<(), Box<dyn Error>> {
+    let storage = memory_storage().await?;
+    write_tuples(
+        storage.as_ref(),
+        vec![
+            tuple("document:owner-one#owner@user:alice")?,
+            tuple("document:owner-three#owner@user:alice")?,
+            tuple("document:owner-two#owner@user:alice")?,
+            tuple("document:boundary#viewer@user:alice")?,
+            tuple("document:boundary#viewer@user:bob")?,
+            tuple("document:boundary#viewer@user:charlie")?,
+            tuple("document:stale#parent@user:alice")?,
+            tuple("document:stale#viewer@folder:roadmap")?,
+        ],
+    )
+    .await?;
+    let model = ModelCompiler::default().compile(&model()?)?;
+    let tuple_reader: Arc<dyn TupleReader> = storage.clone();
+    let limits = InputLimits::builder()
+        .results(Limit::<100_000>::new(2)?)
+        .build();
+
+    let objects = DirectListObjectsEngine::new(
+        limits.clone(),
+        Arc::new(DirectCheckEvaluator::new(limits.clone())),
+    )
+    .list_objects(
+        &command_with_limit("owner", ContextualTuples::empty(), 2)?,
+        Arc::clone(&model),
+        Arc::clone(&tuple_reader),
+        ListObjectsBudget::default(),
+        StorageCancellationToken::new(),
+    )
+    .await?;
+    assert_eq!(objects.objects().len(), 2);
+    assert_eq!(objects.metadata().results(), 2);
+    let stale = DirectListObjectsEngine::new(
+        limits.clone(),
+        Arc::new(DirectCheckEvaluator::new(limits.clone())),
+    )
+    .list_objects(
+        &command("parent", ContextualTuples::empty())?,
+        Arc::clone(&model),
+        Arc::clone(&tuple_reader),
+        ListObjectsBudget::default(),
+        StorageCancellationToken::new(),
+    )
+    .await?;
+    assert!(stale.objects().is_empty());
+
+    let users = DirectListUsersEngine::new(limits.clone())
+        .list_users(
+            &users_command_with_limit(
+                "document:boundary",
+                "viewer",
+                vec![UserTypeFilter::new("user".parse()?, None)],
+                ContextualTuples::empty(),
+                ConditionContext::empty(),
+                2,
+            )?,
+            Arc::clone(&model),
+            Arc::clone(&tuple_reader),
+            ListUsersBudget::default(),
+            StorageCancellationToken::new(),
+        )
+        .await?;
+    assert_eq!(users.users().len(), 2);
+    assert!(users.metadata().truncated());
+    let stale_users = DirectListUsersEngine::new(limits.clone())
+        .list_users(
+            &users_command(
+                "document:stale",
+                "viewer",
+                vec![UserTypeFilter::new("user".parse()?, None)],
+                ContextualTuples::empty(),
+                ConditionContext::empty(),
+            )?,
+            Arc::clone(&model),
+            Arc::clone(&tuple_reader),
+            ListUsersBudget::default(),
+            StorageCancellationToken::new(),
+        )
+        .await?;
+    assert!(stale_users.users().is_empty());
+
+    let expanded = DirectExpandEngine::new(limits)
+        .expand(
+            &expand_command("document:boundary", "viewer", ContextualTuples::empty())?,
+            model,
+            tuple_reader,
+            ExpandBudget::default(),
+            StorageCancellationToken::new(),
+        )
+        .await?;
+    assert!(expanded.metadata().tuple_items() >= 2);
     shutdown(storage).await?;
     Ok(())
 }
@@ -397,6 +554,19 @@ async fn test_should_list_filtered_users_across_rewrites_conditions_wildcards_an
             tuple("document:excluded#banned@user:alice")?,
             tuple("document:public#viewer@user:*")?,
             tuple("document:public#banned@user:alice")?,
+            tuple("document:public-plus#viewer@user:*")?,
+            tuple("document:public-plus#viewer@user:will")?,
+            tuple("document:exclusion-six#viewer@user:*")?,
+            tuple("document:exclusion-six#viewer@user:maria")?,
+            tuple("document:exclusion-six#viewer@user:jon")?,
+            tuple("document:exclusion-six#banned@user:jon")?,
+            tuple("document:exclusion-six#banned@user:will")?,
+            tuple("document:safe-intersection#viewer@user:*")?,
+            tuple("document:safe-intersection#viewer@user:maria")?,
+            tuple("document:safe-intersection#banned@user:will")?,
+            tuple("document:safe-intersection#owner@user:*")?,
+            tuple("document:chained-negation#viewer@user:*")?,
+            tuple("document:chained-negation#banned@user:jon")?,
             conditional_tuple("document:conditional#conditional@user:alice", 10)?,
             conditional_tuple("document:blocked#conditional@user:alice", 100)?,
             tuple("document:bounded#viewer@user:alice")?,
@@ -420,6 +590,22 @@ async fn test_should_list_filtered_users_across_rewrites_conditions_wildcards_an
         ("document:included", "allowed", vec!["user:alice"]),
         ("document:excluded", "allowed", Vec::new()),
         ("document:public", "allowed", vec!["user:*"]),
+        (
+            "document:public-plus",
+            "viewer",
+            vec!["user:will", "user:*"],
+        ),
+        (
+            "document:exclusion-six",
+            "allowed",
+            vec!["user:maria", "user:*"],
+        ),
+        (
+            "document:safe-intersection",
+            "safe_both",
+            vec!["user:maria", "user:*"],
+        ),
+        ("document:chained-negation", "restored", vec!["user:jon"]),
         ("document:conditional", "conditional", vec!["user:alice"]),
         ("document:blocked", "conditional", Vec::new()),
     ] {
@@ -873,11 +1059,12 @@ impl CheckEvaluator for CountingCheckEvaluator {
         model: Arc<CompiledModel>,
         tuples: Arc<dyn TupleReader>,
         budget: CheckBudget,
+        work_meter: Option<CheckWorkMeter>,
         cancellation: StorageCancellationToken,
     ) -> Result<CheckOutcome, CheckError> {
         let outcome = self
             .delegate
-            .check(command, model, tuples, budget, cancellation)
+            .check(command, model, tuples, budget, work_meter, cancellation)
             .await?;
         self.completed.fetch_add(1, Ordering::SeqCst);
         Ok(outcome)
@@ -905,13 +1092,14 @@ impl CheckEvaluator for BlockingCheckEvaluator {
         model: Arc<CompiledModel>,
         tuples: Arc<dyn TupleReader>,
         budget: CheckBudget,
+        work_meter: Option<CheckWorkMeter>,
         cancellation: StorageCancellationToken,
     ) -> Result<CheckOutcome, CheckError> {
         self.active.fetch_add(1, Ordering::SeqCst);
         let _active = ActiveCheck(&self.active);
         cancellation.cancelled().await;
         self.delegate
-            .check(command, model, tuples, budget, cancellation)
+            .check(command, model, tuples, budget, work_meter, cancellation)
             .await
     }
 
@@ -976,6 +1164,7 @@ async fn verify_generated_enumeration_case(
                 Arc::clone(&model),
                 Arc::clone(&tuple_reader),
                 CheckBudget::default(),
+                None,
                 StorageCancellationToken::new(),
             )
             .await?;
@@ -1044,6 +1233,14 @@ fn command(
     relation: &str,
     contextual_tuples: ContextualTuples,
 ) -> Result<ListObjectsCommand, Box<dyn Error>> {
+    command_with_limit(relation, contextual_tuples, 100)
+}
+
+fn command_with_limit(
+    relation: &str,
+    contextual_tuples: ContextualTuples,
+    maximum_results: u32,
+) -> Result<ListObjectsCommand, Box<dyn Error>> {
     let query = query_context(contextual_tuples, ConditionContext::empty())?;
     Ok(ListObjectsCommand::new(
         query,
@@ -1051,7 +1248,7 @@ fn command(
         relation.parse()?,
         "user:alice".parse()?,
         ListControl::new(
-            NonZeroU32::new(100).ok_or("result limit was zero")?,
+            NonZeroU32::new(maximum_results).ok_or("result limit was zero")?,
             None,
             &InputLimits::default(),
         )?,
@@ -1243,6 +1440,19 @@ fn model() -> Result<AuthorizationModelSource, Box<dyn Error>> {
                 RewriteSource::Difference {
                     base: Box::new(computed("viewer")?),
                     subtract: Box::new(computed("banned")?),
+                },
+                Vec::new(),
+            )?,
+            relation(
+                "safe_both",
+                RewriteSource::Intersection(vec![computed("allowed")?, computed("owner")?]),
+                Vec::new(),
+            )?,
+            relation(
+                "restored",
+                RewriteSource::Difference {
+                    base: Box::new(computed("viewer")?),
+                    subtract: Box::new(computed("allowed")?),
                 },
                 Vec::new(),
             )?,

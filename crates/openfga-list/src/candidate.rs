@@ -2,12 +2,11 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    num::NonZeroU32,
     sync::Arc,
 };
 
 use openfga_domain::{
-    ConditionReference, InputLimits, ListObjectsCommand, ObjectRef, SubjectRef, UsersetRef,
+    ConditionReference, InputLimits, Limit, ListObjectsCommand, ObjectRef, SubjectRef, UsersetRef,
 };
 use openfga_model::{CompiledModel, NodeId, RelationId, RestrictionKind, RewriteNode};
 use openfga_storage::{
@@ -288,10 +287,9 @@ impl<'a> Traversal<'a> {
         operation: OperationContext,
         relation: RelationId,
     ) -> Result<Self, ListError> {
-        let maximum_per_read = budget.maximum_tuple_items().min(input_limits.results());
-        let maximum_per_read = NonZeroU32::new(maximum_per_read)
-            .ok_or_else(|| internal("list_reverse_read_limit_zero"))?;
-        let read_options = ReadOptions::new(maximum_per_read, &input_limits)?;
+        let maximum_per_read = Limit::<100_000>::new(budget.maximum_tuple_items().min(100_000))
+            .map_err(|_| internal("list_reverse_read_limit_invalid"))?;
+        let read_options = ReadOptions::from_limit(maximum_per_read);
         let root = StateKey {
             relation,
             subject: command.subject().clone(),
@@ -638,12 +636,6 @@ impl<'a> Traversal<'a> {
             while let Some(row) = stream.next_item() {
                 rows.push(row?);
             }
-            if rows.len() == self.read_options.maximum_results() {
-                return Err(ListError::new(
-                    ListErrorKind::TupleItemExceeded,
-                    "list_reverse_read_may_be_truncated",
-                ));
-            }
             let contextual = self
                 .command
                 .query()
@@ -658,6 +650,7 @@ impl<'a> Traversal<'a> {
                 .cloned()
                 .collect::<Vec<_>>();
             self.charge_tuple_items(rows.len(), contextual.len())?;
+            rows.retain(|tuple| self.model.validate_relationship_tuple(tuple).is_ok());
             for tuple in rows.into_iter().chain(contextual) {
                 let source = subject_info
                     .get(tuple.key().subject())

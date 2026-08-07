@@ -1574,9 +1574,13 @@ async fn test_should_execute_implemented_use_cases_through_shared_wire_adapter()
         .await?;
     assert_eq!(malformed_expand.status(), StatusCode::BAD_REQUEST);
     let malformed_expand_body = to_bytes(malformed_expand.into_body(), 1_024).await?;
+    let malformed_expand_json =
+        serde_json::from_slice::<serde_json::Value>(&malformed_expand_body)?;
     assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&malformed_expand_body)?["code"],
-        serde_json::json!("latest_authorization_model_not_found"),
+        malformed_expand_json
+            .get("code")
+            .ok_or("malformed Expand error omitted code")?,
+        &serde_json::json!("latest_authorization_model_not_found"),
     );
     let grpc_malformed_expand = OpenFgaService::expand(
         &api,

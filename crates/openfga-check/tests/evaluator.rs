@@ -369,6 +369,7 @@ async fn test_should_enforce_root_cancellation_and_deadline() -> Result<(), Box<
             Arc::clone(&model),
             storage.clone(),
             CheckBudget::default(),
+            None,
             StorageCancellationToken::new(),
         )
         .await
@@ -538,7 +539,7 @@ async fn evaluate(
             .map_err(openfga_check::CheckError::from)?,
     );
     DirectCheckEvaluator::default()
-        .check(&command, model, tuples, budget, cancellation)
+        .check(&command, model, tuples, budget, None, cancellation)
         .await
 }
 

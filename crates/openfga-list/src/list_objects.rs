@@ -13,7 +13,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use openfga_check::{CheckEvaluator, CheckOutcome, DirectCheckEvaluator};
+use openfga_check::{CheckEvaluator, CheckOutcome, CheckWorkMeter, DirectCheckEvaluator};
 use openfga_domain::{CheckCommand, InputLimits, ListObjectsCommand, ObjectRef, TupleKey};
 use openfga_model::CompiledModel;
 use openfga_storage::{StorageCancellationToken, TupleReader};
@@ -363,6 +363,7 @@ async fn process_candidates<S: ObjectSink>(
         tuples,
         evaluator,
         budget,
+        work_meter: budget.residual_work_meter(),
         cancellation: cancellation.clone(),
     };
     let mut residual_checks = 0_u32;
@@ -435,6 +436,7 @@ struct ResidualRuntime {
     tuples: Arc<dyn TupleReader>,
     evaluator: Arc<dyn CheckEvaluator>,
     budget: ListObjectsBudget,
+    work_meter: CheckWorkMeter,
     cancellation: StorageCancellationToken,
 }
 
@@ -458,6 +460,7 @@ fn spawn_check(
                 runtime.model,
                 runtime.tuples,
                 runtime.budget.check(),
+                Some(runtime.work_meter),
                 runtime.cancellation,
             )
             .await
