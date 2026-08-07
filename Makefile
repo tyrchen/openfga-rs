@@ -311,6 +311,47 @@ check-differential: $(GO_BASELINE) build
 	$(CARGO) run --quiet -p openfga-server -- differential-check \
 		--go-url "http://$(GO_HTTP_ADDR)/" --rust-url "http://$(RUST_PROBE_ADDR)/"
 
+enumeration-differential: $(GO_BASELINE) build
+	@set -eu; \
+	phase3_tmp=$$(mktemp -d); \
+	go_pid=""; rust_pid=""; \
+	cleanup() { \
+		test -z "$$go_pid" || kill "$$go_pid" 2>/dev/null || true; \
+		test -z "$$rust_pid" || kill "$$rust_pid" 2>/dev/null || true; \
+		test -z "$$go_pid" || wait "$$go_pid" 2>/dev/null || true; \
+		test -z "$$rust_pid" || wait "$$rust_pid" 2>/dev/null || true; \
+		rm -rf "$$phase3_tmp"; \
+	}; \
+	trap cleanup EXIT INT TERM; \
+	$(GO_BASELINE) run --http-addr $(GO_HTTP_ADDR) --grpc-addr $(GO_GRPC_ADDR) \
+		--playground-enabled=false >"$$phase3_tmp/go.log" 2>&1 & go_pid=$$!; \
+	token_key=$$(openssl rand -base64 32); \
+	OPENFGA__LISTENERS__HTTP=$(RUST_HTTP_ADDR) \
+	OPENFGA__LISTENERS__GRPC=$(RUST_GRPC_ADDR) \
+	OPENFGA_TOKEN_KEY="$$token_key" \
+	$(CARGO) run --quiet -p openfga-server -- run \
+		--config config/openfga-development.yaml \
+		>"$$phase3_tmp/rust.log" 2>&1 & rust_pid=$$!; \
+	for endpoint in "http://$(GO_HTTP_ADDR)/healthz" "http://$(RUST_HTTP_ADDR)/readyz"; do \
+		attempt=0; \
+		until curl --fail --silent "$$endpoint" >/dev/null; do \
+			if ! kill -0 "$$go_pid" 2>/dev/null || ! kill -0 "$$rust_pid" 2>/dev/null; then \
+				echo "an enumeration differential server exited before readiness" >&2; \
+				tail -100 "$$phase3_tmp/go.log" "$$phase3_tmp/rust.log" >&2; \
+				exit 1; \
+			fi; \
+			attempt=$$((attempt + 1)); \
+			if test "$$attempt" -ge 100; then \
+				echo "enumeration server did not become ready: $$endpoint" >&2; \
+				tail -100 "$$phase3_tmp/go.log" "$$phase3_tmp/rust.log" >&2; \
+				exit 1; \
+			fi; \
+			sleep 0.1; \
+		done; \
+	done; \
+	$(CARGO) run --quiet -p openfga-server -- differential-enumeration \
+		--go-url "http://$(GO_HTTP_ADDR)/" --rust-url "http://$(RUST_HTTP_ADDR)/"
+
 check-corpus-differential: verify-go-tool verify-go-pin
 	@phase1_tmp=$$(mktemp -d); \
 	repo_root=$$(pwd -P); \
@@ -397,5 +438,5 @@ update-submodule:
 .PHONY: audit build cel-baseline cel-spike check check-agent-sync check-baseline check-corpus-differential check-differential check-docs \
 	check-oracle check-proto check-spike \
 	clippy clippy-strict \
-	conformance deny differential-smoke doc fmt fuzz-condition fuzz-domain fuzz-model go-baseline listobjects-spike model-baseline \
+	conformance deny differential-smoke doc enumeration-differential fmt fuzz-condition fuzz-domain fuzz-model go-baseline listobjects-spike model-baseline \
 	model-spike phase2-compatibility postgres-storage proto release sqlx-prepare-check storage-contract test update-submodule verify-go-pin verify-go-tool

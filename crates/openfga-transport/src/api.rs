@@ -800,7 +800,7 @@ impl OpenFgaApi {
         let model_selection = convert::model_selection(&request.authorization_model_id)?;
         let consistency = consistency(request.consistency)?;
         let deadline = self.deadline()?;
-        let cancellation = StorageCancellationToken::new();
+        let cancellation = RequestCancellation::new();
         let model = self
             .services
             .list_objects
@@ -809,7 +809,7 @@ impl OpenFgaApi {
                 model_selection,
                 consistency,
                 deadline,
-                cancellation.clone(),
+                cancellation.token(),
             )
             .await
             .map_err(ApiError::from)?;
@@ -825,6 +825,7 @@ impl OpenFgaApi {
             request.contextual_tuples,
             request.context,
         )?;
+        let cancellation = cancellation.into_token();
         self.services
             .list_objects
             .streamed_list_objects_resolved(&command, model, cancellation)
@@ -1153,21 +1154,34 @@ impl Drop for CancellableOperationContext {
     }
 }
 
-pub(crate) struct RequestCancellation(StorageCancellationToken);
+pub(crate) struct RequestCancellation {
+    token: StorageCancellationToken,
+    armed: bool,
+}
 
 impl RequestCancellation {
     pub(crate) fn new() -> Self {
-        Self(StorageCancellationToken::new())
+        Self {
+            token: StorageCancellationToken::new(),
+            armed: true,
+        }
     }
 
     pub(crate) fn token(&self) -> StorageCancellationToken {
-        self.0.clone()
+        self.token.clone()
+    }
+
+    fn into_token(mut self) -> StorageCancellationToken {
+        self.armed = false;
+        self.token.clone()
     }
 }
 
 impl Drop for RequestCancellation {
     fn drop(&mut self) {
-        self.0.cancel();
+        if self.armed {
+            self.token.cancel();
+        }
     }
 }
 

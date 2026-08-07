@@ -21,5 +21,6 @@
 | [ListObjects algorithm spike](./research/spike-listobjects-algorithm.md) | Reverse-plus-Check versus worker-pipeline comparison and baseline selection | Accepted |
 | [Phase 0 differential report](./research/phase0-differential-report.md) | Vendored Go/Rust probe lifecycle, normalization contract, and SDK smoke | Passing |
 | [Phase 1 Check differential report](./research/phase1-check-differential-report.md) | Complete vendored corpus plus live Go/Rust Check and BatchCheck parity | Passing |
+| [Phase 3 enumeration differential report](./research/phase3-enumeration-differential-report.md) | Generated-set equivalence, live Go/Rust list/Expand parity, disconnect cleanup, and query-plan controls | Passing (PostgreSQL gate environment-dependent) |
 
 The OpenFGA study is pinned to `vendors/openfga` commit `4e4f79ed841513dfd61746a75ef473f6198299f7`. The Rust survey was checked on 2026-08-05 and must be refreshed before dependency changes.

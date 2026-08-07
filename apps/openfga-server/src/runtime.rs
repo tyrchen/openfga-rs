@@ -1313,6 +1313,91 @@ mod tests {
         Ok(())
     }
 
+    async fn assert_http_disconnect_cancels_storage(
+        address: std::net::SocketAddr,
+        path: &str,
+        body: &[u8],
+        entered: &mut mpsc::Receiver<StorageCancellationToken>,
+        active: &AtomicUsize,
+        operation: &str,
+    ) -> anyhow::Result<()> {
+        let head = format!(
+            "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: \
+             application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len(),
+        );
+        let mut client = tokio::net::TcpStream::connect(address).await?;
+        client.write_all(head.as_bytes()).await?;
+        client.write_all(body).await?;
+        let cancellation = timeout(Duration::from_secs(1), entered.recv())
+            .await?
+            .with_context(|| format!("HTTP {operation} did not reach storage"))?;
+        drop(client);
+        wait_for_request_cancellation(cancellation, active)
+            .await
+            .with_context(|| format!("HTTP {operation} storage work remained active"))
+    }
+
+    fn streamed_list_objects_request() -> pb::StreamedListObjectsRequest {
+        pb::StreamedListObjectsRequest {
+            store_id: STORE_ID.to_owned(),
+            authorization_model_id: MODEL_ID.to_owned(),
+            r#type: "document".to_owned(),
+            relation: "viewer".to_owned(),
+            user: "user:anne".to_owned(),
+            contextual_tuples: None,
+            context: None,
+            consistency: 0,
+        }
+    }
+
+    async fn assert_grpc_disconnects_cancel_storage(
+        address: std::net::SocketAddr,
+        entered: &mut mpsc::Receiver<StorageCancellationToken>,
+        active: &AtomicUsize,
+    ) -> anyhow::Result<()> {
+        let mut client = OpenFgaServiceClient::connect(format!("http://{address}")).await?;
+        let check = pb::CheckRequest {
+            store_id: STORE_ID.to_owned(),
+            tuple_key: Some(pb::CheckRequestTupleKey {
+                user: "user:anne".to_owned(),
+                relation: "viewer".to_owned(),
+                object: "document:roadmap".to_owned(),
+            }),
+            contextual_tuples: None,
+            authorization_model_id: MODEL_ID.to_owned(),
+            trace: false,
+            context: None,
+            consistency: 0,
+        };
+        let task = tokio::spawn(async move { client.check(check).await });
+        assert_aborted_grpc_request(task, entered, active, "Check").await?;
+
+        let mut client = OpenFgaServiceClient::connect(format!("http://{address}")).await?;
+        let task = tokio::spawn(async move {
+            client
+                .streamed_list_objects(streamed_list_objects_request())
+                .await
+        });
+        assert_aborted_grpc_request(task, entered, active, "streamed ListObjects").await
+    }
+
+    async fn assert_aborted_grpc_request<T>(
+        task: tokio::task::JoinHandle<Result<T, tonic::Status>>,
+        entered: &mut mpsc::Receiver<StorageCancellationToken>,
+        active: &AtomicUsize,
+        operation: &str,
+    ) -> anyhow::Result<()> {
+        let cancellation = timeout(Duration::from_secs(1), entered.recv())
+            .await?
+            .with_context(|| format!("gRPC {operation} did not reach storage"))?;
+        task.abort();
+        assert!(task.await.is_err_and(|error| error.is_cancelled()));
+        wait_for_request_cancellation(cancellation, active)
+            .await
+            .with_context(|| format!("gRPC {operation} storage work remained active"))
+    }
+
     #[tokio::test]
     async fn test_should_report_readiness_transitions() -> anyhow::Result<()> {
         let state = Arc::new(HealthState::new());
@@ -1406,7 +1491,7 @@ mod tests {
     #[tokio::test]
     async fn test_should_cancel_http_and_grpc_storage_work_on_client_disconnect()
     -> anyhow::Result<()> {
-        let (entered_tx, mut entered_rx) = mpsc::channel(2);
+        let (entered_tx, mut entered_rx) = mpsc::channel(4);
         let active = Arc::new(AtomicUsize::new(0));
         let (api, authentication, storage) = cancellation_api(entered_tx, Arc::clone(&active))?;
         let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -1441,7 +1526,7 @@ mod tests {
         )?;
         drop(api);
 
-        let body = serde_json::to_vec(&serde_json::json!({
+        let check_body = serde_json::to_vec(&serde_json::json!({
             "tuple_key": {
                 "user": "user:anne",
                 "relation": "viewer",
@@ -1449,43 +1534,27 @@ mod tests {
             },
             "authorization_model_id": MODEL_ID
         }))?;
-        let head = format!(
-            "POST /stores/{STORE_ID}/check HTTP/1.1\r\nHost: localhost\r\nContent-Type: \
-             application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len(),
-        );
-        let mut http_client = tokio::net::TcpStream::connect(http_address).await?;
-        http_client.write_all(head.as_bytes()).await?;
-        http_client.write_all(&body).await?;
-        let http_cancellation = timeout(Duration::from_secs(1), entered_rx.recv())
-            .await?
-            .context("HTTP request did not reach storage")?;
-        drop(http_client);
-        wait_for_request_cancellation(http_cancellation, active.as_ref()).await?;
-
-        let mut grpc_client =
-            OpenFgaServiceClient::connect(format!("http://{grpc_address}")).await?;
-        let grpc_request = pb::CheckRequest {
-            store_id: STORE_ID.to_owned(),
-            tuple_key: Some(pb::CheckRequestTupleKey {
-                user: "user:anne".to_owned(),
-                relation: "viewer".to_owned(),
-                object: "document:roadmap".to_owned(),
-            }),
-            contextual_tuples: None,
-            authorization_model_id: MODEL_ID.to_owned(),
-            trace: false,
-            context: None,
-            consistency: 0,
-        };
-        let grpc_request_task = tokio::spawn(async move { grpc_client.check(grpc_request).await });
-        let grpc_cancellation = timeout(Duration::from_secs(1), entered_rx.recv())
-            .await?
-            .context("gRPC request did not reach storage")?;
-        grpc_request_task.abort();
-        let request_result = grpc_request_task.await;
-        assert!(request_result.is_err_and(|error| error.is_cancelled()));
-        wait_for_request_cancellation(grpc_cancellation, active.as_ref()).await?;
+        assert_http_disconnect_cancels_storage(
+            http_address,
+            &format!("/stores/{STORE_ID}/check"),
+            &check_body,
+            &mut entered_rx,
+            active.as_ref(),
+            "Check",
+        )
+        .await?;
+        let stream_body = serde_json::to_vec(&streamed_list_objects_request())?;
+        assert_http_disconnect_cancels_storage(
+            http_address,
+            &format!("/stores/{STORE_ID}/streamed-list-objects"),
+            &stream_body,
+            &mut entered_rx,
+            active.as_ref(),
+            "streamed ListObjects",
+        )
+        .await?;
+        assert_grpc_disconnects_cancel_storage(grpc_address, &mut entered_rx, active.as_ref())
+            .await?;
 
         shutdown_tx.send(true)?;
         drain_tasks(&mut tasks, Duration::from_secs(2)).await?;

@@ -37,6 +37,11 @@ use openfga_storage::{
     TupleWriteOptions, TupleWriter,
 };
 use openfga_storage_memory::{MemoryStorage, MemoryStorageConfig};
+use proptest::{
+    prelude::*,
+    strategy::{Strategy, ValueTree},
+    test_runner::{Config as ProptestConfig, RngSeed, TestRunner},
+};
 use tokio_stream::StreamExt;
 
 const STORE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
@@ -280,6 +285,86 @@ async fn test_should_cancel_and_join_residual_checks_when_stream_is_dropped()
     .await?;
 
     shutdown(storage).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_should_backpressure_a_slow_stream_consumer_and_release_the_producer()
+-> Result<(), Box<dyn Error>> {
+    let storage = memory_storage().await?;
+    write_tuples(
+        storage.as_ref(),
+        vec![
+            tuple("document:first#viewer@user:alice")?,
+            tuple("document:second#viewer@user:alice")?,
+            tuple("document:third#viewer@user:alice")?,
+        ],
+    )
+    .await?;
+    let model = ModelCompiler::default().compile(&model()?)?;
+    let tuple_reader: Arc<dyn TupleReader> = storage.clone();
+    let evaluator = Arc::new(CountingCheckEvaluator::default());
+    let engine = DirectListObjectsEngine::new(InputLimits::default(), evaluator.clone());
+    let budget = ListObjectsBudget::builder()
+        .residual_concurrency(Limit::<1_024>::new(1)?)
+        .stream_buffer(Limit::<1_024>::new(1)?)
+        .build();
+    let stream = engine
+        .streamed_list_objects(
+            &command("allowed", ContextualTuples::empty())?,
+            model,
+            tuple_reader,
+            budget,
+            StorageCancellationToken::new(),
+        )
+        .await?;
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while evaluator.completed.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        evaluator.completed.load(Ordering::SeqCst),
+        2,
+        "a full stream buffer must stop the producer before the third residual Check",
+    );
+
+    drop(engine);
+    drop(stream);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while Arc::strong_count(&evaluator) != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    shutdown(storage).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_should_match_check_over_seeded_generated_enumeration_sets()
+-> Result<(), Box<dyn Error>> {
+    const SEED: u64 = 0x5eed_f6a3_0003_0005;
+    const CASES: u32 = 64;
+    let strategy = prop::collection::vec(any::<(bool, bool, bool, bool)>(), 4);
+    let mut runner = TestRunner::new(ProptestConfig {
+        cases: CASES,
+        rng_seed: RngSeed::Fixed(SEED),
+        ..ProptestConfig::default()
+    });
+
+    for case_index in 0..CASES {
+        let flags = strategy
+            .new_tree(&mut runner)
+            .map_err(|error| format!("generated case {case_index} seed {SEED:#x}: {error}"))?
+            .current();
+        verify_generated_enumeration_case(case_index, SEED, &flags).await?;
+    }
     Ok(())
 }
 
@@ -774,6 +859,44 @@ struct BlockingCheckEvaluator {
     delegate: DirectCheckEvaluator,
 }
 
+#[derive(Debug, Default)]
+struct CountingCheckEvaluator {
+    completed: AtomicUsize,
+    delegate: DirectCheckEvaluator,
+}
+
+#[async_trait]
+impl CheckEvaluator for CountingCheckEvaluator {
+    async fn check(
+        &self,
+        command: &CheckCommand,
+        model: Arc<CompiledModel>,
+        tuples: Arc<dyn TupleReader>,
+        budget: CheckBudget,
+        cancellation: StorageCancellationToken,
+    ) -> Result<CheckOutcome, CheckError> {
+        let outcome = self
+            .delegate
+            .check(command, model, tuples, budget, cancellation)
+            .await?;
+        self.completed.fetch_add(1, Ordering::SeqCst);
+        Ok(outcome)
+    }
+
+    async fn batch_check(
+        &self,
+        command: &BatchCheckCommand,
+        model: Arc<CompiledModel>,
+        tuples: Arc<dyn TupleReader>,
+        budget: CheckBudget,
+        cancellation: StorageCancellationToken,
+    ) -> Result<BatchCheckOutcome, CheckError> {
+        self.delegate
+            .batch_check(command, model, tuples, budget, cancellation)
+            .await
+    }
+}
+
 #[async_trait]
 impl CheckEvaluator for BlockingCheckEvaluator {
     async fn check(
@@ -813,6 +936,108 @@ impl Drop for ActiveCheck<'_> {
     fn drop(&mut self) {
         let _previous = self.0.fetch_sub(1, Ordering::SeqCst);
     }
+}
+
+async fn verify_generated_enumeration_case(
+    case_index: u32,
+    seed: u64,
+    flags: &[(bool, bool, bool, bool)],
+) -> Result<(), Box<dyn Error>> {
+    let storage = memory_storage().await?;
+    let mut tuples = Vec::with_capacity(flags.len().saturating_mul(4));
+    for (document_index, &(viewer, owner, wildcard, banned)) in flags.iter().enumerate() {
+        let object = format!("document:generated-{document_index}");
+        if viewer {
+            tuples.push(tuple(&format!("{object}#viewer@user:alice"))?);
+        }
+        if owner {
+            tuples.push(tuple(&format!("{object}#owner@user:alice"))?);
+        }
+        if wildcard {
+            tuples.push(tuple(&format!("{object}#viewer@user:*"))?);
+        }
+        if banned {
+            tuples.push(tuple(&format!("{object}#banned@user:alice"))?);
+        }
+    }
+    write_tuples(storage.as_ref(), tuples).await?;
+    let model = ModelCompiler::default().compile(&model()?)?;
+    let tuple_reader: Arc<dyn TupleReader> = storage.clone();
+    let check = DirectCheckEvaluator::default();
+    let mut expected_objects = BTreeSet::new();
+    for document_index in 0..flags.len() {
+        let object = format!("document:generated-{document_index}");
+        let outcome = check
+            .check(
+                &CheckCommand::new(
+                    query_context(ContextualTuples::empty(), ConditionContext::empty())?,
+                    format!("{object}#allowed@user:alice").parse()?,
+                ),
+                Arc::clone(&model),
+                Arc::clone(&tuple_reader),
+                CheckBudget::default(),
+                StorageCancellationToken::new(),
+            )
+            .await?;
+        if outcome.allowed() {
+            expected_objects.insert(object);
+        }
+    }
+
+    let listed_objects = DirectListObjectsEngine::default()
+        .list_objects(
+            &command("allowed", ContextualTuples::empty())?,
+            Arc::clone(&model),
+            Arc::clone(&tuple_reader),
+            ListObjectsBudget::default(),
+            StorageCancellationToken::new(),
+        )
+        .await?
+        .objects()
+        .iter()
+        .map(ToString::to_string)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        listed_objects, expected_objects,
+        "ListObjects/Check mismatch in generated case {case_index} seed {seed:#x}; flags={flags:?}",
+    );
+
+    let user_filter = UserTypeFilter::new("user".parse()?, None);
+    for (document_index, &(_, _, wildcard, banned)) in flags.iter().enumerate() {
+        let object = format!("document:generated-{document_index}");
+        let users = DirectListUsersEngine::default()
+            .list_users(
+                &users_command(
+                    &object,
+                    "allowed",
+                    vec![user_filter.clone()],
+                    ContextualTuples::empty(),
+                    ConditionContext::empty(),
+                )?,
+                Arc::clone(&model),
+                Arc::clone(&tuple_reader),
+                ListUsersBudget::default(),
+                StorageCancellationToken::new(),
+            )
+            .await?
+            .users()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<BTreeSet<_>>();
+        let covers_alice =
+            users.contains("user:alice") || (users.contains("user:*") && !(wildcard && banned));
+        assert_eq!(
+            covers_alice,
+            expected_objects.contains(&object),
+            "ListUsers/Check mismatch for {object} in generated case {case_index} seed {seed:#x}; \
+             flags={flags:?}; users={users:?}",
+        );
+    }
+
+    drop(tuple_reader);
+    drop(model);
+    shutdown(storage).await?;
+    Ok(())
 }
 
 fn command(

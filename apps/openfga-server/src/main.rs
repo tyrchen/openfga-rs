@@ -21,6 +21,7 @@ use tower_http::{limit::RequestBodyLimitLayer, timeout::TimeoutLayer};
 mod check_corpus;
 mod check_probe;
 mod config;
+mod enumeration_probe;
 mod runtime;
 mod telemetry;
 
@@ -101,6 +102,15 @@ enum Command {
         #[arg(long)]
         corpus: PathBuf,
     },
+    /// Compare normalized enumeration and Expand outcomes from the pinned Go and Rust servers.
+    DifferentialEnumeration {
+        /// Base URL of the vendored Go baseline.
+        #[arg(long)]
+        go_url: String,
+        /// Base URL of the Rust server.
+        #[arg(long)]
+        rust_url: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Subcommand)]
@@ -170,6 +180,9 @@ async fn main() -> Result<()> {
             check_probe::run_differential(&go_url, &rust_url).await
         }
         Command::DifferentialCheckCorpus { corpus } => check_corpus::run(corpus).await,
+        Command::DifferentialEnumeration { go_url, rust_url } => {
+            enumeration_probe::run(&go_url, &rust_url).await
+        }
     }
 }
 

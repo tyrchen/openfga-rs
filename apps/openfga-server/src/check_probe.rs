@@ -973,7 +973,7 @@ pub(crate) async fn run_differential(go_url: &str, rust_url: &str) -> Result<()>
     let go_url = validated_loopback_url(go_url)?;
     let rust_url = validated_loopback_url(rust_url)?;
     let client = differential_client()?;
-    let (go_store, go_model) = configure_go(&client, &go_url).await?;
+    let (go_store, go_model) = configure_differential_server(&client, &go_url).await?;
     let mut reports = Vec::with_capacity(DIFFERENTIAL_CASES.len());
     let mut mismatches = Vec::new();
     for case in DIFFERENTIAL_CASES {
@@ -1099,7 +1099,10 @@ fn differential_client() -> Result<Client> {
         .context("failed to build the Check differential client")
 }
 
-async fn configure_go(client: &Client, base_url: &Url) -> Result<(String, String)> {
+pub(crate) async fn configure_differential_server(
+    client: &Client,
+    base_url: &Url,
+) -> Result<(String, String)> {
     let store_url = base_url
         .join("stores")
         .context("failed to build store URL")?;
@@ -1108,12 +1111,13 @@ async fn configure_go(client: &Client, base_url: &Url) -> Result<(String, String
         .json(&json!({"name": "phase1-check-differential"}))
         .send()
         .await
-        .context("Go store creation request failed")?;
-    let store = read_success_json::<CreateStoreResponse>(response, "Go store creation").await?;
+        .context("differential store creation request failed")?;
+    let store =
+        read_success_json::<CreateStoreResponse>(response, "differential store creation").await?;
     let store_id = store
         .id
         .parse::<StoreId>()
-        .context("Go store creation returned an invalid store ID")?;
+        .context("differential store creation returned an invalid store ID")?;
     let model_url = base_url
         .join(&format!("stores/{store_id}/authorization-models"))
         .context("failed to build model URL")?;
@@ -1122,12 +1126,13 @@ async fn configure_go(client: &Client, base_url: &Url) -> Result<(String, String
         .json(&go_model_document())
         .send()
         .await
-        .context("Go model write request failed")?;
-    let model = read_success_json::<WriteModelResponse>(response, "Go model write").await?;
+        .context("differential model write request failed")?;
+    let model =
+        read_success_json::<WriteModelResponse>(response, "differential model write").await?;
     let model_id = model
         .authorization_model_id
         .parse::<AuthorizationModelId>()
-        .context("Go model write returned an invalid model ID")?;
+        .context("differential model write returned an invalid model ID")?;
     let write_url = base_url
         .join(&format!("stores/{store_id}/write"))
         .context("failed to build tuple write URL")?;
@@ -1139,12 +1144,12 @@ async fn configure_go(client: &Client, base_url: &Url) -> Result<(String, String
         }))
         .send()
         .await
-        .context("Go tuple write request failed")?;
-    require_success(response, "Go tuple write").await?;
+        .context("differential tuple write request failed")?;
+    require_success(response, "differential tuple write").await?;
     Ok((store_id.to_string(), model_id.to_string()))
 }
 
-fn go_model_document() -> Value {
+pub(crate) fn go_model_document() -> Value {
     json!({
         "schema_version": "1.1",
         "type_definitions": [
@@ -1236,7 +1241,7 @@ fn go_model_document() -> Value {
     })
 }
 
-fn go_fixture_tuples() -> Vec<Value> {
+pub(crate) fn go_fixture_tuples() -> Vec<Value> {
     vec![
         json!({"object": "document:direct", "relation": "viewer", "user": "user:anne"}),
         json!({"object": "document:wild", "relation": "viewer", "user": "user:*"}),

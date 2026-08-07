@@ -642,6 +642,7 @@ async fn verify_hot_query_plans(storage: &PostgresStorage) -> Result<(), Box<dyn
         forward.contains("tuples_pkey") || forward.contains("tuples_forward_idx"),
         "{forward}"
     );
+    assert!(!forward.contains("Seq Scan"), "{forward}");
     let reverse = explain(
         storage,
         "EXPLAIN (COSTS OFF) SELECT tuple_payload FROM tuples WHERE store_id = $1 AND \
@@ -652,6 +653,7 @@ async fn verify_hot_query_plans(storage: &PostgresStorage) -> Result<(), Box<dyn
     )
     .await?;
     assert!(reverse.contains("tuples_reverse_idx"), "{reverse}");
+    assert!(!reverse.contains("Seq Scan"), "{reverse}");
     let changes = explain(
         storage,
         "EXPLAIN (COSTS OFF) SELECT change_id FROM tuple_changes WHERE store_id = $1 AND \
