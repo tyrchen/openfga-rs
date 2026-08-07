@@ -262,14 +262,14 @@ impl OpenFgaService for OpenFgaApi {
         &self,
         request: Request<pb::ExpandRequest>,
     ) -> Result<Response<pb::ExpandResponse>, Status> {
-        let _permit = validate_unimplemented(
+        unary!(
             self,
-            &request,
-            Action::Expand,
-            &request.get_ref().store_id,
+            request,
+            expand,
             EndpointClass::Enumeration,
-        )?;
-        Err(Status::unimplemented("method Expand not implemented"))
+            Action::Expand,
+            Some(request.get_ref().store_id.as_str())
+        )
     }
 
     async fn read_authorization_model(

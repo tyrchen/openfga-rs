@@ -13,6 +13,7 @@ mod check;
 mod clock;
 mod common;
 mod error;
+mod expand;
 mod identifier;
 mod list_objects;
 mod list_users;
@@ -27,6 +28,7 @@ pub use clock::{ServiceClock, SystemServiceClock};
 pub use error::{
     ModelRelationType, ModelSemanticContext, ModelSetOperator, ServiceError, ServiceErrorKind,
 };
+pub use expand::{ExpandService, ResolvedExpandModel};
 pub use identifier::{
     IdentifierSource, IdentifierSourceError, IdentifierSourceErrorKind, SystemIdentifierSource,
     SystemIdentifierSourceConfig,

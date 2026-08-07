@@ -12,6 +12,7 @@ use openfga_domain::{
     ParameterName, ParseKind, RelationName, RelationshipTuple, StoreId, SubjectRef, TupleKey,
     TypeName, UserTypeFilter, ValidationReason,
 };
+use openfga_list::{ExpandNode, ExpandNodeValue};
 use openfga_model::{
     AuthorizationModelDefinition, ConditionParameterTypeError, ConditionSource,
     DirectRestrictionSource, RelationSource, RestrictionKindSource, RestrictionKindSourceRef,
@@ -75,6 +76,10 @@ pub(crate) fn object_ref(
     ObjectRef::new(object_type, object_id, limits).map_err(|_| ApiError::invalid_request())
 }
 
+pub(crate) fn object_ref_string(value: &str, limits: &InputLimits) -> Result<ObjectRef, ApiError> {
+    ObjectRef::parse_with_limits(value, limits).map_err(|_| ApiError::invalid_request())
+}
+
 pub(crate) fn user_type_filter(
     filter: &pb::UserTypeFilter,
     limits: &InputLimits,
@@ -105,6 +110,59 @@ pub(crate) fn user(subject: &SubjectRef) -> Result<pb::User, ApiError> {
         _ => return Err(ApiError::internal()),
     };
     Ok(pb::User { user: Some(user) })
+}
+
+pub(crate) fn expand_node(node: &ExpandNode) -> Result<pb::userset_tree::Node, ApiError> {
+    use pb::userset_tree::{
+        Computed, Difference, Leaf, Nodes, TupleToUserset, Users, leaf, node as wire_node,
+    };
+
+    let value = match node.value() {
+        ExpandNodeValue::Users(users) => wire_node::Value::Leaf(Leaf {
+            value: Some(leaf::Value::Users(Users {
+                users: users.iter().map(ToString::to_string).collect(),
+            })),
+        }),
+        ExpandNodeValue::Computed(userset) => wire_node::Value::Leaf(Leaf {
+            value: Some(leaf::Value::Computed(Computed {
+                userset: userset.to_string(),
+            })),
+        }),
+        ExpandNodeValue::TupleToUserset { tupleset, computed } => wire_node::Value::Leaf(Leaf {
+            value: Some(leaf::Value::TupleToUserset(TupleToUserset {
+                tupleset: tupleset.to_string(),
+                computed: computed
+                    .iter()
+                    .map(|userset| Computed {
+                        userset: userset.to_string(),
+                    })
+                    .collect(),
+            })),
+        }),
+        ExpandNodeValue::Union(children) => wire_node::Value::Union(Nodes {
+            nodes: children
+                .iter()
+                .map(expand_node)
+                .collect::<Result<Vec<_>, _>>()?,
+        }),
+        ExpandNodeValue::Intersection(children) => wire_node::Value::Intersection(Nodes {
+            nodes: children
+                .iter()
+                .map(expand_node)
+                .collect::<Result<Vec<_>, _>>()?,
+        }),
+        ExpandNodeValue::Difference { base, subtract } => {
+            wire_node::Value::Difference(Box::new(Difference {
+                base: Some(Box::new(expand_node(base)?)),
+                subtract: Some(Box::new(expand_node(subtract)?)),
+            }))
+        }
+        _ => return Err(ApiError::internal()),
+    };
+    Ok(pb::userset_tree::Node {
+        name: node.name().to_string(),
+        value: Some(value),
+    })
 }
 
 pub(crate) fn tuple_key(

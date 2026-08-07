@@ -1,4 +1,4 @@
-//! Independent finite ceilings for reverse candidate discovery.
+//! Independent finite ceilings for enumeration and diagnostic expansion.
 
 use openfga_check::CheckBudget;
 use openfga_domain::Limit;
@@ -168,6 +168,60 @@ impl ListUsersBudget {
 }
 
 impl Default for ListUsersBudget {
+    fn default() -> Self {
+        Self::builder().build()
+    }
+}
+
+/// Independent finite ceilings for one diagnostic `Expand` tree.
+#[derive(Clone, Copy, Debug, TypedBuilder)]
+#[non_exhaustive]
+pub struct ExpandBudget {
+    #[builder(default = trusted_limit::<1_000>(25))]
+    depth: Limit<1_000>,
+    #[builder(default = trusted_limit::<100_000>(10_000))]
+    nodes: Limit<100_000>,
+    #[builder(default = trusted_limit::<100_000>(1_000))]
+    datastore_queries: Limit<100_000>,
+    #[builder(default = trusted_limit::<1_000_000>(10_000))]
+    tuple_items: Limit<1_000_000>,
+    #[builder(default = trusted_limit::<16_777_216>(1_048_576))]
+    response_bytes: Limit<16_777_216>,
+}
+
+impl ExpandBudget {
+    /// Returns the maximum rewrite-tree depth.
+    #[must_use]
+    pub const fn maximum_depth(self) -> u32 {
+        self.depth.get()
+    }
+
+    /// Returns the maximum number of materialized tree nodes.
+    #[must_use]
+    pub const fn maximum_nodes(self) -> u32 {
+        self.nodes.get()
+    }
+
+    /// Returns the maximum number of forward datastore reads.
+    #[must_use]
+    pub const fn maximum_datastore_queries(self) -> u32 {
+        self.datastore_queries.get()
+    }
+
+    /// Returns the maximum number of stored and contextual tuples inspected.
+    #[must_use]
+    pub const fn maximum_tuple_items(self) -> u32 {
+        self.tuple_items.get()
+    }
+
+    /// Returns a conservative ceiling for the serialized response size.
+    #[must_use]
+    pub const fn maximum_response_bytes(self) -> u32 {
+        self.response_bytes.get()
+    }
+}
+
+impl Default for ExpandBudget {
     fn default() -> Self {
         Self::builder().build()
     }

@@ -43,6 +43,7 @@ pub(crate) struct ServerConfig {
     pub(crate) evaluator: EvaluatorPolicy,
     pub(crate) list_objects: ListObjectsPolicy,
     pub(crate) list_users: ListUsersPolicy,
+    pub(crate) expand: ExpandPolicy,
     pub(crate) telemetry: TelemetryConfig,
     pub(crate) shutdown: ShutdownConfig,
 }
@@ -410,6 +411,33 @@ impl Default for ListUsersPolicy {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ExpandPolicy {
+    #[serde(default = "default_depth")]
+    pub(crate) depth: u32,
+    #[serde(default = "default_candidates")]
+    pub(crate) nodes: u32,
+    #[serde(default = "default_candidate_datastore_queries")]
+    pub(crate) datastore_queries: u32,
+    #[serde(default = "default_tuple_items")]
+    pub(crate) tuple_items: u32,
+    #[serde(default = "default_expand_response_bytes")]
+    pub(crate) response_bytes: u32,
+}
+
+impl Default for ExpandPolicy {
+    fn default() -> Self {
+        Self {
+            depth: default_depth(),
+            nodes: default_candidates(),
+            datastore_queries: default_candidate_datastore_queries(),
+            tuple_items: default_tuple_items(),
+            response_bytes: default_expand_response_bytes(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) enum LogFormat {
@@ -476,6 +504,8 @@ struct RawServerConfig {
     #[serde(default)]
     list_users: ListUsersPolicy,
     #[serde(default)]
+    expand: ExpandPolicy,
+    #[serde(default)]
     telemetry: TelemetryConfig,
     #[serde(default)]
     shutdown: ShutdownConfig,
@@ -493,6 +523,7 @@ impl From<RawServerConfig> for ServerConfig {
             evaluator: raw.evaluator,
             list_objects: raw.list_objects,
             list_users: raw.list_users,
+            expand: raw.expand,
             telemetry: raw.telemetry,
             shutdown: raw.shutdown,
         }
@@ -535,6 +566,7 @@ impl ServerConfig {
         self.validate_evaluator()?;
         self.validate_list_objects()?;
         self.validate_list_users()?;
+        self.validate_expand()?;
         self.validate_database_concurrency()?;
         self.validate_telemetry()?;
         bounded_duration(
@@ -907,6 +939,18 @@ impl ServerConfig {
         Ok(())
     }
 
+    fn validate_expand(&self) -> Result<()> {
+        Limit::<1_000>::new(self.expand.depth).context("Expand depth is invalid")?;
+        Limit::<100_000>::new(self.expand.nodes).context("Expand node limit is invalid")?;
+        Limit::<100_000>::new(self.expand.datastore_queries)
+            .context("Expand datastore query limit is invalid")?;
+        Limit::<1_000_000>::new(self.expand.tuple_items)
+            .context("Expand tuple item limit is invalid")?;
+        Limit::<16_777_216>::new(self.expand.response_bytes)
+            .context("Expand response byte limit is invalid")?;
+        Ok(())
+    }
+
     fn validate_database_concurrency(&self) -> Result<()> {
         if self.storage.backend == StorageBackend::Postgres
             && (self.evaluator.concurrent_reads > self.storage.postgres.max_connections
@@ -1171,6 +1215,10 @@ const fn default_candidates() -> u32 {
     10_000
 }
 
+const fn default_expand_response_bytes() -> u32 {
+    1_048_576
+}
+
 const fn default_residual_concurrency() -> u32 {
     16
 }
@@ -1349,6 +1397,10 @@ evaluator: {}
         assert!(config.validate().is_err());
 
         config.list_users.subjects = 10_000;
+        config.expand.response_bytes = 0;
+        assert!(config.validate().is_err());
+
+        config.expand.response_bytes = 1_048_576;
         config.tls.reload_interval_seconds = 0;
         assert!(config.validate().is_err());
         Ok(())

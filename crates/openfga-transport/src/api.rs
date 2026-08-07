@@ -13,9 +13,10 @@ use std::{
 use openfga_auth::Action;
 use openfga_check::{CheckError, CheckErrorKind, CheckResolution};
 use openfga_domain::{
-    BatchCheckCommand, BatchCheckItem, BatchCheckItems, CheckCommand, ConsistencyPreference,
-    CorrelationId, Deadline, ListControl, ListObjectsCommand, ListUsersCommand, ModelSelection,
-    Principal, QueryContext, StoreId, TokenOperation, TypeName, UserTypeFilters,
+    BatchCheckCommand, BatchCheckItem, BatchCheckItems, CheckCommand, ConditionContext,
+    ConsistencyPreference, CorrelationId, Deadline, ExpandCommand, ListControl, ListObjectsCommand,
+    ListUsersCommand, ModelSelection, Principal, QueryContext, StoreId, TokenOperation, TypeName,
+    UserTypeFilters,
 };
 use openfga_list::ListObjectsStream;
 use openfga_proto::openfga::v1 as pb;
@@ -875,6 +876,68 @@ impl OpenFgaApi {
             ListControl::new(maximum_results, None, &self.config.limits)
                 .map_err(|_| ApiError::invalid_request())?,
         ))
+    }
+
+    #[tracing::instrument(skip_all, fields(operation = "expand"))]
+    pub(crate) async fn expand(
+        &self,
+        principal: &Principal,
+        request: pb::ExpandRequest,
+    ) -> Result<pb::ExpandResponse, ApiError> {
+        self.preauthorize(principal, Action::Expand, Some(&request.store_id))?;
+        ApiError::validate(&request)?;
+        self.authorize_store(principal, Action::Expand, &request.store_id)?;
+        let store_id = convert::store_id(&request.store_id)?;
+        let model_selection = convert::model_selection(&request.authorization_model_id)?;
+        let consistency = consistency(request.consistency)?;
+        let deadline = self.deadline()?;
+        let cancellation = RequestCancellation::new();
+        let model = self
+            .services
+            .expand
+            .resolve_transport_model(
+                store_id,
+                model_selection,
+                consistency,
+                deadline,
+                cancellation.token(),
+            )
+            .await
+            .map_err(ApiError::from)?;
+        let tuple_key = request.tuple_key.ok_or_else(ApiError::missing_tuple_key)?;
+        let query = QueryContext::builder()
+            .store_id(store_id)
+            .model_selection(model_selection)
+            .consistency(consistency)
+            .contextual_tuples(convert::contextual_tuples_for_wire_semantics(
+                request.contextual_tuples,
+                &self.config.limits,
+                self.config.maximum_message_bytes,
+            )?)
+            .condition_context(ConditionContext::empty())
+            .deadline(deadline)
+            .principal(principal.clone())
+            .build();
+        let command = ExpandCommand::new(
+            query,
+            convert::object_ref_string(&tuple_key.object, &self.config.limits)?,
+            convert::relation_name(&tuple_key.relation, &self.config.limits)?,
+        );
+        let outcome = self
+            .services
+            .expand
+            .expand_resolved(&command, model, cancellation.token())
+            .await
+            .map_err(ApiError::from)?;
+        let response = pb::ExpandResponse {
+            tree: Some(pb::UsersetTree {
+                root: Some(convert::expand_node(outcome.root())?),
+            }),
+        };
+        if response.encoded_len() > self.config.maximum_message_bytes {
+            return Err(ApiError::response_too_large());
+        }
+        Ok(response)
     }
 
     #[tracing::instrument(skip_all, fields(operation = "list_users"))]

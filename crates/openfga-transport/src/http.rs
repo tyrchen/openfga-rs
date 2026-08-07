@@ -937,11 +937,10 @@ async fn expand(
     Extension(principal): Extension<Principal>,
     Path(store_id): Path<String>,
     body: Result<Json<pb::ExpandRequest>, JsonRejection>,
-) -> Result<(), ApiError> {
+) -> Result<Json<pb::ExpandResponse>, ApiError> {
     let mut request = json(body)?;
     request.store_id.clone_from(&store_id);
-    ApiError::validate(&request)?;
-    authorize_unimplemented(&api, &principal, Action::Expand, &store_id)
+    api.expand(&principal, request).await.map(Json)
 }
 
 async fn list_objects(
@@ -1049,16 +1048,6 @@ async fn list_users(
     let mut request = json(body)?;
     request.store_id.clone_from(&store_id);
     api.list_users(&principal, request).await.map(Json)
-}
-
-fn authorize_unimplemented(
-    api: &OpenFgaApi,
-    principal: &Principal,
-    action: Action,
-    store_id: &str,
-) -> Result<(), ApiError> {
-    api.authorize_store(principal, action, store_id)?;
-    Err(ApiError::unimplemented())
 }
 
 fn json<T>(body: Result<Json<T>, JsonRejection>) -> Result<T, ApiError> {

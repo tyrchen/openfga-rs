@@ -19,14 +19,14 @@ use openfga_condition::{ConditionDefinition, ParameterType};
 use openfga_domain::{
     AuthorizationModelId, BatchCheckCommand, CheckCommand, ConditionBinding, ConditionContext,
     ConditionReference, ConsistencyPreference, ContextValue, ContextualTuples, Deadline,
-    InputLimits, Limit, ListControl, ListObjectsCommand, ListUsersCommand, ModelSelection,
-    Principal, PrincipalKind, QueryContext, RelationshipTuple, RequestTimeout, StoreId, TupleKey,
-    UserTypeFilter, UserTypeFilters,
+    ExpandCommand, InputLimits, Limit, ListControl, ListObjectsCommand, ListUsersCommand,
+    ModelSelection, Principal, PrincipalKind, QueryContext, RelationshipTuple, RequestTimeout,
+    StoreId, TupleKey, UserTypeFilter, UserTypeFilters,
 };
 use openfga_list::{
-    Candidate, CandidateBudget, DirectListObjectsEngine, DirectListUsersEngine, ListErrorKind,
-    ListObjectsBudget, ListObjectsEngine, ListUsersBudget, ListUsersEngine,
-    ReverseCandidateTraversal,
+    Candidate, CandidateBudget, DirectExpandEngine, DirectListObjectsEngine, DirectListUsersEngine,
+    ExpandBudget, ExpandEngine, ExpandNodeValue, ListErrorKind, ListObjectsBudget,
+    ListObjectsEngine, ListUsersBudget, ListUsersEngine, ReverseCandidateTraversal,
 };
 use openfga_model::{
     AuthorizationModelSource, CompiledModel, ConditionSource, DirectRestrictionSource,
@@ -532,6 +532,242 @@ async fn test_should_enforce_list_users_controls_and_combine_multiple_filters()
     Ok(())
 }
 
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the baseline tree-shape matrix shares one immutable model and tuple fixture"
+)]
+async fn test_should_build_baseline_compatible_expand_tree_shapes() -> Result<(), Box<dyn Error>> {
+    let storage = memory_storage().await?;
+    write_tuples(
+        storage.as_ref(),
+        vec![
+            tuple("document:ttu#parent@folder:roadmap")?,
+            tuple("document:bounded#viewer@user:bob")?,
+            tuple("document:bounded#viewer@user:alice")?,
+            tuple("document:ordering#viewer@user:zeta")?,
+            tuple("document:ordering#viewer@user:*")?,
+            tuple("document:ordering#viewer@group:eng#member")?,
+            conditional_tuple("document:conditional#conditional@user:alice", 100)?,
+        ],
+    )
+    .await?;
+    let model = ModelCompiler::default().compile(&model()?)?;
+    let tuple_reader: Arc<dyn TupleReader> = storage.clone();
+    let engine = DirectExpandEngine::default();
+
+    let outcome = engine
+        .expand(
+            &expand_command("document:ttu", "viewer", ContextualTuples::empty())?,
+            Arc::clone(&model),
+            Arc::clone(&tuple_reader),
+            ExpandBudget::default(),
+            StorageCancellationToken::new(),
+        )
+        .await?;
+    let ExpandNodeValue::Union(children) = outcome.root().value() else {
+        return Err("viewer expansion was not a union".into());
+    };
+    let ttu = children.get(2).ok_or("viewer expansion omitted TTU")?;
+    let ExpandNodeValue::TupleToUserset { tupleset, computed } = ttu.value() else {
+        return Err("viewer TTU child had the wrong shape".into());
+    };
+    assert_eq!(tupleset.to_string(), "document:ttu#parent");
+    assert_eq!(
+        computed.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        vec!["folder:roadmap#viewer"],
+    );
+
+    let outcome = engine
+        .expand(
+            &expand_command("document:bounded", "viewer", ContextualTuples::empty())?,
+            Arc::clone(&model),
+            Arc::clone(&tuple_reader),
+            ExpandBudget::default(),
+            StorageCancellationToken::new(),
+        )
+        .await?;
+    let ExpandNodeValue::Union(children) = outcome.root().value() else {
+        return Err("bounded viewer expansion was not a union".into());
+    };
+    let direct = children
+        .first()
+        .ok_or("viewer expansion omitted direct users")?;
+    let ExpandNodeValue::Users(users) = direct.value() else {
+        return Err("viewer direct child had the wrong shape".into());
+    };
+    assert_eq!(
+        users.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        vec!["user:alice", "user:bob"],
+    );
+
+    let outcome = engine
+        .expand(
+            &expand_command("document:ordering", "viewer", ContextualTuples::empty())?,
+            Arc::clone(&model),
+            Arc::clone(&tuple_reader),
+            ExpandBudget::default(),
+            StorageCancellationToken::new(),
+        )
+        .await?;
+    let ExpandNodeValue::Union(children) = outcome.root().value() else {
+        return Err("ordering viewer expansion was not a union".into());
+    };
+    let direct = children
+        .first()
+        .ok_or("ordering expansion omitted direct users")?;
+    let ExpandNodeValue::Users(users) = direct.value() else {
+        return Err("ordering direct child had the wrong shape".into());
+    };
+    assert_eq!(
+        users.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        vec!["group:eng#member", "user:*", "user:zeta"],
+    );
+
+    for (relation, expected) in [("both", "intersection"), ("allowed", "difference")] {
+        let outcome = engine
+            .expand(
+                &expand_command("document:bounded", relation, ContextualTuples::empty())?,
+                Arc::clone(&model),
+                Arc::clone(&tuple_reader),
+                ExpandBudget::default(),
+                StorageCancellationToken::new(),
+            )
+            .await?;
+        let actual = match outcome.root().value() {
+            ExpandNodeValue::Intersection(_) => "intersection",
+            ExpandNodeValue::Difference { .. } => "difference",
+            _ => "other",
+        };
+        assert_eq!(actual, expected);
+    }
+
+    let contextual = ContextualTuples::new(
+        vec![tuple("document:contextual-users#viewer@user:alice")?],
+        &InputLimits::default(),
+    )?;
+    let outcome = engine
+        .expand(
+            &expand_command("document:contextual-users", "viewer", contextual)?,
+            model,
+            tuple_reader,
+            ExpandBudget::default(),
+            StorageCancellationToken::new(),
+        )
+        .await?;
+    assert!(outcome.metadata().nodes() > 0);
+    assert!(outcome.metadata().estimated_response_bytes() > 0);
+
+    shutdown(storage).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_should_fail_expand_closed_on_resource_limits_and_cancellation()
+-> Result<(), Box<dyn Error>> {
+    let storage = memory_storage().await?;
+    write_tuples(
+        storage.as_ref(),
+        vec![
+            conditional_tuple("document:conditional#conditional@user:alice", 100)?,
+            tuple("document:conditional#conditional@folder:roadmap")?,
+        ],
+    )
+    .await?;
+    let model = ModelCompiler::default().compile(&model()?)?;
+    let tuple_reader: Arc<dyn TupleReader> = storage.clone();
+    let engine = DirectExpandEngine::default();
+    let command = expand_command(
+        "document:conditional",
+        "conditional",
+        ContextualTuples::empty(),
+    )?;
+
+    let outcome = engine
+        .expand(
+            &command,
+            Arc::clone(&model),
+            Arc::clone(&tuple_reader),
+            ExpandBudget::default(),
+            StorageCancellationToken::new(),
+        )
+        .await?;
+    let ExpandNodeValue::Users(users) = outcome.root().value() else {
+        return Err("conditional direct expansion had the wrong shape".into());
+    };
+    assert_eq!(
+        users.len(),
+        1,
+        "Expand must retain conditioned tuples and ignore invalid persisted tuples",
+    );
+
+    let node_budget = ExpandBudget::builder()
+        .nodes(Limit::<100_000>::new(1)?)
+        .build();
+    let error = engine
+        .expand(
+            &expand_command("document:conditional", "viewer", ContextualTuples::empty())?,
+            Arc::clone(&model),
+            Arc::clone(&tuple_reader),
+            node_budget,
+            StorageCancellationToken::new(),
+        )
+        .await
+        .err()
+        .ok_or("Expand node limit unexpectedly returned a partial tree")?;
+    assert_eq!(error.kind(), ListErrorKind::NodeExceeded);
+
+    let depth_budget = ExpandBudget::builder()
+        .depth(Limit::<1_000>::new(1)?)
+        .build();
+    let error = engine
+        .expand(
+            &expand_command("document:conditional", "viewer", ContextualTuples::empty())?,
+            Arc::clone(&model),
+            Arc::clone(&tuple_reader),
+            depth_budget,
+            StorageCancellationToken::new(),
+        )
+        .await
+        .err()
+        .ok_or("Expand depth limit unexpectedly returned a partial tree")?;
+    assert_eq!(error.kind(), ListErrorKind::DepthExceeded);
+
+    let response_budget = ExpandBudget::builder()
+        .response_bytes(Limit::<16_777_216>::new(1)?)
+        .build();
+    let error = engine
+        .expand(
+            &command,
+            Arc::clone(&model),
+            Arc::clone(&tuple_reader),
+            response_budget,
+            StorageCancellationToken::new(),
+        )
+        .await
+        .err()
+        .ok_or("Expand response limit unexpectedly returned a partial tree")?;
+    assert_eq!(error.kind(), ListErrorKind::ResponseSizeExceeded);
+
+    let cancellation = StorageCancellationToken::new();
+    cancellation.cancel();
+    let error = engine
+        .expand(
+            &command,
+            model,
+            tuple_reader,
+            ExpandBudget::default(),
+            cancellation,
+        )
+        .await
+        .err()
+        .ok_or("cancelled Expand unexpectedly completed")?;
+    assert_eq!(error.kind(), ListErrorKind::Cancelled);
+
+    shutdown(storage).await?;
+    Ok(())
+}
+
 #[derive(Debug, Default)]
 struct BlockingCheckEvaluator {
     active: AtomicUsize,
@@ -612,6 +848,18 @@ fn users_command(
         condition_context,
         100,
     )
+}
+
+fn expand_command(
+    object: &str,
+    relation: &str,
+    contextual_tuples: ContextualTuples,
+) -> Result<ExpandCommand, Box<dyn Error>> {
+    Ok(ExpandCommand::new(
+        query_context(contextual_tuples, ConditionContext::empty())?,
+        object.parse()?,
+        relation.parse()?,
+    ))
 }
 
 fn users_command_with_limit(

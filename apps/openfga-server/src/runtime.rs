@@ -20,12 +20,12 @@ use openfga_check::CheckBudget;
 use openfga_domain::{
     ConsistencyPreference, Deadline, InputLimits, Limit, RequestTimeout, TokenCodec, TokenKey,
 };
-use openfga_list::{CandidateBudget, ListObjectsBudget, ListUsersBudget};
+use openfga_list::{CandidateBudget, ExpandBudget, ListObjectsBudget, ListUsersBudget};
 use openfga_model::ModelCompiler;
 use openfga_service::{
-    AssertionService, ChangeService, CheckService, IdentifierSource, ListObjectsService,
-    ListUsersService, ModelPublication, ModelService, StoreService, SystemIdentifierSource,
-    SystemIdentifierSourceConfig, SystemServiceClock, TupleService,
+    AssertionService, ChangeService, CheckService, ExpandService, IdentifierSource,
+    ListObjectsService, ListUsersService, ModelPublication, ModelService, StoreService,
+    SystemIdentifierSource, SystemIdentifierSourceConfig, SystemServiceClock, TupleService,
 };
 use openfga_storage::{
     AssertionReader, AssertionWriter, ChangeReader, HealthCheck, ModelReader, ModelWriter,
@@ -301,6 +301,7 @@ async fn assemble(config: &ServerConfig) -> Result<RuntimeAssembly> {
     let budget = check_budget(config)?;
     let list_objects_budget = list_objects_budget(config, budget)?;
     let list_users_budget = list_users_budget(config)?;
+    let expand_budget = expand_budget(config)?;
     let (services, storage, health) = match config.storage.backend {
         StorageBackend::Memory => {
             let capacity = NonZeroUsize::new(config.storage.memory.actor_capacity)
@@ -321,6 +322,7 @@ async fn assemble(config: &ServerConfig) -> Result<RuntimeAssembly> {
                 budget,
                 list_objects_budget,
                 list_users_budget,
+                expand_budget,
             );
             (services, StorageOwner::Memory(storage), health)
         }
@@ -339,6 +341,7 @@ async fn assemble(config: &ServerConfig) -> Result<RuntimeAssembly> {
                 budget,
                 list_objects_budget,
                 list_users_budget,
+                expand_budget,
             );
             (services, StorageOwner::Postgres(storage), health)
         }
@@ -422,6 +425,7 @@ fn services<B>(
     budget: CheckBudget,
     list_objects_budget: ListObjectsBudget,
     list_users_budget: ListUsersBudget,
+    expand_budget: ExpandBudget,
 ) -> OpenFgaServices
 where
     B: AssertionReader
@@ -489,11 +493,12 @@ where
             limits.clone(),
         ))
         .list_users(ListUsersService::direct(
-            models,
-            tuples,
+            Arc::clone(&models),
+            Arc::clone(&tuples),
             list_users_budget,
-            limits,
+            limits.clone(),
         ))
+        .expand(ExpandService::direct(models, tuples, expand_budget, limits))
         .build()
 }
 
@@ -541,6 +546,16 @@ fn list_users_budget(config: &ServerConfig) -> Result<ListUsersBudget> {
         .tuple_items(Limit::<1_000_000>::new(config.list_users.tuple_items)?)
         .subjects(Limit::<100_000>::new(config.list_users.subjects)?)
         .condition_cost(Limit::<1_000_000>::new(config.list_users.condition_cost)?)
+        .build())
+}
+
+fn expand_budget(config: &ServerConfig) -> Result<ExpandBudget> {
+    Ok(ExpandBudget::builder()
+        .depth(Limit::<1_000>::new(config.expand.depth)?)
+        .nodes(Limit::<100_000>::new(config.expand.nodes)?)
+        .datastore_queries(Limit::<100_000>::new(config.expand.datastore_queries)?)
+        .tuple_items(Limit::<1_000_000>::new(config.expand.tuple_items)?)
+        .response_bytes(Limit::<16_777_216>::new(config.expand.response_bytes)?)
         .build())
 }
 
@@ -1062,13 +1077,13 @@ mod tests {
         AuthorizationModelId, InputLimits, PrincipalId, RequestTimeout, StoreId, TokenCodec,
         TokenKey, TokenKeyId,
     };
-    use openfga_list::{ListObjectsBudget, ListUsersBudget};
+    use openfga_list::{ExpandBudget, ListObjectsBudget, ListUsersBudget};
     use openfga_model::ModelCompiler;
     use openfga_proto::openfga::v1::{self as pb, open_fga_service_client::OpenFgaServiceClient};
     use openfga_service::{
-        AssertionService, ChangeService, CheckService, IdentifierSource, IdentifierSourceError,
-        ListObjectsService, ListUsersService, ModelPublication, ModelService, ServiceClock,
-        StoreService, TupleService,
+        AssertionService, ChangeService, CheckService, ExpandService, IdentifierSource,
+        IdentifierSourceError, ListObjectsService, ListUsersService, ModelPublication,
+        ModelService, ServiceClock, StoreService, TupleService,
     };
     use openfga_storage::{
         AssertionReader, AssertionWriter, ChangeReader, ModelReader, ModelWriter, OperationContext,
@@ -1256,9 +1271,15 @@ mod tests {
                 limits.clone(),
             ))
             .list_users(ListUsersService::direct(
+                Arc::clone(&blocking_models),
+                Arc::clone(&tuples),
+                ListUsersBudget::default(),
+                limits.clone(),
+            ))
+            .expand(ExpandService::direct(
                 blocking_models,
                 tuples,
-                ListUsersBudget::default(),
+                ExpandBudget::default(),
                 limits.clone(),
             ))
             .build();

@@ -63,6 +63,12 @@ listUsers:
   tupleItems: 10000
   subjects: 10000
   conditionCost: 100000
+expand:
+  depth: 25
+  nodes: 10000
+  datastoreQueries: 1000
+  tupleItems: 10000
+  responseBytes: 1048576
 telemetry:
   logFormat: pretty
   logFilter: info

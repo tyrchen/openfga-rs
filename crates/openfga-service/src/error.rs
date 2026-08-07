@@ -470,7 +470,9 @@ impl From<ListError> for ServiceError {
             | ListErrorKind::TupleItemExceeded
             | ListErrorKind::CandidateExceeded
             | ListErrorKind::SubjectExceeded
-            | ListErrorKind::ConditionCostExceeded => ServiceErrorKind::ResourceExhausted,
+            | ListErrorKind::ConditionCostExceeded
+            | ListErrorKind::NodeExceeded
+            | ListErrorKind::ResponseSizeExceeded => ServiceErrorKind::ResourceExhausted,
             ListErrorKind::StorageUnavailable => ServiceErrorKind::Unavailable,
             ListErrorKind::Timeout => ServiceErrorKind::Timeout,
             ListErrorKind::Cancelled => ServiceErrorKind::Cancelled,

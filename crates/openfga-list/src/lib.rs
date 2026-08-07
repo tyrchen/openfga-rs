@@ -10,15 +10,19 @@ mod budget;
 mod candidate;
 mod common;
 mod error;
+mod expand;
 mod list_objects;
 mod list_users;
 
 pub use budget::{
-    CandidateBudget, CandidateBudgetBuilder, ListObjectsBudget, ListObjectsBudgetBuilder,
-    ListUsersBudget, ListUsersBudgetBuilder,
+    CandidateBudget, CandidateBudgetBuilder, ExpandBudget, ExpandBudgetBuilder, ListObjectsBudget,
+    ListObjectsBudgetBuilder, ListUsersBudget, ListUsersBudgetBuilder,
 };
 pub use candidate::{Candidate, CandidateMetadata, CandidateSet, ReverseCandidateTraversal};
 pub use error::{ListError, ListErrorKind};
+pub use expand::{
+    DirectExpandEngine, ExpandEngine, ExpandMetadata, ExpandNode, ExpandNodeValue, ExpandOutcome,
+};
 pub use list_objects::{
     DirectListObjectsEngine, ListObjectsEngine, ListObjectsMetadata, ListObjectsOutcome,
     ListObjectsStream,

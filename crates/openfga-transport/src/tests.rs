@@ -19,16 +19,16 @@ use openfga_domain::{
     AuthorizationModelId, FingerprintBuilder, InputLimits, Principal, PrincipalId, PrincipalKind,
     RequestTimeout, StoreId, TokenCodec, TokenKey, TokenKeyId, TokenOperation,
 };
-use openfga_list::{ListObjectsBudget, ListUsersBudget};
+use openfga_list::{ExpandBudget, ListObjectsBudget, ListUsersBudget};
 use openfga_model::ModelCompiler;
 use openfga_proto::openfga::{
     v1 as pb,
     v1::{open_fga_service_client::OpenFgaServiceClient, open_fga_service_server::OpenFgaService},
 };
 use openfga_service::{
-    AssertionService, ChangeService, CheckService, IdentifierSource, IdentifierSourceError,
-    ListObjectsService, ListUsersService, ModelPublication, ModelService, ServiceClock,
-    ServiceError, StoreService, TupleService,
+    AssertionService, ChangeService, CheckService, ExpandService, IdentifierSource,
+    IdentifierSourceError, ListObjectsService, ListUsersService, ModelPublication, ModelService,
+    ServiceClock, ServiceError, StoreService, TupleService,
 };
 use openfga_storage::{
     AssertionReader, AssertionWriter, ChangeReader, ModelReader, ModelWriter, OperationContext,
@@ -147,9 +147,15 @@ fn test_runtime(maximum_message_bytes: usize) -> Result<TestRuntime, Box<dyn Err
                 limits.clone(),
             ))
             .list_users(ListUsersService::direct(
+                Arc::clone(&models),
+                Arc::clone(&tuples),
+                ListUsersBudget::default(),
+                limits.clone(),
+            ))
+            .expand(ExpandService::direct(
                 models,
                 tuples,
-                ListUsersBudget::default(),
+                ExpandBudget::default(),
                 limits.clone(),
             ))
             .build(),
@@ -1556,7 +1562,7 @@ async fn test_should_execute_implemented_use_cases_through_shared_wire_adapter()
         )
         .await?;
     assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
-    let deferred = router
+    let malformed_expand = router
         .clone()
         .oneshot(
             Request::builder()
@@ -1566,16 +1572,13 @@ async fn test_should_execute_implemented_use_cases_through_shared_wire_adapter()
                 .body(Body::from(r#"{"tuple_key":{"object":"document:roadmap"}}"#))?,
         )
         .await?;
-    assert_eq!(deferred.status(), StatusCode::NOT_FOUND);
-    let deferred_body = to_bytes(deferred.into_body(), 1_024).await?;
+    assert_eq!(malformed_expand.status(), StatusCode::BAD_REQUEST);
+    let malformed_expand_body = to_bytes(malformed_expand.into_body(), 1_024).await?;
     assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&deferred_body)?,
-        serde_json::json!({
-            "code": "unimplemented",
-            "message": "the operation is not implemented"
-        }),
+        serde_json::from_slice::<serde_json::Value>(&malformed_expand_body)?["code"],
+        serde_json::json!("latest_authorization_model_not_found"),
     );
-    let grpc_deferred = OpenFgaService::expand(
+    let grpc_malformed_expand = OpenFgaService::expand(
         &api,
         authenticated_request(
             &principal,
@@ -1592,10 +1595,10 @@ async fn test_should_execute_implemented_use_cases_through_shared_wire_adapter()
         ),
     )
     .await;
-    assert!(matches!(
-        grpc_deferred,
-        Err(status) if status.code() == tonic::Code::Unimplemented
-    ));
+    let grpc_malformed_expand = grpc_malformed_expand
+        .err()
+        .ok_or("malformed gRPC Expand unexpectedly succeeded")?;
+    assert_eq!(grpc_malformed_expand.code(), tonic::Code::Unknown,);
     let stores_page = api
         .list_stores(
             &principal,
@@ -1749,6 +1752,13 @@ async fn test_should_execute_implemented_use_cases_through_shared_wire_adapter()
     );
     assert!(listed_stream.next().await.is_none());
 
+    let expanded = api.expand(&principal, expand_request()).await?;
+    let expanded_root = expanded
+        .tree
+        .and_then(|tree| tree.root)
+        .ok_or("direct Expand response omitted its root")?;
+    assert_eq!(expanded_root.name, "document:roadmap#viewer");
+
     let response = router
         .clone()
         .oneshot(
@@ -1789,6 +1799,27 @@ async fn test_should_execute_implemented_use_cases_through_shared_wire_adapter()
 
     let listed_users = api.list_users(&principal, list_users_request()).await?;
     assert_eq!(listed_users.users.len(), 1);
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::post(format!("/stores/{STORE_ID}/expand"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&expand_request())?))?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let expanded = serde_json::from_slice::<pb::ExpandResponse>(
+        &to_bytes(response.into_body(), 2_048).await?,
+    )?;
+    assert_eq!(
+        expanded
+            .tree
+            .and_then(|tree| tree.root)
+            .ok_or("HTTP Expand response omitted its root")?
+            .name,
+        "document:roadmap#viewer",
+    );
     assert!(matches!(
         listed_users.users.first().and_then(|user| user.user.as_ref()),
         Some(pb::user::User::Object(user))
@@ -1857,6 +1888,61 @@ async fn test_should_execute_implemented_use_cases_through_shared_wire_adapter()
         1
     );
 
+    api.write(
+        &principal,
+        pb::WriteRequest {
+            store_id: STORE_ID.to_owned(),
+            writes: Some(pb::WriteRequestWrites {
+                tuple_keys: (0..90)
+                    .map(|index| pb::TupleKey {
+                        user: format!("user:member-{index:03}"),
+                        relation: "viewer".to_owned(),
+                        object: "document:large".to_owned(),
+                        condition: None,
+                    })
+                    .collect(),
+                on_duplicate: "error".to_owned(),
+            }),
+            deletes: None,
+            authorization_model_id: MODEL_ID.to_owned(),
+        },
+    )
+    .await?;
+    let error = api
+        .expand(
+            &principal,
+            pb::ExpandRequest {
+                tuple_key: Some(pb::ExpandRequestTupleKey {
+                    relation: "viewer".to_owned(),
+                    object: "document:large".to_owned(),
+                }),
+                ..expand_request()
+            },
+        )
+        .await
+        .err()
+        .ok_or("oversized Expand response unexpectedly succeeded")?;
+    assert_eq!(error.code(), "resource_exhausted");
+    api.write(
+        &principal,
+        pb::WriteRequest {
+            store_id: STORE_ID.to_owned(),
+            writes: None,
+            deletes: Some(pb::WriteRequestDeletes {
+                tuple_keys: (0..90)
+                    .map(|index| pb::TupleKeyWithoutCondition {
+                        user: format!("user:member-{index:03}"),
+                        relation: "viewer".to_owned(),
+                        object: "document:large".to_owned(),
+                    })
+                    .collect(),
+                on_missing: "error".to_owned(),
+            }),
+            authorization_model_id: MODEL_ID.to_owned(),
+        },
+    )
+    .await?;
+
     assert_grpc_endpoint_admission(api.clone(), authentication.clone()).await?;
 
     api.delete_store(
@@ -1918,14 +2004,14 @@ async fn assert_grpc_endpoint_admission(
     authentication: AuthenticationService,
 ) -> Result<(), Box<dyn Error>> {
     let one = NonZeroU32::MIN;
-    let three = NonZeroU32::new(3).ok_or("enumeration admission limit was zero")?;
+    let four = NonZeroU32::new(4).ok_or("enumeration admission limit was zero")?;
     api.admission = crate::admission::AdmissionControl::new(
         AdmissionPolicy::builder()
             .administration(one)
             .reads(one)
             .writes(one)
             .checks(one)
-            .enumeration(three)
+            .enumeration(four)
             .build(),
     )?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -2015,6 +2101,15 @@ async fn assert_grpc_endpoint_admission(
         assert!(listed_stream.message().await?.is_none());
         let listed_users = client.list_users(list_users_request()).await?.into_inner();
         assert_eq!(listed_users.users.len(), 1);
+        let expanded = client.expand(expand_request()).await?.into_inner();
+        assert_eq!(
+            expanded
+                .tree
+                .and_then(|tree| tree.root)
+                .ok_or("gRPC Expand response omitted its root")?
+                .name,
+            "document:roadmap#viewer",
+        );
         let error = client
             .list_objects(list_objects_request())
             .await
@@ -2394,6 +2489,19 @@ fn list_users_request() -> pb::ListUsersRequest {
         contextual_tuples: Vec::new(),
         context: None,
         consistency: 0,
+    }
+}
+
+fn expand_request() -> pb::ExpandRequest {
+    pb::ExpandRequest {
+        store_id: STORE_ID.to_owned(),
+        tuple_key: Some(pb::ExpandRequestTupleKey {
+            relation: "viewer".to_owned(),
+            object: "document:roadmap".to_owned(),
+        }),
+        authorization_model_id: MODEL_ID.to_owned(),
+        consistency: 0,
+        contextual_tuples: None,
     }
 }
 

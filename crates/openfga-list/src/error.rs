@@ -8,7 +8,7 @@ use openfga_model::{ModelLookupError, TupleValidationError};
 use openfga_storage::{StorageError, StorageErrorKind};
 use thiserror::Error;
 
-/// Stable reverse-enumeration failure category.
+/// Stable enumeration or diagnostic-expansion failure category.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ListErrorKind {
@@ -30,6 +30,10 @@ pub enum ListErrorKind {
     SubjectExceeded,
     /// The cumulative condition evaluation cost was exhausted.
     ConditionCostExceeded,
+    /// The diagnostic expansion node ceiling was exhausted.
+    NodeExceeded,
+    /// The diagnostic expansion response-size ceiling was exhausted.
+    ResponseSizeExceeded,
     /// Tuple storage is temporarily unavailable.
     StorageUnavailable,
     /// The request deadline elapsed.
@@ -54,9 +58,9 @@ enum ListErrorSource {
     TupleValidation(TupleValidationError),
 }
 
-/// One typed reverse-enumeration failure with a stable low-cardinality code.
+/// One typed query-expansion failure with a stable low-cardinality code.
 #[derive(Error)]
-#[error("authorization enumeration failed: {code}")]
+#[error("authorization query expansion failed: {code}")]
 pub struct ListError {
     kind: ListErrorKind,
     code: &'static str,
