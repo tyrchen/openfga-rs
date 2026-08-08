@@ -18,6 +18,13 @@ storage:
     replicaMaxLagMs: 1000
     maxTupleMutations: 100
     migrateOnStart: false
+cache:
+  model:
+    sourceWeight: 100000
+    compiledWeight: 200000
+    latestAliases: 10000
+    immutableTtlSeconds: 604800
+    latestAliasTtlSeconds: 10
 auth:
   mode: disabled
 transport:

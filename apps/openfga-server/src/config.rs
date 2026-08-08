@@ -3,7 +3,7 @@
 use std::{
     collections::{BTreeSet, HashSet},
     net::SocketAddr,
-    num::NonZeroU32,
+    num::{NonZeroU32, NonZeroU64},
     path::{Component, Path, PathBuf},
     time::Duration,
 };
@@ -13,6 +13,7 @@ use config::{Case, Config, Environment, File, FileFormat};
 use openfga_auth::{
     Action, AuthorizationPolicy, OidcAlgorithm, OidcConfig, PolicyBinding, StoreScope,
 };
+use openfga_cache::ModelCacheConfig;
 use openfga_domain::{Limit, PrincipalId, RequestTimeout, StoreId, TokenKeyId};
 use openfga_transport::AdmissionPolicy;
 use serde::{Deserialize, Serialize};
@@ -38,6 +39,7 @@ pub(crate) struct ServerConfig {
     pub(crate) listeners: ListenerConfig,
     pub(crate) tls: TlsConfig,
     pub(crate) storage: StorageConfig,
+    pub(crate) cache: CacheConfig,
     pub(crate) auth: AuthConfig,
     pub(crate) transport: TransportPolicy,
     pub(crate) evaluator: EvaluatorPolicy,
@@ -159,6 +161,41 @@ impl Default for PostgresConfig {
             replica_max_lag_ms: default_replica_lag_ms(),
             max_tuple_mutations: default_tuple_mutations(),
             migrate_on_start: false,
+        }
+    }
+}
+
+/// Finite in-process cache policy.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct CacheConfig {
+    #[serde(default)]
+    pub(crate) model: ModelCachePolicy,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ModelCachePolicy {
+    #[serde(default = "default_model_source_weight")]
+    pub(crate) source_weight: u64,
+    #[serde(default = "default_model_compiled_weight")]
+    pub(crate) compiled_weight: u64,
+    #[serde(default = "default_model_aliases")]
+    pub(crate) latest_aliases: u64,
+    #[serde(default = "default_model_immutable_ttl_seconds")]
+    pub(crate) immutable_ttl_seconds: u64,
+    #[serde(default = "default_model_alias_ttl_seconds")]
+    pub(crate) latest_alias_ttl_seconds: u64,
+}
+
+impl Default for ModelCachePolicy {
+    fn default() -> Self {
+        Self {
+            source_weight: default_model_source_weight(),
+            compiled_weight: default_model_compiled_weight(),
+            latest_aliases: default_model_aliases(),
+            immutable_ttl_seconds: default_model_immutable_ttl_seconds(),
+            latest_alias_ttl_seconds: default_model_alias_ttl_seconds(),
         }
     }
 }
@@ -505,6 +542,8 @@ struct RawServerConfig {
     #[serde(default)]
     tls: TlsConfig,
     storage: StorageConfig,
+    #[serde(default)]
+    cache: CacheConfig,
     auth: AuthConfig,
     transport: TransportPolicy,
     evaluator: EvaluatorPolicy,
@@ -527,6 +566,7 @@ impl From<RawServerConfig> for ServerConfig {
             listeners: raw.listeners,
             tls: raw.tls,
             storage: raw.storage,
+            cache: raw.cache,
             auth: raw.auth,
             transport: raw.transport,
             evaluator: raw.evaluator,
@@ -571,6 +611,7 @@ impl ServerConfig {
         self.validate_auth()?;
         self.validate_tls()?;
         self.validate_storage()?;
+        self.model_cache_config()?;
         self.validate_transport()?;
         self.validate_evaluator()?;
         self.validate_list_objects()?;
@@ -630,6 +671,20 @@ impl ServerConfig {
 
     pub(crate) const fn health_interval(&self) -> Duration {
         Duration::from_millis(self.shutdown.health_interval_ms)
+    }
+
+    pub(crate) fn model_cache_config(&self) -> Result<ModelCacheConfig> {
+        ModelCacheConfig::new(
+            NonZeroU64::new(self.cache.model.source_weight)
+                .context("model source cache weight must be nonzero")?,
+            NonZeroU64::new(self.cache.model.compiled_weight)
+                .context("compiled model cache weight must be nonzero")?,
+            NonZeroU64::new(self.cache.model.latest_aliases)
+                .context("latest model alias capacity must be nonzero")?,
+            Duration::from_secs(self.cache.model.immutable_ttl_seconds),
+            Duration::from_secs(self.cache.model.latest_alias_ttl_seconds),
+        )
+        .context("model cache configuration is invalid")
     }
 
     pub(crate) fn oidc_config(&self) -> OidcConfig {
@@ -1258,6 +1313,26 @@ const fn default_health_interval_ms() -> u64 {
     1_000
 }
 
+const fn default_model_source_weight() -> u64 {
+    100_000
+}
+
+const fn default_model_compiled_weight() -> u64 {
+    200_000
+}
+
+const fn default_model_aliases() -> u64 {
+    10_000
+}
+
+const fn default_model_immutable_ttl_seconds() -> u64 {
+    7 * 24 * 60 * 60
+}
+
+const fn default_model_alias_ttl_seconds() -> u64 {
+    10
+}
+
 #[cfg(test)]
 mod tests {
     use openfga_auth::Action;
@@ -1418,6 +1493,22 @@ evaluator: {}
         config.expand.response_bytes = 1_048_576;
         config.tls.reload_interval_seconds = 0;
         assert!(config.validate().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_reject_unbounded_or_zero_model_cache_policy() -> anyhow::Result<()> {
+        let mut config = ServerConfig::from(parse(VALID.as_bytes())?);
+        config.cache.model.source_weight = 0;
+        assert!(config.validate().is_err());
+
+        config.cache.model.source_weight = 1;
+        config.cache.model.latest_alias_ttl_seconds = 301;
+        assert!(config.validate().is_err());
+
+        config.cache.model.latest_alias_ttl_seconds = 10;
+        config.cache.model.immutable_ttl_seconds = 30 * 24 * 60 * 60;
+        config.validate()?;
         Ok(())
     }
 

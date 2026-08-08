@@ -16,6 +16,24 @@ Every cache has a project trait, one canonical key/value schema, independent cap
 
 The decision key includes explicit store/model/fingerprint, canonical object/relation/subject, contextual-tuple canonical fingerprint, condition-context fingerprint, and evaluator semantics version. Secret context is hashed with a process key; raw context is never stored in keys or metrics. A request resolving `Latest` first obtains an explicit model ID.
 
+```mermaid
+flowchart LR
+    Request[Query service] --> Selection{Model selection}
+    Selection -->|Explicit ID| Source[Weighted source cache]
+    Selection -->|Latest + minimize latency| Alias[Short-lived latest alias]
+    Selection -->|Latest + higher consistency| Primary[Primary model reader]
+    Alias --> Source
+    Primary --> Source
+    Source --> Compile[Weighted compiled cache<br/>compiler-version key]
+    Compile --> Engine[Check/List/Expand engine]
+    Publication[Durable model publication] --> Immutable[Populate immutable entries]
+    Publication --> Invalidate[Invalidate latest alias]
+    Immutable --> Source
+    Immutable --> Compile
+```
+
+Cold source loads and compilations are coalesced independently. A failed load or compile is shared with current waiters but never inserted. Local publication populates explicit immutable entries and invalidates, rather than overwrites, the latest alias so concurrent publications cannot regress it. Higher-consistency latest selection bypasses the alias and resolves through the primary before continuing under an explicit immutable ID.
+
 Errors, cancelled work, resource exhaustion, and partial streams are never cached. Negative results follow the same mutation consistency rules as positive results.
 
 ## Mutation invalidation

@@ -54,6 +54,13 @@ storage:
     replicaMaxLagMs: 1000
     maxTupleMutations: 100
     migrateOnStart: false
+cache:
+  model:
+    sourceWeight: 100000
+    compiledWeight: 200000
+    latestAliases: 10000
+    immutableTtlSeconds: 604800
+    latestAliasTtlSeconds: 10
 auth:
   mode: preshared
   preshared:
@@ -133,6 +140,7 @@ configuration, logs, tickets, or shell history.
 | Area | Important constraints |
 | --- | --- |
 | PostgreSQL | `maxConnections` is 1–65,536; `minConnections` cannot exceed it; acquisition and statement timeouts are 1 ms–5 minutes; tuple mutations are 1–5,000 |
+| Model cache | source/compiled weights and latest-alias capacity are positive; immutable TTL is at most 30 days; the mutable latest alias is at most 5 minutes and is bypassed by higher-consistency reads |
 | TLS | reload interval is 1–3,600 seconds; each complete pair is bounded and validated before one atomic publication to HTTP and gRPC |
 | Transport | page size is 1–100; timeout is 1 ms–5 minutes; token TTL is 1 second–720 hours; message size is 1–16 MiB; concurrency is 1–65,536; admission rates are 1–1,000,000 per 1–3,600-second window |
 | Evaluator | every budget is positive; depth ≤1,000, dispatches/items/cost ≤1,000,000, datastore queries ≤100,000, reads ≤1,024, batch concurrency ≤1,000 |

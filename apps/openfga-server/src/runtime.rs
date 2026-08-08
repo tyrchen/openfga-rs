@@ -16,6 +16,7 @@ use anyhow::{Context, Result, bail};
 use axum::{Json, Router, http::StatusCode, routing::get};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use openfga_auth::{AuthenticationService, JwksActor, PresharedKey};
+use openfga_cache::{CachedModelStorage, ModelCacheConfig};
 use openfga_check::CheckBudget;
 use openfga_domain::{
     ConsistencyPreference, Deadline, InputLimits, Limit, RequestTimeout, TokenCodec, TokenKey,
@@ -138,6 +139,14 @@ struct TransportRuntime {
 struct ReadinessDependencies {
     storage: Arc<dyn HealthCheck>,
     authentication: AuthenticationService,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ServiceBudgets {
+    check: CheckBudget,
+    list_objects: ListObjectsBudget,
+    list_users: ListUsersBudget,
+    expand: ExpandBudget,
 }
 
 impl fmt::Debug for ReadinessDependencies {
@@ -298,10 +307,14 @@ async fn assemble(config: &ServerConfig) -> Result<RuntimeAssembly> {
             .context("failed to start identifier actor")?,
     );
     let identifier_service: Arc<dyn IdentifierSource> = identifiers.clone();
-    let budget = check_budget(config)?;
-    let list_objects_budget = list_objects_budget(config, budget)?;
-    let list_users_budget = list_users_budget(config)?;
-    let expand_budget = expand_budget(config)?;
+    let check = check_budget(config)?;
+    let budgets = ServiceBudgets {
+        check,
+        list_objects: list_objects_budget(config, check)?,
+        list_users: list_users_budget(config)?,
+        expand: expand_budget(config)?,
+    };
+    let model_cache_config = config.model_cache_config()?;
     let (services, storage, health) = match config.storage.backend {
         StorageBackend::Memory => {
             let capacity = NonZeroUsize::new(config.storage.memory.actor_capacity)
@@ -319,10 +332,8 @@ async fn assemble(config: &ServerConfig) -> Result<RuntimeAssembly> {
                 storage.clone(),
                 identifier_service,
                 limits.clone(),
-                budget,
-                list_objects_budget,
-                list_users_budget,
-                expand_budget,
+                budgets,
+                model_cache_config,
             );
             (services, StorageOwner::Memory(storage), health)
         }
@@ -338,10 +349,8 @@ async fn assemble(config: &ServerConfig) -> Result<RuntimeAssembly> {
                 storage.clone(),
                 identifier_service,
                 limits.clone(),
-                budget,
-                list_objects_budget,
-                list_users_budget,
-                expand_budget,
+                budgets,
+                model_cache_config,
             );
             (services, StorageOwner::Postgres(storage), health)
         }
@@ -422,10 +431,8 @@ fn services<B>(
     storage: Arc<B>,
     identifiers: Arc<dyn IdentifierSource>,
     limits: InputLimits,
-    budget: CheckBudget,
-    list_objects_budget: ListObjectsBudget,
-    list_users_budget: ListUsersBudget,
-    expand_budget: ExpandBudget,
+    budgets: ServiceBudgets,
+    model_cache_config: ModelCacheConfig,
 ) -> OpenFgaServices
 where
     B: AssertionReader
@@ -443,8 +450,16 @@ where
 {
     let stores: Arc<dyn StoreReader> = storage.clone();
     let store_writes: Arc<dyn StoreWriter> = storage.clone();
-    let models: Arc<dyn ModelReader> = storage.clone();
-    let model_writes: Arc<dyn ModelWriter> = storage.clone();
+    let storage_models: Arc<dyn ModelReader> = storage.clone();
+    let storage_model_writes: Arc<dyn ModelWriter> = storage.clone();
+    let cached_models = Arc::new(CachedModelStorage::new(
+        storage_models,
+        storage_model_writes,
+        ModelCompiler::default(),
+        model_cache_config,
+    ));
+    let models: Arc<dyn ModelReader> = cached_models.clone();
+    let model_writes: Arc<dyn ModelWriter> = cached_models;
     let tuples: Arc<dyn TupleReader> = storage.clone();
     let tuple_writes: Arc<dyn TupleWriter> = storage.clone();
     let assertion_reads: Arc<dyn AssertionReader> = storage.clone();
@@ -484,21 +499,26 @@ where
         .checks(CheckService::direct(
             Arc::clone(&models),
             Arc::clone(&tuples),
-            budget,
+            budgets.check,
         ))
         .list_objects(ListObjectsService::direct(
             Arc::clone(&models),
             Arc::clone(&tuples),
-            list_objects_budget,
+            budgets.list_objects,
             limits.clone(),
         ))
         .list_users(ListUsersService::direct(
             Arc::clone(&models),
             Arc::clone(&tuples),
-            list_users_budget,
+            budgets.list_users,
             limits.clone(),
         ))
-        .expand(ExpandService::direct(models, tuples, expand_budget, limits))
+        .expand(ExpandService::direct(
+            models,
+            tuples,
+            budgets.expand,
+            limits,
+        ))
         .build()
 }
 
