@@ -22,6 +22,7 @@ mod check_corpus;
 mod check_probe;
 mod config;
 mod enumeration_probe;
+mod phase4_scale;
 mod runtime;
 mod telemetry;
 
@@ -111,6 +112,42 @@ enum Command {
         #[arg(long)]
         rust_url: String,
     },
+    /// Exercise concurrent write/check consistency and cache invalidation.
+    Phase4ConsistencyFaults {
+        /// Base URL of the complete Rust server.
+        #[arg(long)]
+        rust_url: String,
+        /// Number of concurrent independent mutation sequences.
+        #[arg(long, default_value_t = 32)]
+        iterations: usize,
+    },
+    /// Compare bounded Check throughput and latency with the pinned Go baseline.
+    Phase4ReferenceBenchmark {
+        /// Base URL of the vendored Go baseline.
+        #[arg(long)]
+        go_url: String,
+        /// Base URL of the complete Rust server.
+        #[arg(long)]
+        rust_url: String,
+        /// Sequential requests issued by each client at each concurrency level.
+        #[arg(long, default_value_t = 25)]
+        requests_per_client: usize,
+    },
+    /// Apply a fixed-concurrency Check soak to the complete Rust server.
+    Phase4Soak {
+        /// Base URL of the complete Rust server.
+        #[arg(long)]
+        rust_url: String,
+        /// Soak duration in seconds.
+        #[arg(long, default_value_t = 1_800)]
+        seconds: u64,
+        /// Number of concurrent clients.
+        #[arg(long, default_value_t = 100)]
+        clients: usize,
+        /// Bypass mutable caches and require authoritative storage reads.
+        #[arg(long, default_value_t = false)]
+        higher_consistency: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Subcommand)]
@@ -183,6 +220,27 @@ async fn main() -> Result<()> {
         Command::DifferentialEnumeration { go_url, rust_url } => {
             enumeration_probe::run(&go_url, &rust_url).await
         }
+        Command::Phase4ConsistencyFaults {
+            rust_url,
+            iterations,
+        } => phase4_scale::run_consistency_faults(&rust_url, iterations)
+            .await
+            .context("Phase 4 consistency fault suite failed"),
+        Command::Phase4ReferenceBenchmark {
+            go_url,
+            rust_url,
+            requests_per_client,
+        } => phase4_scale::run_reference_benchmark(&go_url, &rust_url, requests_per_client)
+            .await
+            .context("Phase 4 reference benchmark failed"),
+        Command::Phase4Soak {
+            rust_url,
+            seconds,
+            clients,
+            higher_consistency,
+        } => phase4_scale::run_soak(&rust_url, seconds, clients, higher_consistency)
+            .await
+            .context("Phase 4 soak failed"),
     }
 }
 
@@ -308,7 +366,7 @@ async fn run_differential_smoke(go_url: &str, rust_url: &str) -> Result<()> {
     Ok(())
 }
 
-fn validated_loopback_url(input: &str) -> Result<Url> {
+pub(crate) fn validated_loopback_url(input: &str) -> Result<Url> {
     if input.len() > MAX_PROBE_URL_BYTES {
         bail!("probe URL exceeds the {MAX_PROBE_URL_BYTES}-byte limit");
     }
@@ -401,7 +459,7 @@ fn write_report(report: &DifferentialReport) -> Result<()> {
     write_value(report)
 }
 
-fn write_value(value: &impl Serialize) -> Result<()> {
+pub(crate) fn write_value(value: &impl Serialize) -> Result<()> {
     let stdout = io::stdout();
     let mut output = stdout.lock();
     serde_json::to_writer_pretty(&mut output, value).context("failed to serialize output")?;

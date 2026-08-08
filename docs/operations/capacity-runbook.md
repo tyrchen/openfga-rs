@@ -63,6 +63,23 @@ Use the smallest of these constraints as the initial concurrency ceiling:
 7. Roll out by canary. Roll back on authorization mismatch, controller unready/lag, sustained pool
    exhaustion, or a memory/task count that does not return to baseline.
 
+## Executable gates
+
+`make phase4-scale-smoke` runs a five-second release smoke. `make phase4-scale` runs the required
+30-minute, 100-client release soak, pinned Go comparison, concurrent consistency sequences, cache
+fault suite, RSS bound, and in-flight drain test. Results are written beneath `target/phase4`.
+
+`make phase4-local-postgres-scale-smoke` creates an isolated temporary local PostgreSQL cluster,
+runs a 30-second higher-consistency load through the 16-connection pool, then stops the cluster and
+removes its temporary data. Operators with an existing isolated database use
+`make phase4-postgres-scale-smoke POSTGRES_TEST_URL=...`; never point a destructive test at a shared
+or production database.
+
+The release target lifts authentication-attempt and Check rate ceilings to their validated maximum
+only for this loopback harness, isolating endpoint and storage capacity. It does not alter the
+checked-in deployment defaults. `PHASE4_SOAK_SECONDS`, `PHASE4_SOAK_CLIENTS`, and the other
+`PHASE4_*` variables provide bounded, explicit overrides.
+
 ## Incident containment
 
 When overload is sustained, preserve the bounds and shed upstream traffic. Lower BatchCheck or

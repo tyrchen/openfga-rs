@@ -49,3 +49,23 @@ Weight-two joins, rewrite flattening, reverse worker pipelines, granular cache i
 - Flamegraphs/profiles identify actual bottlenecks before optimization work.
 - Load and soak tests prove queue/cache/task/memory bounds and graceful overload.
 - Performance reports always state compatibility result, because a faster incorrect deny/allow is a failure.
+
+```mermaid
+flowchart LR
+    Pin["pinned Go baseline"] --> Seed["identical model and tuple workload"]
+    Release["optimized Rust release binary"] --> Seed
+    Seed --> Faults["concurrent write / higher-consistency / delete checks"]
+    Seed --> Reference["1 / 10 / 100-client reference measurements"]
+    Seed --> Soak["bounded 100-client, 30-minute soak"]
+    Soak --> Bounds["authorization outcomes, overload, RSS growth"]
+    Faults --> Gate["zero stale higher-consistency results"]
+    Reference --> Report["versioned benchmark report"]
+    Bounds --> Report
+    Gate --> Report
+    Drain["in-flight rolling drain test"] --> Report
+```
+
+The release harness starts exact binaries directly, restricts targets to loopback origins, bounds
+client counts, request counts, response bytes, and soak duration, and records machine-readable
+artifacts before producing the versioned report. Allowed-result latency excludes shed responses;
+overload remains an independently reported finite-capacity outcome.

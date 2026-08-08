@@ -12,10 +12,23 @@ RUST_GRPC_ADDR ?= 127.0.0.1:18084
 FUZZ_TIME ?= 15
 POSTGRES_TEST_URL ?=
 CONFIG ?= config/openfga-development.yaml
+PHASE4_BENCH_REQUESTS ?= 25
+PHASE4_CONSISTENCY_ITERATIONS ?= 32
+PHASE4_SOAK_CLIENTS ?= 100
+PHASE4_SOAK_SECONDS ?= 1800
+PHASE4_RSS_GROWTH_KIB ?= 65536
+PHASE4_ARTIFACT_DIR ?= target/phase4
+PHASE4_STORAGE_BACKEND ?= memory
+PHASE4_POSTGRES_MIGRATE ?= false
+PHASE4_POSTGRES_PORT ?= 55432
+PHASE4_SOAK_CONSISTENCY_ARG ?=
 PROTO_OUTPUT := crates/openfga-proto/src/generated
 
 build:
 	@$(CARGO) build --workspace --all-targets
+
+build-release:
+	@$(CARGO) build --release -p openfga-server
 
 test:
 	@$(CARGO) test --workspace --all-targets
@@ -351,6 +364,123 @@ enumeration-differential: $(GO_BASELINE) build
 	done; \
 	$(CARGO) run --quiet -p openfga-server -- differential-enumeration \
 		--go-url "http://$(GO_HTTP_ADDR)/" --rust-url "http://$(RUST_HTTP_ADDR)/"
+
+phase4-scale: $(GO_BASELINE) build-release
+	@set -eu; \
+	phase4_tmp=$$(mktemp -d); \
+	go_pid=""; rust_pid=""; \
+	cleanup() { \
+		test -z "$$go_pid" || kill "$$go_pid" 2>/dev/null || true; \
+		test -z "$$rust_pid" || kill "$$rust_pid" 2>/dev/null || true; \
+		test -z "$$go_pid" || wait "$$go_pid" 2>/dev/null || true; \
+		test -z "$$rust_pid" || wait "$$rust_pid" 2>/dev/null || true; \
+		rm -rf "$$phase4_tmp"; \
+	}; \
+	trap cleanup EXIT INT TERM; \
+	target_dir=$$($(CARGO) metadata --no-deps --format-version 1 | \
+		sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p'); \
+	test -n "$$target_dir"; \
+	server_binary="$$target_dir/release/openfga-server"; \
+	test -x "$$server_binary"; \
+	$(GO_BASELINE) run --http-addr $(GO_HTTP_ADDR) --grpc-addr $(GO_GRPC_ADDR) \
+		--playground-enabled=false >"$$phase4_tmp/go.log" 2>&1 & go_pid=$$!; \
+	OPENFGA__LISTENERS__HTTP=$(RUST_HTTP_ADDR) \
+	OPENFGA__LISTENERS__GRPC=$(RUST_GRPC_ADDR) \
+	OPENFGA__STORAGE__BACKEND=$(PHASE4_STORAGE_BACKEND) \
+	OPENFGA__STORAGE__POSTGRES__MIGRATE_ON_START=$(PHASE4_POSTGRES_MIGRATE) \
+	OPENFGA__TRANSPORT__ADMISSION__AUTHENTICATION_ATTEMPTS=1000000 \
+	OPENFGA__TRANSPORT__ADMISSION__GLOBAL_AUTHENTICATION_ATTEMPTS=1000000 \
+	OPENFGA__TRANSPORT__ADMISSION__CHECKS=1000000 \
+	OPENFGA_DATABASE_URL="$(POSTGRES_TEST_URL)" \
+	OPENFGA_TOKEN_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= \
+	"$$server_binary" run --config config/openfga-development.yaml \
+		>"$$phase4_tmp/rust.log" 2>&1 & rust_pid=$$!; \
+	for endpoint in "http://$(GO_HTTP_ADDR)/healthz" "http://$(RUST_HTTP_ADDR)/readyz"; do \
+		attempt=0; \
+		until curl --fail --silent "$$endpoint" >/dev/null; do \
+			if ! kill -0 "$$go_pid" 2>/dev/null || ! kill -0 "$$rust_pid" 2>/dev/null; then \
+				echo "a Phase 4 scale server exited before readiness" >&2; \
+				tail -100 "$$phase4_tmp/go.log" "$$phase4_tmp/rust.log" >&2; \
+				exit 1; \
+			fi; \
+			attempt=$$((attempt + 1)); \
+			test "$$attempt" -lt 150 || { echo "Phase 4 server did not become ready: $$endpoint" >&2; exit 1; }; \
+			sleep 0.1; \
+		done; \
+	done; \
+	mkdir -p "$(PHASE4_ARTIFACT_DIR)"; \
+	"$$server_binary" phase4-consistency-faults \
+		--rust-url "http://$(RUST_HTTP_ADDR)/" \
+		--iterations "$(PHASE4_CONSISTENCY_ITERATIONS)" \
+		>"$(PHASE4_ARTIFACT_DIR)/consistency.json"; \
+	"$$server_binary" phase4-reference-benchmark \
+		--go-url "http://$(GO_HTTP_ADDR)/" \
+		--rust-url "http://$(RUST_HTTP_ADDR)/" \
+		--requests-per-client "$(PHASE4_BENCH_REQUESTS)" \
+		>"$(PHASE4_ARTIFACT_DIR)/reference-benchmark.json"; \
+	rss_before=$$(ps -o rss= -p "$$rust_pid" | tr -d ' '); \
+	test -n "$$rss_before"; \
+	"$$server_binary" phase4-soak \
+		--rust-url "http://$(RUST_HTTP_ADDR)/" \
+		--seconds "$(PHASE4_SOAK_SECONDS)" \
+		--clients "$(PHASE4_SOAK_CLIENTS)" $(PHASE4_SOAK_CONSISTENCY_ARG) \
+		>"$(PHASE4_ARTIFACT_DIR)/soak.json"; \
+	rss_after=$$(ps -o rss= -p "$$rust_pid" | tr -d ' '); \
+	test -n "$$rss_after"; \
+	rss_growth=$$((rss_after > rss_before ? rss_after - rss_before : 0)); \
+	test "$$rss_growth" -le "$(PHASE4_RSS_GROWTH_KIB)" || { \
+		echo "Rust RSS grew by $$rss_growth KiB, above $(PHASE4_RSS_GROWTH_KIB) KiB" >&2; \
+		exit 1; \
+	}; \
+	printf '{"rssBeforeKiB":%s,"rssAfterKiB":%s,"rssGrowthKiB":%s,"maximumGrowthKiB":%s}\n' \
+		"$$rss_before" "$$rss_after" "$$rss_growth" "$(PHASE4_RSS_GROWTH_KIB)" \
+		>"$(PHASE4_ARTIFACT_DIR)/memory.json"; \
+	kill -TERM "$$rust_pid"; \
+	wait "$$rust_pid"; \
+	rust_pid=""; \
+	$(CARGO) test -p openfga-cache --all-targets; \
+	$(CARGO) test -p openfga-server \
+		'runtime::tests::test_should_bound_shutdown_with_an_in_flight_client'; \
+	echo "Phase 4 artifacts: $(PHASE4_ARTIFACT_DIR)"
+
+phase4-scale-smoke:
+	@$(MAKE) phase4-scale \
+		PHASE4_BENCH_REQUESTS=5 \
+		PHASE4_CONSISTENCY_ITERATIONS=8 \
+		PHASE4_SOAK_CLIENTS=16 \
+		PHASE4_SOAK_SECONDS=5
+
+phase4-postgres-scale-smoke:
+	@test -n "$(POSTGRES_TEST_URL)" || { echo "POSTGRES_TEST_URL is required" >&2; exit 1; }
+	@$(MAKE) phase4-scale \
+		PHASE4_ARTIFACT_DIR=target/phase4-postgres \
+		PHASE4_BENCH_REQUESTS=5 \
+		PHASE4_CONSISTENCY_ITERATIONS=8 \
+		PHASE4_SOAK_CLIENTS=16 \
+		PHASE4_SOAK_SECONDS=30 \
+		PHASE4_STORAGE_BACKEND=postgres \
+		PHASE4_POSTGRES_MIGRATE=true \
+		PHASE4_SOAK_CONSISTENCY_ARG=--higher-consistency
+
+phase4-local-postgres-scale-smoke:
+	@set -eu; \
+	phase4_pg_tmp=$$(mktemp -d); \
+	postgres_started=false; \
+	cleanup() { \
+		if test "$$postgres_started" = true; then \
+			pg_ctl -D "$$phase4_pg_tmp/data" -m fast -w stop >/dev/null; \
+		fi; \
+		rm -rf "$$phase4_pg_tmp"; \
+	}; \
+	trap cleanup EXIT INT TERM; \
+	initdb -D "$$phase4_pg_tmp/data" --auth=trust --no-instructions >/dev/null; \
+	pg_ctl -D "$$phase4_pg_tmp/data" \
+		-o "-h 127.0.0.1 -p $(PHASE4_POSTGRES_PORT)" -w start >/dev/null; \
+	postgres_started=true; \
+	postgres_url="postgresql://$$(id -un)@127.0.0.1:$(PHASE4_POSTGRES_PORT)/postgres?sslmode=disable"; \
+	$(MAKE) postgres-storage POSTGRES_TEST_URL="$$postgres_url"; \
+	$(MAKE) phase4-postgres-scale-smoke \
+		POSTGRES_TEST_URL="$$postgres_url"
 
 check-corpus-differential: verify-go-tool verify-go-pin
 	@phase1_tmp=$$(mktemp -d); \

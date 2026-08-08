@@ -1509,7 +1509,7 @@ where
     serde_json::from_slice(&body).with_context(|| format!("{operation} returned invalid JSON"))
 }
 
-async fn require_success(response: reqwest::Response, operation: &str) -> Result<()> {
+pub(crate) async fn require_success(response: reqwest::Response, operation: &str) -> Result<()> {
     let status = response.status();
     let _body = read_bounded(response).await?;
     if !status.is_success() {
@@ -1518,7 +1518,7 @@ async fn require_success(response: reqwest::Response, operation: &str) -> Result
     Ok(())
 }
 
-async fn read_bounded(mut response: reqwest::Response) -> Result<Vec<u8>> {
+pub(crate) async fn read_bounded(mut response: reqwest::Response) -> Result<Vec<u8>> {
     if response
         .content_length()
         .is_some_and(|length| length > MAXIMUM_RESPONSE_BYTES as u64)
