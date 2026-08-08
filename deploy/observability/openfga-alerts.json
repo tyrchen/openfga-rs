@@ -1,0 +1,113 @@
+{
+  "groups": [
+    {
+      "name": "openfga-rs-consistency",
+      "rules": [
+        {
+          "alert": "OpenFgaCacheControllerDown",
+          "annotations": {
+            "description": "The supervised changelog controller is absent or stopped; mutable caches cannot be trusted.",
+            "runbook": "docs/operations/observability-runbook.md#alert-response",
+            "summary": "OpenFGA cache controller is not running"
+          },
+          "expr": "max(openfga_cache_controller_running) < 1 or absent(openfga_cache_controller_running)",
+          "for": "2m",
+          "labels": { "severity": "critical" }
+        },
+        {
+          "alert": "OpenFgaCacheControllerUnready",
+          "annotations": {
+            "description": "At least one tracked store is not caught up within the configured cache-consistency policy.",
+            "runbook": "docs/operations/observability-runbook.md#alert-response",
+            "summary": "OpenFGA cache controller is unready"
+          },
+          "expr": "min(openfga_cache_controller_ready) < 1",
+          "for": "2m",
+          "labels": { "severity": "critical" }
+        },
+        {
+          "alert": "OpenFgaCacheControllerLagging",
+          "annotations": {
+            "description": "Controller lag has consumed 80% of the default 10-second maximum-lag budget.",
+            "runbook": "docs/operations/observability-runbook.md#alert-response",
+            "summary": "OpenFGA cache-controller lag is near its ceiling"
+          },
+          "expr": "max(openfga_cache_controller_lag_milliseconds) > 8000",
+          "for": "2m",
+          "labels": { "severity": "warning" }
+        },
+        {
+          "alert": "OpenFgaCacheControllerFailures",
+          "annotations": {
+            "description": "A poll failure, conservative flush, or actor restart occurred during the last five minutes.",
+            "runbook": "docs/operations/observability-runbook.md#alert-response",
+            "summary": "OpenFGA cache controller is recovering from failures"
+          },
+          "expr": "increase(openfga_cache_controller_polls_failed_total[5m]) + increase(openfga_cache_controller_flushes_total[5m]) + increase(openfga_cache_controller_restarts_total[5m]) > 0",
+          "for": "1m",
+          "labels": { "severity": "warning" }
+        },
+        {
+          "alert": "OpenFgaCacheControllerOverflow",
+          "annotations": {
+            "description": "The bounded controller channel or tracked-store capacity overflowed during the last five minutes.",
+            "runbook": "docs/operations/observability-runbook.md#alert-response",
+            "summary": "OpenFGA cache controller rejected work at its capacity boundary"
+          },
+          "expr": "increase(openfga_cache_controller_overflows_total[5m]) > 0",
+          "for": "1m",
+          "labels": { "severity": "critical" }
+        }
+      ]
+    },
+    {
+      "name": "openfga-rs-capacity",
+      "rules": [
+        {
+          "alert": "OpenFgaTransportOverload",
+          "annotations": {
+            "description": "More than 5% of requests are rejected at the endpoint concurrency boundary while traffic exceeds one request per second.",
+            "runbook": "docs/operations/capacity-runbook.md#incident-containment",
+            "summary": "OpenFGA is shedding sustained request concurrency"
+          },
+          "expr": "sum(rate(openfga_transport_requests_total{result=\"overloaded\"}[5m])) / clamp_min(sum(rate(openfga_transport_requests_total[5m])), 0.001) > 0.05 and sum(rate(openfga_transport_requests_total[5m])) > 1",
+          "for": "5m",
+          "labels": { "severity": "warning" }
+        },
+        {
+          "alert": "OpenFgaPostgresWorkSaturated",
+          "annotations": {
+            "description": "No PostgreSQL work permits have been available for two minutes.",
+            "runbook": "docs/operations/capacity-runbook.md#incident-containment",
+            "summary": "OpenFGA PostgreSQL work capacity is saturated"
+          },
+          "expr": "max(openfga_storage_work_available) == 0",
+          "for": "2m",
+          "labels": { "severity": "critical" }
+        },
+        {
+          "alert": "OpenFgaPostgresWaitHigh",
+          "annotations": {
+            "description": "The p95 wait for a PostgreSQL work permit exceeds 100 milliseconds.",
+            "runbook": "docs/operations/capacity-runbook.md#incident-containment",
+            "summary": "OpenFGA PostgreSQL work queue latency is high"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(openfga_storage_work_wait_duration_seconds_bucket{result=\"acquired\"}[5m]))) > 0.1",
+          "for": "5m",
+          "labels": { "severity": "warning" }
+        },
+        {
+          "alert": "OpenFgaCacheHitRatioLow",
+          "annotations": {
+          "description": "The aggregate hit ratio among cacheable lookups is below 50% while cacheable traffic exceeds one lookup per second.",
+            "runbook": "docs/operations/observability-runbook.md#alert-response",
+            "summary": "OpenFGA cache effectiveness has regressed"
+          },
+          "expr": "sum(rate(openfga_cache_requests_total{result=\"hit\"}[10m])) / clamp_min(sum(rate(openfga_cache_requests_total{result=~\"hit|miss\"}[10m])), 0.001) < 0.5 and sum(rate(openfga_cache_requests_total{result=~\"hit|miss\"}[10m])) > 1",
+          "for": "10m",
+          "labels": { "severity": "warning" }
+        }
+      ]
+    }
+  ]
+}

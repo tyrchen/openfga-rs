@@ -21,6 +21,8 @@ use openfga_storage::{
 use thiserror::Error;
 use tokio::time::{Instant as TokioInstant, sleep_until};
 
+use crate::metrics::CacheMetrics;
+
 const MAXIMUM_IMMUTABLE_TTL: Duration = Duration::from_hours(720);
 const MAXIMUM_ALIAS_TTL: Duration = Duration::from_mins(5);
 
@@ -169,6 +171,7 @@ pub struct CachedModelStorage {
     sources: Cache<ModelKey, Arc<SourceEntry>>,
     compiled: Cache<CompiledModelKey, Arc<CompiledEntry>>,
     latest_aliases: Cache<StoreId, ModelKey>,
+    metrics: CacheMetrics,
 }
 
 impl CachedModelStorage {
@@ -201,6 +204,7 @@ impl CachedModelStorage {
             sources,
             compiled: compiled_cache,
             latest_aliases,
+            metrics: CacheMetrics::new(),
         }
     }
 
@@ -212,27 +216,38 @@ impl CachedModelStorage {
         context.check()?;
         let reader = Arc::clone(&self.reader);
         let load_key = key.clone();
-        let source = wait_for_cache(
-            context,
-            self.sources.try_get_with(key.clone(), async move {
-                let model = reader
-                    .read_model(context, load_key.store_id, load_key.model_id)
-                    .await?;
-                Ok::<Arc<SourceEntry>, StorageError>(Arc::new(SourceEntry {
-                    source: Arc::clone(model.source()),
-                    written_at: model.written_at(),
-                }))
-            }),
-        )
-        .await?;
+        let source = if let Some(source) = self.sources.get(&key).await {
+            self.metrics.record("model_source", "hit");
+            source
+        } else {
+            self.metrics.record("model_source", "miss");
+            wait_for_cache(
+                context,
+                self.sources.try_get_with(key.clone(), async move {
+                    let model = reader
+                        .read_model(context, load_key.store_id, load_key.model_id)
+                        .await?;
+                    Ok::<Arc<SourceEntry>, StorageError>(Arc::new(SourceEntry {
+                        source: Arc::clone(model.source()),
+                        written_at: model.written_at(),
+                    }))
+                }),
+            )
+            .await?
+        };
 
         let model_compiler = self.compiler.clone();
         let compile_source = Arc::clone(&source.source);
         let weight = source_weight(&compile_source).saturating_mul(2);
-        let compiled_entry = wait_for_cache(
-            context,
-            self.compiled
-                .try_get_with(CompiledModelKey::current(key), async move {
+        let compiled_key = CompiledModelKey::current(key);
+        let compiled_entry = if let Some(entry) = self.compiled.get(&compiled_key).await {
+            self.metrics.record("model_compiled", "hit");
+            entry
+        } else {
+            self.metrics.record("model_compiled", "miss");
+            wait_for_cache(
+                context,
+                self.compiled.try_get_with(compiled_key, async move {
                     model_compiler
                         .compile(&compile_source)
                         .map(|model| Arc::new(CompiledEntry { model, weight }))
@@ -244,8 +259,9 @@ impl CachedModelStorage {
                             )
                         })
                 }),
-        )
-        .await?;
+            )
+            .await?
+        };
         context.check()?;
         StoredAuthorizationModel::new(
             Arc::clone(&source.source),
@@ -291,6 +307,7 @@ impl fmt::Debug for CachedModelStorage {
             .field("source_entries", &self.sources.entry_count())
             .field("compiled_entries", &self.compiled.entry_count())
             .field("latest_alias_entries", &self.latest_aliases.entry_count())
+            .field("metrics", &self.metrics)
             .finish_non_exhaustive()
     }
 }
@@ -314,6 +331,8 @@ impl ModelReader for CachedModelStorage {
     ) -> Result<Arc<StoredAuthorizationModel>, StorageError> {
         context.check()?;
         if context.consistency() == ConsistencyPreference::HigherConsistency {
+            self.metrics
+                .record("model_latest_alias", "bypass_consistency");
             let model = self.reader.read_latest_model(context, store_id).await?;
             self.cache_published(&model).await;
             context.check()?;
@@ -322,36 +341,42 @@ impl ModelReader for CachedModelStorage {
         let reader = Arc::clone(&self.reader);
         let sources = self.sources.clone();
         let compiled = self.compiled.clone();
-        let key = wait_for_cache(
-            context,
-            self.latest_aliases.try_get_with(store_id, async move {
-                let model = reader.read_latest_model(context, store_id).await?;
-                let key = ModelKey::new(*model.store_id(), *model.model_id());
-                sources
-                    .insert(
-                        key.clone(),
-                        Arc::new(SourceEntry {
-                            source: Arc::clone(model.source()),
-                            written_at: model.written_at(),
-                        }),
-                    )
-                    .await;
-                compiled
-                    .insert(
-                        CompiledModelKey {
-                            model: key.clone(),
-                            compiler_version: model.compiled().compiler_format_version(),
-                        },
-                        Arc::new(CompiledEntry {
-                            model: Arc::clone(model.compiled()),
-                            weight: source_weight(model.source()).saturating_mul(2),
-                        }),
-                    )
-                    .await;
-                Ok::<ModelKey, StorageError>(key)
-            }),
-        )
-        .await?;
+        let key = if let Some(key) = self.latest_aliases.get(&store_id).await {
+            self.metrics.record("model_latest_alias", "hit");
+            key
+        } else {
+            self.metrics.record("model_latest_alias", "miss");
+            wait_for_cache(
+                context,
+                self.latest_aliases.try_get_with(store_id, async move {
+                    let model = reader.read_latest_model(context, store_id).await?;
+                    let key = ModelKey::new(*model.store_id(), *model.model_id());
+                    sources
+                        .insert(
+                            key.clone(),
+                            Arc::new(SourceEntry {
+                                source: Arc::clone(model.source()),
+                                written_at: model.written_at(),
+                            }),
+                        )
+                        .await;
+                    compiled
+                        .insert(
+                            CompiledModelKey {
+                                model: key.clone(),
+                                compiler_version: model.compiled().compiler_format_version(),
+                            },
+                            Arc::new(CompiledEntry {
+                                model: Arc::clone(model.compiled()),
+                                weight: source_weight(model.source()).saturating_mul(2),
+                            }),
+                        )
+                        .await;
+                    Ok::<ModelKey, StorageError>(key)
+                }),
+            )
+            .await?
+        };
         self.resolve_key(context, key).await
     }
 

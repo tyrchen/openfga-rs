@@ -15,7 +15,7 @@ use openfga_storage::{
 };
 use thiserror::Error;
 
-use crate::{InvalidationControllerHandle, InvalidationWatermark};
+use crate::{InvalidationControllerHandle, InvalidationWatermark, metrics::CacheMetrics};
 
 const MAXIMUM_TUPLE_CACHE_TTL: Duration = Duration::from_hours(24);
 const MAXIMUM_CACHED_RESULTS: usize = 100_000;
@@ -124,6 +124,7 @@ pub struct CachedTupleStorage {
     invalidation: InvalidationWatermark,
     maximum_results: usize,
     controller: Option<InvalidationControllerHandle>,
+    metrics: CacheMetrics,
 }
 
 impl CachedTupleStorage {
@@ -147,6 +148,7 @@ impl CachedTupleStorage {
             invalidation,
             maximum_results: config.maximum_results,
             controller: None,
+            metrics: CacheMetrics::new(),
         }
     }
 
@@ -174,16 +176,27 @@ impl CachedTupleStorage {
         let before = self.invalidation.current();
         let entry = self.entries.get(key).await;
         let after = self.invalidation.current();
-        entry
-            .filter(|entry| {
-                before == after
+        match entry {
+            Some(entry)
+                if before == after
                     && entry.watermark == after
                     && self
                         .controller
                         .as_ref()
-                        .is_none_or(|controller| controller.permits_caching(store_id))
-            })
-            .map(|entry| entry.value.clone())
+                        .is_none_or(|controller| controller.permits_caching(store_id)) =>
+            {
+                self.metrics.record("tuple", "hit");
+                Some(entry.value.clone())
+            }
+            Some(_) => {
+                self.metrics.record("tuple", "invalidated");
+                None
+            }
+            None => {
+                self.metrics.record("tuple", "miss");
+                None
+            }
+        }
     }
 
     async fn insert_if_unchanged(
@@ -220,6 +233,24 @@ impl CachedTupleStorage {
                 .is_none_or(|controller| controller.permits_caching(store_id))
     }
 
+    async fn lookup(
+        &self,
+        context: &OperationContext,
+        store_id: StoreId,
+        key: &TupleReadKey,
+    ) -> Option<TupleCacheValue> {
+        if !self.eligible(context, store_id) {
+            let result = if context.consistency() == ConsistencyPreference::HigherConsistency {
+                "bypass_consistency"
+            } else {
+                "bypass_controller"
+            };
+            self.metrics.record("tuple", result);
+            return None;
+        }
+        self.cached(store_id, key).await
+    }
+
     async fn read_stream(
         &self,
         context: &OperationContext,
@@ -228,9 +259,7 @@ impl CachedTupleStorage {
         load: impl std::future::Future<Output = Result<TupleStream, StorageError>>,
     ) -> Result<TupleStream, StorageError> {
         context.check()?;
-        if self.eligible(context, store_id)
-            && let Some(TupleCacheValue::Tuples(tuples)) = self.cached(store_id, &key).await
-        {
+        if let Some(TupleCacheValue::Tuples(tuples)) = self.lookup(context, store_id, &key).await {
             context.check()?;
             return Ok(TupleStream::from_tuples(tuples.to_vec()));
         }
@@ -273,6 +302,7 @@ impl fmt::Debug for CachedTupleStorage {
             .field("watermark", &self.invalidation.current())
             .field("maximum_results", &self.maximum_results)
             .field("controller", &self.controller)
+            .field("metrics", &self.metrics)
             .finish_non_exhaustive()
     }
 }
@@ -289,9 +319,7 @@ impl TupleReader for CachedTupleStorage {
         self.track(store_id);
         context.check()?;
         let key = page_key(store_id, filter, options);
-        if self.eligible(context, store_id)
-            && let Some(TupleCacheValue::Page(page)) = self.cached(store_id, &key).await
-        {
+        if let Some(TupleCacheValue::Page(page)) = self.lookup(context, store_id, &key).await {
             context.check()?;
             return Ok(page);
         }
@@ -321,8 +349,8 @@ impl TupleReader for CachedTupleStorage {
         self.track(store_id);
         context.check()?;
         let cache_key = exact_key("exact", store_id, key);
-        if self.eligible(context, store_id)
-            && let Some(TupleCacheValue::Exact(tuple)) = self.cached(store_id, &cache_key).await
+        if let Some(TupleCacheValue::Exact(tuple)) =
+            self.lookup(context, store_id, &cache_key).await
         {
             context.check()?;
             return Ok(tuple);
@@ -404,8 +432,8 @@ impl TupleReader for CachedTupleStorage {
         self.track(store_id);
         context.check()?;
         let cache_key = exact_key("exists", store_id, key);
-        if self.eligible(context, store_id)
-            && let Some(TupleCacheValue::Exists(exists)) = self.cached(store_id, &cache_key).await
+        if let Some(TupleCacheValue::Exists(exists)) =
+            self.lookup(context, store_id, &cache_key).await
         {
             context.check()?;
             return Ok(exists);
@@ -438,8 +466,8 @@ impl TupleReader for CachedTupleStorage {
             filter,
             ReadOptions::from_limit(openfga_domain::Limit::MIN),
         );
-        if self.eligible(context, store_id)
-            && let Some(TupleCacheValue::Count(count)) = self.cached(store_id, &cache_key).await
+        if let Some(TupleCacheValue::Count(count)) =
+            self.lookup(context, store_id, &cache_key).await
         {
             context.check()?;
             return Ok(count);

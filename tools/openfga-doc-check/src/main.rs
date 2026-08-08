@@ -1,4 +1,4 @@
-//! Repository-local Markdown link validation.
+//! Repository-local documentation and observability artifact validation.
 
 #![forbid(unsafe_code)]
 
@@ -11,16 +11,26 @@ use anyhow::{Context, Result, bail};
 
 fn main() -> Result<()> {
     let workspace = workspace_root()?;
-    let mut files = vec![workspace.join("README.md")];
-    collect_markdown(&workspace.join("docs"), &mut files)?;
-    collect_markdown(&workspace.join("specs"), &mut files)?;
+    let mut markdown_files = vec![workspace.join("README.md")];
+    collect_files(&workspace.join("docs"), "md", &mut markdown_files)?;
+    collect_files(&workspace.join("specs"), "md", &mut markdown_files)?;
 
     let mut invalid = Vec::new();
-    for file in files {
+    for file in markdown_files {
         check_links(&workspace, &file, &mut invalid)?;
     }
     if !invalid.is_empty() {
         bail!("invalid local Markdown links:\n{}", invalid.join("\n"));
+    }
+
+    let mut json_files = Vec::new();
+    collect_files(
+        &workspace.join("deploy/observability"),
+        "json",
+        &mut json_files,
+    )?;
+    for file in json_files {
+        check_json(&file)?;
     }
     Ok(())
 }
@@ -35,7 +45,7 @@ fn workspace_root() -> Result<PathBuf> {
 
 // This finite command-line scan has no async runtime in which synchronous filesystem work blocks.
 #[allow(clippy::disallowed_methods)]
-fn collect_markdown(directory: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+fn collect_files(directory: &Path, extension: &str, files: &mut Vec<PathBuf>) -> Result<()> {
     for entry in fs::read_dir(directory)
         .with_context(|| format!("failed to read {}", directory.display()))?
     {
@@ -44,16 +54,29 @@ fn collect_markdown(directory: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
             .file_type()
             .with_context(|| format!("failed to inspect {}", entry.path().display()))?;
         if file_type.is_dir() {
-            collect_markdown(&entry.path(), files)?;
+            collect_files(&entry.path(), extension, files)?;
         } else if entry
             .path()
             .extension()
-            .is_some_and(|extension| extension == "md")
+            .is_some_and(|candidate| candidate == extension)
         {
             files.push(entry.path());
         }
     }
     Ok(())
+}
+
+// This finite command-line scan has no async runtime in which synchronous filesystem work blocks.
+#[allow(clippy::disallowed_methods)]
+fn check_json(file: &Path) -> Result<()> {
+    let contents =
+        fs::read_to_string(file).with_context(|| format!("failed to read {}", file.display()))?;
+    parse_json(&contents).with_context(|| format!("invalid JSON in {}", file.display()))?;
+    Ok(())
+}
+
+fn parse_json(contents: &str) -> std::result::Result<serde_json::Value, serde_json::Error> {
+    serde_json::from_str(contents)
 }
 
 // This finite command-line scan has no async runtime in which synchronous filesystem work blocks.
@@ -119,11 +142,19 @@ fn is_external_or_anchor(target: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::inline_link_targets;
+    use super::{inline_link_targets, parse_json};
 
     #[test]
     fn test_should_extract_multiple_inline_markdown_links() {
         let targets = inline_link_targets("[one](a.md) and [two](../b.md#section)");
         assert_eq!(targets, ["a.md", "../b.md#section"]);
+    }
+
+    #[test]
+    fn test_should_reject_invalid_observability_json() {
+        assert!(matches!(
+            parse_json(r#"{"groups": [}"#),
+            Err(error) if error.is_syntax() || error.is_eof()
+        ));
     }
 }

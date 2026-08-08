@@ -23,6 +23,10 @@ use openfga_storage::{
     StoredAuthorizationModel, StoredTuple, TupleChange, TupleReadFilter, TupleReader, TupleStream,
     TupleWriteOptions, TupleWriter, UsersetTupleFilter, WriteConflictPolicy,
 };
+use opentelemetry::{
+    KeyValue,
+    metrics::{AsyncInstrument, Histogram, ObservableGauge},
+};
 use secrecy::ExposeSecret;
 use sqlx::{
     FromRow, PgPool, Postgres, QueryBuilder, Transaction,
@@ -63,6 +67,83 @@ pub struct PostgresStorage {
     config: PostgresStorageConfig,
     compiler: ModelCompiler,
     faults: Arc<dyn PostgresMutationFaultInjector>,
+    metrics: PostgresMetrics,
+}
+
+struct PostgresMetrics {
+    wait_duration: Histogram<f64>,
+    _pool_connections: ObservableGauge<u64>,
+    _work_available: ObservableGauge<u64>,
+}
+
+impl PostgresMetrics {
+    fn new(primary: &PgPool, replica: Option<&PgPool>, work_permits: &Arc<Semaphore>) -> Self {
+        let meter = opentelemetry::global::meter("openfga-storage-sql");
+        let primary = primary.clone();
+        let replica = replica.cloned();
+        let work_permits = Arc::clone(work_permits);
+        Self {
+            wait_duration: meter
+                .f64_histogram("openfga.storage.work.wait.duration")
+                .with_description("Time waiting for bounded PostgreSQL work admission")
+                .with_unit("s")
+                .with_boundaries(vec![
+                    0.000_1, 0.000_25, 0.000_5, 0.001, 0.002_5, 0.005, 0.01, 0.025, 0.05, 0.1,
+                    0.25, 0.5, 1.0, 2.5, 5.0,
+                ])
+                .build(),
+            _pool_connections: meter
+                .u64_observable_gauge("openfga.storage.pool.connections")
+                .with_description("Open and idle PostgreSQL pool connections")
+                .with_callback(move |observer| {
+                    observe_pool(observer, "primary", &primary);
+                    if let Some(replica) = &replica {
+                        observe_pool(observer, "replica", replica);
+                    }
+                })
+                .build(),
+            _work_available: meter
+                .u64_observable_gauge("openfga.storage.work.available")
+                .with_description("Immediately available PostgreSQL work permits")
+                .with_callback(move |observer| {
+                    observer.observe(
+                        u64::try_from(work_permits.available_permits()).unwrap_or(u64::MAX),
+                        &[],
+                    );
+                })
+                .build(),
+        }
+    }
+
+    fn record_wait(&self, duration: Duration, result: &'static str) {
+        self.wait_duration
+            .record(duration.as_secs_f64(), &[KeyValue::new("result", result)]);
+    }
+}
+
+impl fmt::Debug for PostgresMetrics {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PostgresMetrics")
+    }
+}
+
+fn observe_pool(observer: &dyn AsyncInstrument<u64>, role: &'static str, pool: &PgPool) {
+    let open = u64::from(pool.size());
+    let idle = u64::try_from(pool.num_idle()).unwrap_or(u64::MAX);
+    observer.observe(
+        open,
+        &[
+            KeyValue::new("pool.role", role),
+            KeyValue::new("state", "open"),
+        ],
+    );
+    observer.observe(
+        idle,
+        &[
+            KeyValue::new("pool.role", role),
+            KeyValue::new("state", "idle"),
+        ],
+    );
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -128,6 +209,7 @@ impl PostgresStorage {
                 )
             })?,
         ));
+        let metrics = PostgresMetrics::new(&primary, replica.as_ref(), &work_permits);
         Ok(Self {
             primary,
             replica,
@@ -135,6 +217,7 @@ impl PostgresStorage {
             config,
             compiler: ModelCompiler::default(),
             faults,
+            metrics,
         })
     }
 
@@ -183,16 +266,25 @@ impl PostgresStorage {
         context.check()?;
         let acquire = Arc::clone(&self.work_permits).acquire_owned();
         tokio::pin!(acquire);
+        let started_at = Instant::now();
         let deadline = Instant::from_std(context.deadline().instant());
-        tokio::select! {
+        let (result, outcome) = tokio::select! {
             biased;
-            () = context.cancellation().cancelled() => Err(cancelled()),
-            () = sleep_until(deadline) => Err(timed_out()),
-            result = &mut acquire => result.map_err(|_| StorageError::new(
-                StorageErrorKind::Unavailable,
-                "postgres_work_admission_closed",
-            )),
-        }
+            () = context.cancellation().cancelled() => (Err(cancelled()), "cancelled"),
+            () = sleep_until(deadline) => (Err(timed_out()), "deadline"),
+            result = &mut acquire => match result {
+                Ok(permit) => (Ok(permit), "acquired"),
+                Err(_) => (
+                    Err(StorageError::new(
+                        StorageErrorKind::Unavailable,
+                        "postgres_work_admission_closed",
+                    )),
+                    "closed",
+                ),
+            },
+        };
+        self.metrics.record_wait(started_at.elapsed(), outcome);
+        result
     }
 
     async fn read_pool<'a>(&'a self, context: &OperationContext) -> &'a PgPool {
@@ -330,6 +422,7 @@ impl fmt::Debug for PostgresStorage {
             .field("config", &self.config)
             .field("replica_configured", &self.replica.is_some())
             .field("faults", &self.faults)
+            .field("metrics", &self.metrics)
             .finish_non_exhaustive()
     }
 }

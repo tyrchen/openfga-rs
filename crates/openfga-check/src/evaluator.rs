@@ -139,6 +139,7 @@ impl CheckEvaluator for CachedCheckEvaluator {
             return Err(timed_out("decision_cache_lookup_deadline_elapsed"));
         }
         if command.query().consistency() == ConsistencyPreference::HigherConsistency {
+            self.decisions.record_bypass();
             return self
                 .delegate
                 .check(command, model, tuples, budget, work_meter, cancellation)
@@ -185,6 +186,7 @@ impl CheckEvaluator for CachedCheckEvaluator {
             return Err(timed_out("batch_decision_cache_lookup_deadline_elapsed"));
         }
         if command.query().consistency() == ConsistencyPreference::HigherConsistency {
+            self.decisions.record_bypass();
             return self
                 .delegate
                 .batch_check(command, model, tuples, budget, cancellation)

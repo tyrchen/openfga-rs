@@ -10,7 +10,7 @@ use openfga_model::CompiledModel;
 use sha2::Sha256;
 use thiserror::Error;
 
-use crate::{InvalidationControllerHandle, InvalidationWatermark};
+use crate::{InvalidationControllerHandle, InvalidationWatermark, metrics::CacheMetrics};
 
 const MAXIMUM_DECISION_TTL: Duration = Duration::from_hours(24);
 type HmacSha256 = Hmac<Sha256>;
@@ -159,6 +159,7 @@ where
     entries: Cache<DecisionKey, Arc<DecisionEntry<V>>>,
     invalidation: InvalidationWatermark,
     controller: Option<InvalidationControllerHandle>,
+    metrics: CacheMetrics,
 }
 
 impl<V> DecisionCache<V>
@@ -177,6 +178,7 @@ where
             entries,
             invalidation,
             controller: None,
+            metrics: CacheMetrics::new(),
         }
     }
 
@@ -203,22 +205,34 @@ where
         if let Some(controller) = &self.controller {
             controller.track(key.store_id);
             if !controller.permits_caching(key.store_id) {
+                self.metrics.record("decision", "bypass_controller");
                 return None;
             }
         }
         let before = self.invalidation.current();
         let entry = self.entries.get(key).await;
         let after = self.invalidation.current();
-        entry
-            .filter(|entry| {
-                before == after
+        match entry {
+            Some(entry)
+                if before == after
                     && entry.watermark == after
                     && self
                         .controller
                         .as_ref()
-                        .is_none_or(|controller| controller.permits_caching(key.store_id))
-            })
-            .map(|entry| entry.value.clone())
+                        .is_none_or(|controller| controller.permits_caching(key.store_id)) =>
+            {
+                self.metrics.record("decision", "hit");
+                Some(entry.value.clone())
+            }
+            Some(_) => {
+                self.metrics.record("decision", "invalidated");
+                None
+            }
+            None => {
+                self.metrics.record("decision", "miss");
+                None
+            }
+        }
     }
 
     /// Inserts a successful result only if invalidation did not race computation.
@@ -247,6 +261,11 @@ where
                 .as_ref()
                 .is_none_or(|controller| controller.permits_caching(store_id))
     }
+
+    /// Records an explicit consistency bypass performed before key lookup.
+    pub fn record_bypass(&self) {
+        self.metrics.record("decision", "bypass_consistency");
+    }
 }
 
 impl<V> fmt::Debug for DecisionCache<V>
@@ -259,6 +278,7 @@ where
             .field("entries", &self.entries.entry_count())
             .field("watermark", &self.invalidation.current())
             .field("controller", &self.controller)
+            .field("metrics", &self.metrics)
             .finish_non_exhaustive()
     }
 }

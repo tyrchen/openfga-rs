@@ -9,6 +9,8 @@
 | [PostgreSQL backup and restore](./operations/backup-restore-runbook.md) | Logical backup, PITR expectations, restore verification, and promotion |
 | [Authentication and authorization](./operations/authentication-runbook.md) | Disabled/preshared/OIDC operation, rotation, JWKS outages, and store/action policy |
 | [Failure response](./operations/failure-response-runbook.md) | Triage, fail-safe behavior, diagnosis, graceful restart, and escalation evidence |
+| [Capacity and overload](./operations/capacity-runbook.md) | Pool-derived concurrency envelope, load worksheet, tuning sequence, and containment |
+| [Observability and alerts](./operations/observability-runbook.md) | OTLP metric contract, Grafana dashboard, alert rules, and redacted response procedures |
 
 ## Research
 

@@ -1,0 +1,184 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "description": "Bounded request, cache-controller, and PostgreSQL capacity signals for openfga-rs.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [
+    {
+      "title": "Observability runbook",
+      "type": "link",
+      "url": "docs/operations/observability-runbook.md"
+    },
+    {
+      "title": "Capacity runbook",
+      "type": "link",
+      "url": "docs/operations/capacity-runbook.md"
+    }
+  ],
+  "panels": [
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 0 },
+      "id": 1,
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "expr": "sum by (endpoint_class, result) (rate(openfga_transport_requests_total[$__rate_interval]))", "legendFormat": "{{endpoint_class}} {{result}}", "refId": "A" }
+      ],
+      "title": "Request rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "max": 1, "min": 0, "unit": "percentunit" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 0 },
+      "id": 2,
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "expr": "sum by (endpoint_class) (rate(openfga_transport_requests_total{result=\"overloaded\"}[$__rate_interval])) / clamp_min(sum by (endpoint_class) (rate(openfga_transport_requests_total[$__rate_interval])), 0.001)", "legendFormat": "{{endpoint_class}}", "refId": "A" }
+      ],
+      "title": "Concurrency-overload ratio",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 0 },
+      "id": 3,
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "expr": "histogram_quantile(0.95, sum by (le, endpoint_class) (rate(openfga_transport_request_duration_seconds_bucket[$__rate_interval])))", "legendFormat": "p95 {{endpoint_class}}", "refId": "A" },
+        { "expr": "histogram_quantile(0.99, sum by (le, endpoint_class) (rate(openfga_transport_request_duration_seconds_bucket[$__rate_interval])))", "legendFormat": "p99 {{endpoint_class}}", "refId": "B" }
+      ],
+      "title": "Admitted request lifetime",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "min": 0, "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 8 },
+      "id": 4,
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "expr": "sum by (endpoint_class) (openfga_transport_in_flight)", "legendFormat": "{{endpoint_class}}", "refId": "A" }
+      ],
+      "title": "Requests holding endpoint permits",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "max": 1, "min": 0, "unit": "percentunit" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 8 },
+      "id": 5,
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "expr": "sum by (cache) (rate(openfga_cache_requests_total{result=\"hit\"}[$__rate_interval])) / clamp_min(sum by (cache) (rate(openfga_cache_requests_total{result=~\"hit|miss\"}[$__rate_interval])), 0.001)", "legendFormat": "{{cache}}", "refId": "A" }
+      ],
+      "title": "Cache hit ratio",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "min": 0, "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 8 },
+      "id": 6,
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "expr": "openfga_cache_controller_running", "legendFormat": "running", "refId": "A" },
+        { "expr": "openfga_cache_controller_ready", "legendFormat": "ready", "refId": "B" },
+        { "expr": "openfga_cache_controller_tracked_stores", "legendFormat": "tracked stores", "refId": "C" }
+      ],
+      "title": "Cache controller state",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "min": 0, "unit": "ms" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 16 },
+      "id": 7,
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "expr": "openfga_cache_controller_lag_milliseconds", "legendFormat": "maximum lag", "refId": "A" }
+      ],
+      "title": "Cache-controller lag",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "min": 0, "unit": "ops" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 16 },
+      "id": 8,
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "expr": "sum(rate(openfga_cache_controller_polls_failed_total[$__rate_interval]))", "legendFormat": "failed polls", "refId": "A" },
+        { "expr": "sum(rate(openfga_cache_controller_flushes_total[$__rate_interval]))", "legendFormat": "flushes", "refId": "B" },
+        { "expr": "sum(rate(openfga_cache_controller_overflows_total[$__rate_interval]))", "legendFormat": "overflows", "refId": "C" },
+        { "expr": "sum(rate(openfga_cache_controller_restarts_total[$__rate_interval]))", "legendFormat": "restarts", "refId": "D" }
+      ],
+      "title": "Cache-controller events",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "min": 0, "unit": "s" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 16 },
+      "id": 9,
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "expr": "histogram_quantile(0.95, sum by (le, result) (rate(openfga_storage_work_wait_duration_seconds_bucket[$__rate_interval])))", "legendFormat": "p95 {{result}}", "refId": "A" }
+      ],
+      "title": "PostgreSQL work-permit wait",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "min": 0, "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "id": 10,
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "expr": "openfga_storage_pool_connections", "legendFormat": "{{pool_role}} {{state}}", "refId": "A" }
+      ],
+      "title": "PostgreSQL pool connections",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "min": 0, "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "id": 11,
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "expr": "openfga_storage_work_available", "legendFormat": "available permits", "refId": "A" }
+      ],
+      "title": "PostgreSQL work permits available",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": ["openfga-rs", "authorization", "capacity"],
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "label": "Prometheus",
+        "name": "DS_PROMETHEUS",
+        "options": [],
+        "query": "prometheus",
+        "refresh": 1,
+        "type": "datasource"
+      }
+    ]
+  },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "openfga-rs / Capacity and consistency",
+  "uid": "openfga-rs-capacity",
+  "version": 1
+}

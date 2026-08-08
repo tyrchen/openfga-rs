@@ -31,6 +31,8 @@ const MAXIMUM_AUTH_KEYS: usize = 32;
 const MAXIMUM_TOKEN_KEYS: usize = 16;
 const MAXIMUM_PAGE_SIZE: u32 = 100;
 const MAXIMUM_POLICY_BINDINGS: usize = 1_024;
+const POSTGRES_CONTROL_PLANE_HEADROOM: u32 = 2;
+const POSTGRES_IN_FLIGHT_MULTIPLIER: u32 = 4;
 pub(crate) const DEVELOPMENT_PRINCIPAL_ID: &str = "openfga-development-runtime";
 
 /// Fully validated server configuration. No secret values are retained here.
@@ -1134,12 +1136,38 @@ impl ServerConfig {
     }
 
     fn validate_database_concurrency(&self) -> Result<()> {
-        if self.storage.backend == StorageBackend::Postgres
-            && (self.evaluator.concurrent_reads > self.storage.postgres.max_connections
-                || self.evaluator.batch_concurrency > self.storage.postgres.max_connections
-                || self.list_objects.residual_concurrency > self.storage.postgres.max_connections)
+        if self.storage.backend != StorageBackend::Postgres {
+            return Ok(());
+        }
+        let pool = self.storage.postgres.max_connections;
+        let request_reads = pool.saturating_sub(POSTGRES_CONTROL_PLANE_HEADROOM).max(1);
+        if self.evaluator.concurrent_reads > request_reads {
+            bail!(
+                "evaluator concurrent reads must leave PostgreSQL capacity for control-plane work"
+            );
+        }
+        if self.evaluator.batch_concurrency > pool || self.list_objects.residual_concurrency > pool
         {
-            bail!("evaluator and ListObjects concurrency cannot exceed the PostgreSQL work limit");
+            bail!("batch and ListObjects concurrency cannot exceed the PostgreSQL work limit");
+        }
+        let total_work = pool.saturating_mul(POSTGRES_IN_FLIGHT_MULTIPLIER);
+        if self
+            .evaluator
+            .batch_concurrency
+            .saturating_mul(self.evaluator.concurrent_reads)
+            > total_work
+            || self
+                .list_objects
+                .residual_concurrency
+                .saturating_mul(self.evaluator.concurrent_reads)
+                > total_work
+        {
+            bail!("nested evaluator concurrency exceeds the bounded PostgreSQL work envelope");
+        }
+        let transport = u32::try_from(self.transport.maximum_concurrency)
+            .context("transport concurrency exceeds the PostgreSQL arithmetic range")?;
+        if transport > total_work {
+            bail!("transport concurrency cannot exceed four times the PostgreSQL work limit");
         }
         Ok(())
     }
@@ -1282,7 +1310,7 @@ const fn default_message_bytes() -> usize {
 }
 
 const fn default_concurrency() -> usize {
-    1_024
+    64
 }
 
 fn default_token_key_id() -> String {
@@ -1386,11 +1414,11 @@ const fn default_condition_cost() -> u32 {
 }
 
 const fn default_concurrent_reads() -> u32 {
-    16
+    8
 }
 
 const fn default_batch_concurrency() -> u32 {
-    16
+    8
 }
 
 const fn default_candidates() -> u32 {
@@ -1402,7 +1430,7 @@ const fn default_expand_response_bytes() -> u32 {
 }
 
 const fn default_residual_concurrency() -> u32 {
-    16
+    8
 }
 
 const fn default_stream_buffer() -> u32 {
@@ -1680,19 +1708,27 @@ evaluator: {}
         let mut config = ServerConfig::from(parse(VALID.as_bytes())?);
         config.storage.backend = super::StorageBackend::Postgres;
         config.storage.postgres.max_connections = 8;
-        config.evaluator.concurrent_reads = 9;
+        config.transport.maximum_concurrency = 32;
+        config.evaluator.concurrent_reads = 7;
         assert!(config.validate().is_err());
 
-        config.evaluator.concurrent_reads = 8;
+        config.evaluator.concurrent_reads = 6;
         config.evaluator.batch_concurrency = 9;
         assert!(config.validate().is_err());
 
-        config.evaluator.batch_concurrency = 8;
+        config.evaluator.batch_concurrency = 5;
         config.list_objects.residual_concurrency = 9;
         assert!(config.validate().is_err());
 
-        config.list_objects.residual_concurrency = 8;
+        config.list_objects.residual_concurrency = 5;
         config.validate()?;
+
+        config.evaluator.batch_concurrency = 6;
+        assert!(config.validate().is_err());
+
+        config.evaluator.batch_concurrency = 5;
+        config.transport.maximum_concurrency = 33;
+        assert!(config.validate().is_err());
         Ok(())
     }
 

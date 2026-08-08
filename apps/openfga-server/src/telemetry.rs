@@ -5,7 +5,7 @@ use std::{fmt, time::Duration};
 use anyhow::{Context, Result};
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig;
-use opentelemetry_sdk::{Resource, trace::SdkTracerProvider};
+use opentelemetry_sdk::{Resource, metrics::SdkMeterProvider, trace::SdkTracerProvider};
 use tracing_subscriber::{
     EnvFilter,
     layer::SubscriberExt,
@@ -16,33 +16,53 @@ use crate::config::{LogFormat, TelemetryConfig};
 
 /// Owns the optional exporter so shutdown can flush it deterministically.
 pub(crate) struct TelemetryGuard {
-    provider: Option<SdkTracerProvider>,
+    tracer_provider: Option<SdkTracerProvider>,
+    meter_provider: Option<SdkMeterProvider>,
     shutdown_timeout: Duration,
 }
 
 impl TelemetryGuard {
     pub(crate) fn install(config: &TelemetryConfig) -> Result<Self> {
         let shutdown_timeout = Duration::from_millis(config.export_timeout_ms);
-        let provider = config
+        let providers = config
             .otlp_endpoint
             .as_deref()
-            .map(|endpoint| build_provider(endpoint, shutdown_timeout))
+            .map(|endpoint| build_providers(endpoint, shutdown_timeout))
             .transpose()?;
-        install_subscriber(config, provider.as_ref())?;
-        if let Some(provider) = &provider {
+        let (tracer_provider, meter_provider) = match providers {
+            Some((tracer, meter)) => (Some(tracer), Some(meter)),
+            None => (None, None),
+        };
+        install_subscriber(config, tracer_provider.as_ref())?;
+        if let Some(provider) = &tracer_provider {
             opentelemetry::global::set_tracer_provider(provider.clone());
         }
+        if let Some(provider) = &meter_provider {
+            opentelemetry::global::set_meter_provider(provider.clone());
+        }
         Ok(Self {
-            provider,
+            tracer_provider,
+            meter_provider,
             shutdown_timeout,
         })
     }
 
     pub(crate) fn shutdown(&self) -> Result<()> {
-        if let Some(provider) = &self.provider {
+        let metrics = self.meter_provider.as_ref().map(|provider| {
             provider
                 .shutdown_with_timeout(self.shutdown_timeout)
-                .context("failed to flush OpenTelemetry traces")?;
+                .context("failed to flush OpenTelemetry metrics")
+        });
+        let traces = self.tracer_provider.as_ref().map(|provider| {
+            provider
+                .shutdown_with_timeout(self.shutdown_timeout)
+                .context("failed to flush OpenTelemetry traces")
+        });
+        if let Some(result) = metrics {
+            result?;
+        }
+        if let Some(result) = traces {
+            result?;
         }
         Ok(())
     }
@@ -52,27 +72,41 @@ impl fmt::Debug for TelemetryGuard {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("TelemetryGuard")
-            .field("otlp_enabled", &self.provider.is_some())
+            .field("otlp_traces_enabled", &self.tracer_provider.is_some())
+            .field("otlp_metrics_enabled", &self.meter_provider.is_some())
             .field("shutdown_timeout", &self.shutdown_timeout)
             .finish()
     }
 }
 
-fn build_provider(endpoint: &str, timeout: Duration) -> Result<SdkTracerProvider> {
-    let exporter = opentelemetry_otlp::SpanExporter::builder()
+fn build_providers(
+    endpoint: &str,
+    timeout: Duration,
+) -> Result<(SdkTracerProvider, SdkMeterProvider)> {
+    let span_exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_tonic()
         .with_endpoint(endpoint)
         .with_timeout(timeout)
         .build()
         .context("failed to build OTLP trace exporter")?;
-    Ok(SdkTracerProvider::builder()
-        .with_resource(
-            Resource::builder()
-                .with_service_name("openfga-server")
-                .build(),
-        )
-        .with_batch_exporter(exporter)
-        .build())
+    let metric_exporter = opentelemetry_otlp::MetricExporter::builder()
+        .with_tonic()
+        .with_endpoint(endpoint)
+        .with_timeout(timeout)
+        .build()
+        .context("failed to build OTLP metric exporter")?;
+    let resource = Resource::builder()
+        .with_service_name("openfga-server")
+        .build();
+    let tracer = SdkTracerProvider::builder()
+        .with_resource(resource.clone())
+        .with_batch_exporter(span_exporter)
+        .build();
+    let meter = SdkMeterProvider::builder()
+        .with_resource(resource)
+        .with_periodic_exporter(metric_exporter)
+        .build();
+    Ok((tracer, meter))
 }
 
 fn install_subscriber(

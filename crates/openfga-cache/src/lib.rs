@@ -10,6 +10,7 @@
 mod controller;
 mod decision;
 mod invalidation;
+mod metrics;
 mod model;
 mod tuple;
 

@@ -17,6 +17,7 @@ openfga-condition.workspace = true
 openfga-domain.workspace = true
 openfga-model.workspace = true
 openfga-storage.workspace = true
+opentelemetry.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 secrecy.workspace = true

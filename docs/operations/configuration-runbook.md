@@ -90,7 +90,7 @@ transport:
   requestTimeoutMs: 5000
   tokenTtlSeconds: 86400
   maximumMessageBytes: 1048576
-  maximumConcurrency: 1024
+  maximumConcurrency: 64
   tokenKeyId: primary
   tokenKeyEnv: OPENFGA_TOKEN_KEY
   tokenVerificationKeys:
@@ -113,11 +113,12 @@ evaluator:
   datastoreQueries: 100
   tupleItems: 10000
   conditionCost: 100000
-  concurrentReads: 16
-  batchConcurrency: 16
+  concurrentReads: 8
+  batchConcurrency: 8
 telemetry:
   logFormat: json
   logFilter: info
+  otlpEndpoint: https://otel-collector.internal:4317
   exportTimeoutMs: 5000
 shutdown:
   drainTimeoutMs: 10000
@@ -127,6 +128,10 @@ shutdown:
 Omit `replicaUrlEnv` when there is no replica. Latency-preferring reads use a configured replica
 only while its replay lag is within `replicaMaxLagMs`; otherwise they conservatively use the
 primary.
+
+Omit `telemetry.otlpEndpoint` to disable trace and metric export. When configured, it must identify
+an OTLP gRPC collector; route the collector's metric pipeline to the Prometheus datasource used by
+the checked-in dashboard and alerts.
 
 Authentication attempt and failure limits apply independently to each direct TCP peer IP. The
 global authentication limits are separate emergency ceilings across all peers. Forwarded client-IP
@@ -157,8 +162,8 @@ configuration, logs, tickets, or shell history.
 | Mutable caches | decision/tuple weights are positive; TTL is at most 24 hours; tuple entries hold at most 100,000 rows; higher-consistency reads bypass and do not populate either cache |
 | Cache controller | channel capacity also bounds tracked stores; page size is positive and ≤1,000; poll/read/lag are ≤5 minutes; maximum lag bounds four sequential changelog reads and cannot exceed shutdown drain timeout; overflow, detectable gap/order fault, timeout, lag, failure, and restart conservatively flush and disable mutable entries until a healthy poll |
 | TLS | reload interval is 1–3,600 seconds; each complete pair is bounded and validated before one atomic publication to HTTP and gRPC |
-| Transport | page size is 1–100; timeout is 1 ms–5 minutes; token TTL is 1 second–720 hours; message size is 1–16 MiB; concurrency is 1–65,536; admission rates are 1–1,000,000 per 1–3,600-second window |
-| Evaluator | every budget is positive; depth ≤1,000, dispatches/items/cost ≤1,000,000, datastore queries ≤100,000, reads ≤1,024, batch concurrency ≤1,000 |
+| Transport | page size is 1–100; timeout is 1 ms–5 minutes; token TTL is 1 second–720 hours; message size is 1–16 MiB; concurrency is 1–65,536 and, for PostgreSQL, ≤4× pool size; admission rates are 1–1,000,000 per 1–3,600-second window |
+| Evaluator | every budget is positive; depth ≤1,000, dispatches/items/cost ≤1,000,000, datastore queries ≤100,000, reads ≤1,024, batch concurrency ≤1,000; PostgreSQL per-root read budgets leave two pool slots and nested fan-out is bounded to 4× pool size |
 | Telemetry | `logFormat` is `pretty` or `json`; the log filter must parse; export timeout is 1 ms–1 minute; OTLP is a credential-free HTTP(S) origin without path/query/fragment |
 | Shutdown | drain timeout is 1 ms–5 minutes; health interval is 1 ms–1 minute |
 

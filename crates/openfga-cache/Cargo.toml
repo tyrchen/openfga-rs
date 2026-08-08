@@ -19,6 +19,7 @@ moka.workspace = true
 openfga-domain.workspace = true
 openfga-model.workspace = true
 openfga-storage.workspace = true
+opentelemetry.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

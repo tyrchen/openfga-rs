@@ -32,6 +32,26 @@ Use `tracing` and OpenTelemetry. Logs are structured JSON in production and huma
 
 Labels use endpoint, result/error class, strategy, backend, and object/subject type only when cardinality is bounded. Object IDs, subject IDs, tuples, contexts, tokens, credentials, DSNs, and SQL parameter values are forbidden. Redaction tests inspect logs/errors/debug output.
 
+```mermaid
+flowchart LR
+    Client --> Admission["authentication, rate, and nonwaiting endpoint permit"]
+    Admission --> Evaluator["request budgets and evaluator read permits"]
+    Evaluator --> StorageGate["shared PostgreSQL work permits"]
+    StorageGate --> Pools["primary and replica pools"]
+    Admission -. bounded metrics .-> OTLP["OTLP collector"]
+    Evaluator -. bounded metrics .-> OTLP
+    StorageGate -. bounded metrics .-> OTLP
+    Controller["supervised cache controller"] -. readiness, lag, and invalidation metrics .-> OTLP
+    OTLP --> Dashboard["Grafana dashboard"]
+    OTLP --> Alerts["Prometheus-compatible alert rules"]
+```
+
+PostgreSQL-backed configurations validate endpoint and nested evaluator concurrency against pool
+capacity. The storage work semaphore remains the final finite queue; per-request evaluator budgets
+leave headroom within a pool-sized scheduling wave for control-plane work. Dashboard and alert
+artifacts are versioned with the server, validated by the documentation gate, and paired with
+capacity and incident runbooks.
+
 ## Health and resilience
 
 Liveness reports event-loop/process health without touching external systems. Readiness reports storage/schema, authentication key availability, and correctness-critical actor state with bounded cached probes. Each network/disk operation has a timeout. Retries are bounded, jittered, idempotency-aware, and never retry semantic validation or non-idempotent mutation after ambiguous commit without reconciliation.

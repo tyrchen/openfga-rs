@@ -28,9 +28,9 @@ moka = { version = "~0.12.15", default-features = false, features = ["future", "
 pbjson = { version = "~0.9.0", default-features = false }
 pbjson-build = { version = "~0.9.0", default-features = false }
 pbjson-types = { version = "~0.9.0", default-features = false }
-opentelemetry = { version = "~0.32.0", default-features = false, features = ["trace"] }
-opentelemetry-otlp = { version = "~0.32.0", default-features = false, features = ["grpc-tonic", "tls-aws-lc", "tls-webpki-roots", "trace"] }
-opentelemetry_sdk = { version = "~0.32.1", default-features = false, features = ["rt-tokio", "trace"] }
+opentelemetry = { version = "~0.32.0", default-features = false, features = ["metrics", "trace"] }
+opentelemetry-otlp = { version = "~0.32.0", default-features = false, features = ["grpc-tonic", "metrics", "tls-aws-lc", "tls-webpki-roots", "trace"] }
+opentelemetry_sdk = { version = "~0.32.1", default-features = false, features = ["metrics", "rt-tokio", "trace"] }
 prost = { version = "~0.14.4", default-features = false, features = ["derive", "std"] }
 prost-reflect = { version = "~0.16.5", default-features = false, features = ["derive"] }
 prost-reflect-build = "~0.16.1"

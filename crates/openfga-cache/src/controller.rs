@@ -17,6 +17,7 @@ use openfga_storage::{
     ChangeFilter, ChangeReader, OperationContext, PageOptions, StorageCancellationToken,
     StorageError, TupleChange,
 };
+use opentelemetry::metrics::{ObservableCounter, ObservableGauge};
 use thiserror::Error;
 use tokio::{
     sync::{mpsc, oneshot},
@@ -108,6 +109,130 @@ struct DiagnosticsState {
     flushes: AtomicU64,
     overflows: AtomicU64,
     restarts: AtomicU64,
+    current_lag_millis: AtomicU64,
+}
+
+struct ControllerMetrics {
+    _running: ObservableGauge<u64>,
+    _ready: ObservableGauge<u64>,
+    _tracked_stores: ObservableGauge<u64>,
+    _lag: ObservableGauge<u64>,
+    _successful_polls: ObservableCounter<u64>,
+    _failed_polls: ObservableCounter<u64>,
+    _flushes: ObservableCounter<u64>,
+    _overflows: ObservableCounter<u64>,
+    _restarts: ObservableCounter<u64>,
+}
+
+impl ControllerMetrics {
+    fn new(diagnostics: &InvalidationControllerDiagnostics) -> Self {
+        let meter = opentelemetry::global::meter("openfga-cache-controller");
+        Self {
+            _running: boolean_gauge(
+                &meter,
+                "openfga.cache.controller.running",
+                Arc::clone(&diagnostics.0),
+                |state| state.running.load(Ordering::Acquire),
+            ),
+            _ready: boolean_gauge(
+                &meter,
+                "openfga.cache.controller.ready",
+                Arc::clone(&diagnostics.0),
+                |state| state.ready.load(Ordering::Acquire),
+            ),
+            _tracked_stores: u64_gauge(
+                &meter,
+                "openfga.cache.controller.tracked_stores",
+                Arc::clone(&diagnostics.0),
+                |state| {
+                    u64::try_from(state.tracked_stores.load(Ordering::Relaxed)).unwrap_or(u64::MAX)
+                },
+            ),
+            _lag: meter
+                .u64_observable_gauge("openfga.cache.controller.lag")
+                .with_description("Maximum lag among tracked changelog cursors")
+                .with_unit("ms")
+                .with_callback({
+                    let state = Arc::clone(&diagnostics.0);
+                    move |observer| {
+                        observer.observe(state.current_lag_millis.load(Ordering::Relaxed), &[]);
+                    }
+                })
+                .build(),
+            _successful_polls: u64_counter(
+                &meter,
+                "openfga.cache.controller.polls.successful",
+                Arc::clone(&diagnostics.0),
+                |state| state.successful_polls.load(Ordering::Relaxed),
+            ),
+            _failed_polls: u64_counter(
+                &meter,
+                "openfga.cache.controller.polls.failed",
+                Arc::clone(&diagnostics.0),
+                |state| state.failed_polls.load(Ordering::Relaxed),
+            ),
+            _flushes: u64_counter(
+                &meter,
+                "openfga.cache.controller.flushes",
+                Arc::clone(&diagnostics.0),
+                |state| state.flushes.load(Ordering::Relaxed),
+            ),
+            _overflows: u64_counter(
+                &meter,
+                "openfga.cache.controller.overflows",
+                Arc::clone(&diagnostics.0),
+                |state| state.overflows.load(Ordering::Relaxed),
+            ),
+            _restarts: u64_counter(
+                &meter,
+                "openfga.cache.controller.restarts",
+                Arc::clone(&diagnostics.0),
+                |state| state.restarts.load(Ordering::Relaxed),
+            ),
+        }
+    }
+}
+
+impl fmt::Debug for ControllerMetrics {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ControllerMetrics")
+    }
+}
+
+fn boolean_gauge(
+    meter: &opentelemetry::metrics::Meter,
+    name: &'static str,
+    state: Arc<DiagnosticsState>,
+    value: fn(&DiagnosticsState) -> bool,
+) -> ObservableGauge<u64> {
+    meter
+        .u64_observable_gauge(name)
+        .with_callback(move |observer| observer.observe(u64::from(value(&state)), &[]))
+        .build()
+}
+
+fn u64_gauge(
+    meter: &opentelemetry::metrics::Meter,
+    name: &'static str,
+    state: Arc<DiagnosticsState>,
+    value: fn(&DiagnosticsState) -> u64,
+) -> ObservableGauge<u64> {
+    meter
+        .u64_observable_gauge(name)
+        .with_callback(move |observer| observer.observe(value(&state), &[]))
+        .build()
+}
+
+fn u64_counter(
+    meter: &opentelemetry::metrics::Meter,
+    name: &'static str,
+    state: Arc<DiagnosticsState>,
+    value: fn(&DiagnosticsState) -> u64,
+) -> ObservableCounter<u64> {
+    meter
+        .u64_observable_counter(name)
+        .with_callback(move |observer| observer.observe(value(&state), &[]))
+        .build()
 }
 
 struct RunningGuard(InvalidationControllerDiagnostics);
@@ -263,6 +388,7 @@ pub struct InvalidationController {
     handle: InvalidationControllerHandle,
     join: Option<JoinHandle<()>>,
     maximum_lag: Duration,
+    metrics: ControllerMetrics,
 }
 
 impl InvalidationController {
@@ -288,7 +414,9 @@ impl InvalidationController {
             flushes: AtomicU64::new(0),
             overflows: AtomicU64::new(0),
             restarts: AtomicU64::new(0),
+            current_lag_millis: AtomicU64::new(0),
         }));
+        let metrics = ControllerMetrics::new(&diagnostics);
         flush(&invalidation, &diagnostics);
         let registrations = moka::sync::Cache::builder()
             .max_capacity(config.channel_capacity.get() as u64)
@@ -315,6 +443,7 @@ impl InvalidationController {
             },
             join: Some(join),
             maximum_lag: config.maximum_lag,
+            metrics,
         })
     }
 
@@ -399,6 +528,7 @@ impl fmt::Debug for InvalidationController {
             .field("handle", &self.handle)
             .field("running", &self.join.is_some())
             .field("maximum_lag", &self.maximum_lag)
+            .field("metrics", &self.metrics)
             .finish_non_exhaustive()
     }
 }
@@ -647,6 +777,16 @@ impl Actor {
             .tracked_stores
             .store(self.stores.len(), Ordering::Relaxed);
         let now = Instant::now();
+        let current_lag_millis = self
+            .stores
+            .values()
+            .map(|state| now.duration_since(state.last_success).as_millis())
+            .max()
+            .map_or(0, |millis| u64::try_from(millis).unwrap_or(u64::MAX));
+        self.diagnostics
+            .0
+            .current_lag_millis
+            .store(current_lag_millis, Ordering::Relaxed);
         let ready = self.stores.values().all(|state| {
             state.initialized && now.duration_since(state.last_success) <= self.config.maximum_lag
         });

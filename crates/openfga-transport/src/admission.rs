@@ -37,6 +37,18 @@ pub enum EndpointClass {
     Enumeration,
 }
 
+impl EndpointClass {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Administration => "administration",
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::Check => "check",
+            Self::Enumeration => "enumeration",
+        }
+    }
+}
+
 /// Finite admission rates for authentication and per-principal endpoint classes.
 #[derive(Clone, Copy, Debug, TypedBuilder)]
 pub struct AdmissionPolicy {

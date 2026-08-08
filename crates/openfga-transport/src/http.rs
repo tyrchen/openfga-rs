@@ -36,7 +36,6 @@ use serde::{
     de::{DeserializeSeed, Error as _, IgnoredAny, MapAccess, SeqAccess, Visitor},
 };
 use serde_json::{Map, Number, Value};
-use tokio::sync::OwnedSemaphorePermit;
 use tokio_stream::{Stream, StreamExt};
 use tonic::Status;
 use tower_http::{
@@ -47,7 +46,9 @@ use tower_http::{
     trace::TraceLayer,
 };
 
-use crate::{ApiError, EndpointClass, OpenFgaApi, admission::AdmissionControl};
+use crate::{
+    ApiError, EndpointClass, OpenFgaApi, admission::AdmissionControl, api::EndpointPermit,
+};
 
 const REQUEST_ID_HEADER: HeaderName = HeaderName::from_static("x-request-id");
 
@@ -125,7 +126,8 @@ async fn limit_endpoint_concurrency(
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    match api.acquire_endpoint_permit() {
+    let class = endpoint_class(request.method(), request.uri().path());
+    match api.acquire_endpoint_permit(class) {
         Ok(permit) => {
             let response = next.run(request).await;
             if is_streamed_list_objects(response.extensions()) {
@@ -148,7 +150,7 @@ fn is_streamed_list_objects(extensions: &axum::http::Extensions) -> bool {
         .is_some()
 }
 
-fn retain_permit_for_body(response: Response, permit: OwnedSemaphorePermit) -> Response {
+fn retain_permit_for_body(response: Response, permit: EndpointPermit) -> Response {
     let (parts, body) = response.into_parts();
     Response::from_parts(
         parts,
@@ -162,7 +164,7 @@ fn retain_permit_for_body(response: Response, permit: OwnedSemaphorePermit) -> R
 #[derive(Debug)]
 struct PermittedBodyStream {
     inner: BodyDataStream,
-    _permit: OwnedSemaphorePermit,
+    _permit: EndpointPermit,
 }
 
 impl Stream for PermittedBodyStream {

@@ -17,19 +17,20 @@ use openfga_proto::openfga::v1::{
 };
 use openfga_service::ServiceError;
 use prost_reflect::ReflectMessage;
-use tokio::sync::OwnedSemaphorePermit;
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status, codegen::InterceptedService, service::Interceptor};
 
 use crate::{
-    ApiError, EndpointClass, OpenFgaApi, admission::AdmissionControl, api::with_request_deadline,
+    ApiError, EndpointClass, OpenFgaApi,
+    admission::AdmissionControl,
+    api::{EndpointPermit, with_request_deadline},
 };
 
 /// gRPC object stream retaining its endpoint concurrency permit until termination.
 #[non_exhaustive]
 pub struct GrpcListObjectsStream {
     inner: ListObjectsStream,
-    _permit: OwnedSemaphorePermit,
+    _permit: EndpointPermit,
 }
 
 impl Stream for GrpcListObjectsStream {
@@ -134,7 +135,9 @@ macro_rules! unary {
             .admission
             .admit_principal(&principal, $class)
             .map_err(Status::from)?;
-        let endpoint_permit = $self.acquire_endpoint_permit().map_err(Status::from)?;
+        let endpoint_permit = $self
+            .acquire_endpoint_permit($class)
+            .map_err(Status::from)?;
         let request_deadline = match request_deadline {
             GrpcDeadline::Elapsed => {
                 return Err(Status::deadline_exceeded("Request Deadline Exceeded"));
@@ -486,7 +489,7 @@ fn validate_unimplemented<T: ReflectMessage>(
     action: Action,
     store_id: &str,
     class: EndpointClass,
-) -> Result<OwnedSemaphorePermit, Status> {
+) -> Result<EndpointPermit, Status> {
     let principal = request
         .extensions()
         .get::<Principal>()
@@ -497,7 +500,7 @@ fn validate_unimplemented<T: ReflectMessage>(
     api.admission
         .admit_principal(principal, class)
         .map_err(Status::from)?;
-    let permit = api.acquire_endpoint_permit().map_err(Status::from)?;
+    let permit = api.acquire_endpoint_permit(class).map_err(Status::from)?;
     let deadline = match deadline {
         GrpcDeadline::Elapsed => {
             return Err(Status::deadline_exceeded("Request Deadline Exceeded"));
@@ -517,7 +520,7 @@ fn validate_streaming<T: ReflectMessage>(
     action: Action,
     store_id: &str,
     class: EndpointClass,
-) -> Result<(Principal, Deadline, OwnedSemaphorePermit), Status> {
+) -> Result<(Principal, Deadline, EndpointPermit), Status> {
     let principal = request
         .extensions()
         .get::<Principal>()
@@ -529,7 +532,7 @@ fn validate_streaming<T: ReflectMessage>(
     api.admission
         .admit_principal(&principal, class)
         .map_err(Status::from)?;
-    let permit = api.acquire_endpoint_permit().map_err(Status::from)?;
+    let permit = api.acquire_endpoint_permit(class).map_err(Status::from)?;
     let deadline = match deadline {
         GrpcDeadline::Elapsed => {
             return Err(Status::deadline_exceeded("Request Deadline Exceeded"));

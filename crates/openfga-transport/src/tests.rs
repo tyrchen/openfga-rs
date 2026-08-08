@@ -43,7 +43,9 @@ use tokio_stream::{StreamExt, wrappers::TcpListenerStream};
 use tonic::transport::Server;
 use tower::ServiceExt;
 
-use crate::{AdmissionPolicy, ApiError, OpenFgaApi, OpenFgaServices, TransportConfig};
+use crate::{
+    AdmissionPolicy, ApiError, EndpointClass, OpenFgaApi, OpenFgaServices, TransportConfig,
+};
 
 const STORE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 const MODEL_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAW";
@@ -440,7 +442,7 @@ async fn test_should_authorize_before_admission_and_validation_on_both_transport
     let router = crate::http_router(api.clone(), authentication.clone());
     let mut saturated = Vec::with_capacity(api.config.maximum_concurrency);
     for _ in 0..api.config.maximum_concurrency {
-        saturated.push(api.acquire_endpoint_permit()?);
+        saturated.push(api.acquire_endpoint_permit(EndpointClass::Administration)?);
     }
     for _ in 0..2 {
         let response = router
@@ -500,7 +502,7 @@ async fn test_should_load_shed_only_after_authorization_on_both_transports()
     } = test_runtime(1_024)?;
     let mut saturated = Vec::with_capacity(api.config.maximum_concurrency);
     for _ in 0..api.config.maximum_concurrency {
-        saturated.push(api.acquire_endpoint_permit()?);
+        saturated.push(api.acquire_endpoint_permit(EndpointClass::Administration)?);
     }
 
     let router = crate::http_router(api.clone(), authentication.clone());
@@ -529,8 +531,16 @@ async fn test_should_load_shed_only_after_authorization_on_both_transports()
     .err()
     .ok_or("saturated authorized gRPC request unexpectedly succeeded")?;
     assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+    let diagnostics = api.transport_diagnostics();
+    assert_eq!(diagnostics.in_flight(), api.config.maximum_concurrency);
+    assert_eq!(
+        diagnostics.admitted(),
+        u64::try_from(api.config.maximum_concurrency)?,
+    );
+    assert_eq!(diagnostics.overloaded(), 2);
 
     drop(saturated);
+    assert_eq!(diagnostics.in_flight(), 0);
     drop(authentication);
     drop(api);
     let mut storage = Arc::try_unwrap(storage).map_err(|_| "storage references remain")?;

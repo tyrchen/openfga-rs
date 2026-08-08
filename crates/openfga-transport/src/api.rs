@@ -1,5 +1,7 @@
 //! Transport-independent execution of generated `OpenFGA` wire requests.
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::{
     collections::{BTreeSet, HashMap},
     fmt,
@@ -25,12 +27,16 @@ use openfga_storage::{
     ChangeFilter, OperationContext, PageOptions, StorageCancellationToken, StoreFilter, StoreName,
     TupleWriteOptions, WriteConflictPolicy,
 };
+use opentelemetry::{
+    KeyValue,
+    metrics::{Counter, Histogram, UpDownCounter},
+};
 use prost::Message;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::{
     ApiError, OpenFgaServices, TransportConfig,
-    admission::AdmissionControl,
+    admission::{AdmissionControl, EndpointClass},
     convert,
     pagination::{self, GLOBAL_SCOPE_STORE},
 };
@@ -57,6 +63,154 @@ pub struct OpenFgaApi {
     pub(crate) config: TransportConfig,
     pub(crate) admission: AdmissionControl,
     endpoint_permits: Arc<Semaphore>,
+    transport_metrics: TransportMetrics,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct TransportDiagnosticsState {
+    in_flight: AtomicUsize,
+    admitted: AtomicU64,
+    overloaded: AtomicU64,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct TransportDiagnostics(Arc<TransportDiagnosticsState>);
+
+#[cfg(test)]
+impl TransportDiagnostics {
+    pub(crate) fn in_flight(&self) -> usize {
+        self.0.in_flight.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn admitted(&self) -> u64 {
+        self.0.admitted.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn overloaded(&self) -> u64 {
+        self.0.overloaded.load(Ordering::Relaxed)
+    }
+}
+
+#[derive(Clone)]
+struct TransportMetrics {
+    attempts: Counter<u64>,
+    in_flight: UpDownCounter<i64>,
+    duration: Histogram<f64>,
+    #[cfg(test)]
+    diagnostics: TransportDiagnostics,
+}
+
+impl TransportMetrics {
+    fn new() -> Self {
+        let meter = opentelemetry::global::meter("openfga-transport");
+        Self {
+            attempts: meter
+                .u64_counter("openfga.transport.requests")
+                .with_description("Endpoint admission attempts by bounded class and result")
+                .build(),
+            in_flight: meter
+                .i64_up_down_counter("openfga.transport.in_flight")
+                .with_description("Currently admitted endpoint requests")
+                .build(),
+            duration: meter
+                .f64_histogram("openfga.transport.request.duration")
+                .with_description("Admitted request lifetime including stream consumption")
+                .with_unit("s")
+                .with_boundaries(vec![
+                    0.000_25, 0.000_5, 0.001, 0.002_5, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5,
+                    1.0, 2.5, 5.0, 10.0,
+                ])
+                .build(),
+            #[cfg(test)]
+            diagnostics: TransportDiagnostics(Arc::new(TransportDiagnosticsState {
+                in_flight: AtomicUsize::new(0),
+                admitted: AtomicU64::new(0),
+                overloaded: AtomicU64::new(0),
+            })),
+        }
+    }
+
+    fn admitted(&self, class: EndpointClass) -> EndpointPermitMetrics {
+        let attributes = class_attributes(class, "admitted");
+        self.attempts.add(1, &attributes);
+        self.in_flight.add(1, &attributes[..1]);
+        #[cfg(test)]
+        {
+            self.diagnostics.0.in_flight.fetch_add(1, Ordering::AcqRel);
+            self.diagnostics.0.admitted.fetch_add(1, Ordering::Relaxed);
+        }
+        EndpointPermitMetrics {
+            metrics: self.clone(),
+            class,
+            started_at: Instant::now(),
+        }
+    }
+
+    fn overloaded(&self, class: EndpointClass) {
+        self.attempts.add(1, &class_attributes(class, "overloaded"));
+        #[cfg(test)]
+        self.diagnostics
+            .0
+            .overloaded
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+impl fmt::Debug for TransportMetrics {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TransportMetrics")
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug)]
+struct EndpointPermitMetrics {
+    metrics: TransportMetrics,
+    class: EndpointClass,
+    started_at: Instant,
+}
+
+pub(crate) struct EndpointPermit {
+    _permit: OwnedSemaphorePermit,
+    metrics: EndpointPermitMetrics,
+}
+
+impl fmt::Debug for EndpointPermit {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EndpointPermit")
+            .field("class", &self.metrics.class)
+            .field("elapsed", &self.metrics.started_at.elapsed())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for EndpointPermit {
+    fn drop(&mut self) {
+        let attributes = [KeyValue::new("endpoint.class", self.metrics.class.as_str())];
+        self.metrics
+            .metrics
+            .duration
+            .record(self.metrics.started_at.elapsed().as_secs_f64(), &attributes);
+        self.metrics.metrics.in_flight.add(-1, &attributes);
+        #[cfg(test)]
+        self.metrics
+            .metrics
+            .diagnostics
+            .0
+            .in_flight
+            .fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn class_attributes(class: EndpointClass, result: &'static str) -> [KeyValue; 2] {
+    [
+        KeyValue::new("endpoint.class", class.as_str()),
+        KeyValue::new("result", result),
+    ]
 }
 
 impl OpenFgaApi {
@@ -74,6 +228,7 @@ impl OpenFgaApi {
             config,
             admission,
             endpoint_permits,
+            transport_metrics: TransportMetrics::new(),
         })
     }
 
@@ -1032,10 +1187,24 @@ impl OpenFgaApi {
         self.authorize(principal, action, Some(store_id))
     }
 
-    pub(crate) fn acquire_endpoint_permit(&self) -> Result<OwnedSemaphorePermit, ApiError> {
-        Arc::clone(&self.endpoint_permits)
-            .try_acquire_owned()
-            .map_err(|_| ApiError::overloaded())
+    pub(crate) fn acquire_endpoint_permit(
+        &self,
+        class: EndpointClass,
+    ) -> Result<EndpointPermit, ApiError> {
+        if let Ok(permit) = Arc::clone(&self.endpoint_permits).try_acquire_owned() {
+            Ok(EndpointPermit {
+                _permit: permit,
+                metrics: self.transport_metrics.admitted(class),
+            })
+        } else {
+            self.transport_metrics.overloaded(class);
+            Err(ApiError::overloaded())
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn transport_diagnostics(&self) -> TransportDiagnostics {
+        self.transport_metrics.diagnostics.clone()
     }
 
     pub(crate) fn preauthorize(

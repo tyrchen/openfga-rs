@@ -52,7 +52,7 @@ transport:
   requestTimeoutMs: 5000
   tokenTtlSeconds: 86400
   maximumMessageBytes: 1048576
-  maximumConcurrency: 1024
+  maximumConcurrency: 64
   tokenKeyId: primary
   tokenKeyEnv: OPENFGA_TOKEN_KEY
   tokenVerificationKeys: []
@@ -73,8 +73,8 @@ evaluator:
   datastoreQueries: 100
   tupleItems: 10000
   conditionCost: 100000
-  concurrentReads: 16
-  batchConcurrency: 16
+  concurrentReads: 8
+  batchConcurrency: 8
 listObjects:
   candidateDepth: 25
   candidateDispatches: 10000
@@ -84,7 +84,7 @@ listObjects:
   residualDispatches: 10000
   residualDatastoreQueries: 1000
   residualTupleItems: 10000
-  residualConcurrency: 16
+  residualConcurrency: 8
   streamBuffer: 16
 listUsers:
   depth: 25
