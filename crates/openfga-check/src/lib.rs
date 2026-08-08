@@ -32,7 +32,7 @@ mod outcome;
 
 pub use budget::{CheckBudget, CheckBudgetBuilder, CheckWorkMeter};
 pub use error::{CheckError, CheckErrorKind};
-pub use evaluator::{CheckEvaluator, DirectCheckEvaluator};
+pub use evaluator::{CachedCheckEvaluator, CheckEvaluator, DirectCheckEvaluator};
 pub use outcome::{
     BatchCheckOutcome, BatchCheckResult, CheckMetadata, CheckOutcome, CheckResolution,
 };

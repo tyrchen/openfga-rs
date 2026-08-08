@@ -13,7 +13,7 @@ use config::{Case, Config, Environment, File, FileFormat};
 use openfga_auth::{
     Action, AuthorizationPolicy, OidcAlgorithm, OidcConfig, PolicyBinding, StoreScope,
 };
-use openfga_cache::ModelCacheConfig;
+use openfga_cache::{DecisionCacheConfig, ModelCacheConfig, TupleCacheConfig};
 use openfga_domain::{Limit, PrincipalId, RequestTimeout, StoreId, TokenKeyId};
 use openfga_transport::AdmissionPolicy;
 use serde::{Deserialize, Serialize};
@@ -171,6 +171,10 @@ impl Default for PostgresConfig {
 pub(crate) struct CacheConfig {
     #[serde(default)]
     pub(crate) model: ModelCachePolicy,
+    #[serde(default)]
+    pub(crate) decision: DecisionCachePolicy,
+    #[serde(default)]
+    pub(crate) tuple: TupleCachePolicy,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -196,6 +200,45 @@ impl Default for ModelCachePolicy {
             latest_aliases: default_model_aliases(),
             immutable_ttl_seconds: default_model_immutable_ttl_seconds(),
             latest_alias_ttl_seconds: default_model_alias_ttl_seconds(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct DecisionCachePolicy {
+    #[serde(default = "default_decision_weight")]
+    pub(crate) weight: u64,
+    #[serde(default = "default_mutable_cache_ttl_seconds")]
+    pub(crate) ttl_seconds: u64,
+}
+
+impl Default for DecisionCachePolicy {
+    fn default() -> Self {
+        Self {
+            weight: default_decision_weight(),
+            ttl_seconds: default_mutable_cache_ttl_seconds(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct TupleCachePolicy {
+    #[serde(default = "default_tuple_weight")]
+    pub(crate) weight: u64,
+    #[serde(default = "default_tuple_cache_results")]
+    pub(crate) maximum_results: usize,
+    #[serde(default = "default_mutable_cache_ttl_seconds")]
+    pub(crate) ttl_seconds: u64,
+}
+
+impl Default for TupleCachePolicy {
+    fn default() -> Self {
+        Self {
+            weight: default_tuple_weight(),
+            maximum_results: default_tuple_cache_results(),
+            ttl_seconds: default_mutable_cache_ttl_seconds(),
         }
     }
 }
@@ -612,6 +655,8 @@ impl ServerConfig {
         self.validate_tls()?;
         self.validate_storage()?;
         self.model_cache_config()?;
+        self.decision_cache_config()?;
+        self.tuple_cache_config()?;
         self.validate_transport()?;
         self.validate_evaluator()?;
         self.validate_list_objects()?;
@@ -685,6 +730,25 @@ impl ServerConfig {
             Duration::from_secs(self.cache.model.latest_alias_ttl_seconds),
         )
         .context("model cache configuration is invalid")
+    }
+
+    pub(crate) fn decision_cache_config(&self) -> Result<DecisionCacheConfig> {
+        DecisionCacheConfig::new(
+            NonZeroU64::new(self.cache.decision.weight)
+                .context("decision cache weight must be nonzero")?,
+            Duration::from_secs(self.cache.decision.ttl_seconds),
+        )
+        .context("decision cache configuration is invalid")
+    }
+
+    pub(crate) fn tuple_cache_config(&self) -> Result<TupleCacheConfig> {
+        TupleCacheConfig::new(
+            NonZeroU64::new(self.cache.tuple.weight)
+                .context("tuple cache weight must be nonzero")?,
+            self.cache.tuple.maximum_results,
+            Duration::from_secs(self.cache.tuple.ttl_seconds),
+        )
+        .context("tuple cache configuration is invalid")
     }
 
     pub(crate) fn oidc_config(&self) -> OidcConfig {
@@ -1333,6 +1397,22 @@ const fn default_model_alias_ttl_seconds() -> u64 {
     10
 }
 
+const fn default_decision_weight() -> u64 {
+    100_000
+}
+
+const fn default_tuple_weight() -> u64 {
+    1_000_000
+}
+
+const fn default_tuple_cache_results() -> usize {
+    10_000
+}
+
+const fn default_mutable_cache_ttl_seconds() -> u64 {
+    10
+}
+
 #[cfg(test)]
 mod tests {
     use openfga_auth::Action;
@@ -1509,6 +1589,13 @@ evaluator: {}
         config.cache.model.latest_alias_ttl_seconds = 10;
         config.cache.model.immutable_ttl_seconds = 30 * 24 * 60 * 60;
         config.validate()?;
+
+        config.cache.decision.ttl_seconds = 0;
+        assert!(config.validate().is_err());
+
+        config.cache.decision.ttl_seconds = 10;
+        config.cache.tuple.maximum_results = 100_001;
+        assert!(config.validate().is_err());
         Ok(())
     }
 

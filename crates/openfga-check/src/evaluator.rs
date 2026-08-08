@@ -7,13 +7,14 @@ use std::{
 };
 
 use async_trait::async_trait;
+use openfga_cache::{DecisionCache, DecisionKey, DecisionKeyHasher};
 use openfga_condition::{
     CancellationCheck, EvaluationBudget as ConditionBudget, EvaluationErrorKind,
 };
 use openfga_domain::{
     BatchCheckCommand, CheckCommand, ConditionContext, ConditionReference, ConsistencyPreference,
-    ContextualTuples, Deadline, InputLimits, Limit, ModelSelection, ObjectRef, RelationName,
-    RelationshipTuple, StoreId, SubjectRef, TupleKey,
+    ContextualTuples, Deadline, InputLimits, Limit, ModelSelection, ObjectRef, QueryContext,
+    RelationName, RelationshipTuple, StoreId, SubjectRef, TupleKey,
 };
 use openfga_model::{
     CompiledModel, ConditionRequirement, DirectRestriction, NodeId, RelationId, RestrictionKind,
@@ -75,6 +76,221 @@ pub trait CheckEvaluator: Send + Sync {
         budget: CheckBudget,
         cancellation: StorageCancellationToken,
     ) -> Result<BatchCheckOutcome, CheckError>;
+}
+
+/// Semantic version of the evaluator behavior encoded in decision cache keys.
+const EVALUATOR_SEMANTICS_VERSION: u32 = 1;
+
+/// Decision-caching evaluator decorator preserving the direct oracle contract.
+#[derive(Clone)]
+#[non_exhaustive]
+pub struct CachedCheckEvaluator {
+    delegate: Arc<dyn CheckEvaluator>,
+    decisions: DecisionCache<bool>,
+    key_hasher: DecisionKeyHasher,
+    input_limits: InputLimits,
+}
+
+impl CachedCheckEvaluator {
+    /// Creates a decision-caching decorator around an evaluator strategy.
+    #[must_use]
+    pub const fn new(
+        delegate: Arc<dyn CheckEvaluator>,
+        decisions: DecisionCache<bool>,
+        key_hasher: DecisionKeyHasher,
+        input_limits: InputLimits,
+    ) -> Self {
+        Self {
+            delegate,
+            decisions,
+            key_hasher,
+            input_limits,
+        }
+    }
+}
+
+impl fmt::Debug for CachedCheckEvaluator {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CachedCheckEvaluator")
+            .field("delegate", &"dyn CheckEvaluator")
+            .field("decisions", &self.decisions)
+            .field("key_hasher", &self.key_hasher)
+            .field("input_limits", &self.input_limits)
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl CheckEvaluator for CachedCheckEvaluator {
+    async fn check(
+        &self,
+        command: &CheckCommand,
+        model: Arc<CompiledModel>,
+        tuples: Arc<dyn TupleReader>,
+        budget: CheckBudget,
+        work_meter: Option<CheckWorkMeter>,
+        cancellation: StorageCancellationToken,
+    ) -> Result<CheckOutcome, CheckError> {
+        if cancellation.is_cancelled() {
+            return Err(cancelled("decision_cache_lookup_cancelled"));
+        }
+        if command.query().deadline().is_elapsed(Instant::now()) {
+            return Err(timed_out("decision_cache_lookup_deadline_elapsed"));
+        }
+        if command.query().consistency() == ConsistencyPreference::HigherConsistency {
+            return self
+                .delegate
+                .check(command, model, tuples, budget, work_meter, cancellation)
+                .await;
+        }
+        let key = DecisionKey::for_check(
+            command,
+            &model,
+            &self.key_hasher,
+            EVALUATOR_SEMANTICS_VERSION,
+        );
+        if let Some(allowed) = self.decisions.get(&key).await {
+            if cancellation.is_cancelled() {
+                return Err(cancelled("decision_cache_hit_cancelled"));
+            }
+            if command.query().deadline().is_elapsed(Instant::now()) {
+                return Err(timed_out("decision_cache_hit_deadline_elapsed"));
+            }
+            return Ok(cached_outcome(allowed));
+        }
+        let started_at = self.decisions.begin_computation();
+        let outcome = self
+            .delegate
+            .check(command, model, tuples, budget, work_meter, cancellation)
+            .await?;
+        self.decisions
+            .insert_if_unchanged(started_at, key, outcome.allowed())
+            .await;
+        Ok(outcome)
+    }
+
+    async fn batch_check(
+        &self,
+        command: &BatchCheckCommand,
+        model: Arc<CompiledModel>,
+        tuples: Arc<dyn TupleReader>,
+        budget: CheckBudget,
+        cancellation: StorageCancellationToken,
+    ) -> Result<BatchCheckOutcome, CheckError> {
+        if cancellation.is_cancelled() {
+            return Err(cancelled("batch_decision_cache_lookup_cancelled"));
+        }
+        if command.query().deadline().is_elapsed(Instant::now()) {
+            return Err(timed_out("batch_decision_cache_lookup_deadline_elapsed"));
+        }
+        if command.query().consistency() == ConsistencyPreference::HigherConsistency {
+            return self
+                .delegate
+                .batch_check(command, model, tuples, budget, cancellation)
+                .await;
+        }
+        let keys = batch_decision_keys(command, &model, &self.key_hasher, &self.input_limits);
+        let mut cached = Vec::with_capacity(keys.len());
+        for key in &keys {
+            let Some(key) = key else {
+                cached.clear();
+                break;
+            };
+            let Some(allowed) = self.decisions.get(key).await else {
+                cached.clear();
+                break;
+            };
+            cached.push(allowed);
+        }
+        if cached.len() == keys.len() {
+            if cancellation.is_cancelled() {
+                return Err(cancelled("batch_decision_cache_hit_cancelled"));
+            }
+            if command.query().deadline().is_elapsed(Instant::now()) {
+                return Err(timed_out("batch_decision_cache_hit_deadline_elapsed"));
+            }
+            let results = command
+                .items()
+                .as_slice()
+                .iter()
+                .zip(cached)
+                .map(|(item, allowed)| {
+                    BatchCheckResult::new(
+                        item.correlation_id().clone(),
+                        Ok(cached_outcome(allowed)),
+                    )
+                })
+                .collect();
+            return Ok(BatchCheckOutcome::new(results));
+        }
+
+        let started_at = self.decisions.begin_computation();
+        let outcome = self
+            .delegate
+            .batch_check(command, model, tuples, budget, cancellation)
+            .await?;
+        for (key, result) in keys.into_iter().zip(outcome.results()) {
+            if let (Some(key), Ok(item_outcome)) = (key, result.outcome()) {
+                self.decisions
+                    .insert_if_unchanged(started_at, key, item_outcome.allowed())
+                    .await;
+            }
+        }
+        Ok(outcome)
+    }
+}
+
+fn batch_decision_keys(
+    command: &BatchCheckCommand,
+    model: &CompiledModel,
+    hasher: &DecisionKeyHasher,
+    input_limits: &InputLimits,
+) -> Vec<Option<DecisionKey>> {
+    let query = command.query();
+    command
+        .items()
+        .as_slice()
+        .iter()
+        .map(|item| {
+            let condition_context = query
+                .condition_context()
+                .overlay(item.condition_context(), input_limits)
+                .ok()?;
+            let mut contextual = BTreeMap::<TupleKey, RelationshipTuple>::new();
+            for tuple in query.contextual_tuples().as_slice() {
+                contextual.insert(tuple.key().clone(), tuple.clone());
+            }
+            for tuple in item.contextual_tuples().as_slice() {
+                contextual.insert(tuple.key().clone(), tuple.clone());
+            }
+            let contextual_tuples =
+                ContextualTuples::new(contextual.into_values().collect(), input_limits).ok()?;
+            let item_query = QueryContext::builder()
+                .store_id(query.store_id())
+                .model_selection(query.model_selection())
+                .consistency(query.consistency())
+                .contextual_tuples(contextual_tuples)
+                .condition_context(condition_context)
+                .deadline(query.deadline())
+                .principal(query.principal().clone())
+                .build();
+            Some(DecisionKey::for_check(
+                &CheckCommand::new(item_query, item.tuple().clone()),
+                model,
+                hasher,
+                EVALUATOR_SEMANTICS_VERSION,
+            ))
+        })
+        .collect()
+}
+
+fn cached_outcome(allowed: bool) -> CheckOutcome {
+    CheckOutcome::new(
+        allowed,
+        CheckResolution::Cached,
+        CheckMetadata::new(0, 0, 0, 0, 0, 0, std::time::Duration::ZERO),
+    )
 }
 
 /// Stateless correctness-first evaluator configured only with boundary limits.

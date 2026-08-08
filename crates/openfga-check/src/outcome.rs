@@ -10,6 +10,8 @@ use crate::CheckError;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum CheckResolution {
+    /// A complete semantic decision key resolved from the mutable cache.
+    Cached,
     /// No authorization path matched.
     Denied,
     /// Conservative reachability proved that no path can match.

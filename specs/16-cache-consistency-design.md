@@ -42,6 +42,29 @@ Tuple mutation and changelog append commit atomically. A supervised cache-contro
 
 Initial correctness MAY invalidate all mutable entries for the store. More granular invalidation graduates only with a proof that every impacted direct, computed, TTU, recursive, and list-derived key is covered. Invalidation queues are bounded; overflow triggers conservative flush and a health/metric signal.
 
+```mermaid
+sequenceDiagram
+    participant Q as Check/List engine
+    participant C as Decision or tuple cache
+    participant W as Shared watermark
+    participant S as Authoritative storage/evaluator
+    Q->>W: capture generation
+    Q->>C: lookup complete semantic key
+    C->>W: validate generation again
+    alt eligible hit and generation unchanged
+        C-->>Q: bounded successful value
+    else miss, higher consistency, or invalidated
+        Q->>S: read/evaluate with original consistency
+        S-->>Q: successful complete result
+        Q->>W: compare generation
+        opt minimize latency and unchanged
+            Q->>C: insert result + captured generation
+        end
+    end
+```
+
+The initial watermark is process-global and therefore conservatively invalidates mutable entries for every store after any observed change. This sacrifices some multi-store hit rate but avoids an unproven relation/object scope. Exact, forward, userset, reverse, existence, count, and paged tuple shapes use distinct canonical fingerprints including every filter, bound, and cursor input. Partial streams and every error class remain ineligible.
+
 ## Consistency behavior
 
 - `HigherConsistency`: read mutable tuples from primary, bypass decision and tuple-read caches, and do not populate them from that request.

@@ -1581,12 +1581,16 @@ name = "openfga-cache"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "getrandom 0.4.3",
+ "hmac",
  "moka",
  "openfga-condition",
  "openfga-domain",
  "openfga-model",
  "openfga-storage",
  "openfga-storage-memory",
+ "serde_json",
+ "sha2 0.11.0",
  "thiserror 2.0.19",
  "tokio",
 ]
@@ -1596,6 +1600,7 @@ name = "openfga-check"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "openfga-cache",
  "openfga-condition",
  "openfga-domain",
  "openfga-model",

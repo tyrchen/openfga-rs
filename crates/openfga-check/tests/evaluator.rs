@@ -12,7 +12,11 @@ use std::{
 };
 
 use async_trait::async_trait;
-use openfga_check::{CheckBudget, CheckErrorKind, CheckEvaluator, DirectCheckEvaluator};
+use openfga_cache::{DecisionCache, DecisionCacheConfig, DecisionKeyHasher, InvalidationWatermark};
+use openfga_check::{
+    CachedCheckEvaluator, CheckBudget, CheckErrorKind, CheckEvaluator, CheckResolution,
+    DirectCheckEvaluator,
+};
 use openfga_condition::{ConditionDefinition, ParameterType};
 use openfga_domain::{
     AuthorizationModelId, BatchCheckCommand, BatchCheckItem, BatchCheckItems, CheckCommand,
@@ -35,6 +39,86 @@ use tokio::sync::Barrier;
 
 const STORE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 const MODEL_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAW";
+
+#[tokio::test]
+async fn test_should_cache_complete_decisions_and_bypass_for_higher_consistency()
+-> Result<(), Box<dyn Error>> {
+    let storage = memory_storage().await?;
+    let model = ModelCompiler::default().compile(&complete_model()?)?;
+    write_tuples(
+        storage.as_ref(),
+        vec![tuple("document:cached#viewer@user:alice")?],
+    )
+    .await?;
+    let decisions = DecisionCache::new(
+        DecisionCacheConfig::new(
+            std::num::NonZeroU64::new(100).ok_or("invalid test cache capacity")?,
+            Duration::from_mins(1),
+        )?,
+        InvalidationWatermark::new(),
+    );
+    let evaluator = CachedCheckEvaluator::new(
+        Arc::new(DirectCheckEvaluator::default()),
+        decisions,
+        DecisionKeyHasher::random()?,
+        InputLimits::default(),
+    );
+    let minimize = CheckCommand::new(
+        query_context_with_consistency(ConsistencyPreference::MinimizeLatency)?,
+        "document:cached#viewer@user:alice".parse()?,
+    );
+    let first = evaluator
+        .check(
+            &minimize,
+            Arc::clone(&model),
+            storage.clone(),
+            CheckBudget::default(),
+            None,
+            StorageCancellationToken::new(),
+        )
+        .await?;
+    let second = evaluator
+        .check(
+            &minimize,
+            Arc::clone(&model),
+            storage.clone(),
+            CheckBudget::default(),
+            None,
+            StorageCancellationToken::new(),
+        )
+        .await?;
+    assert!(first.allowed());
+    assert_eq!(second.resolution(), CheckResolution::Cached);
+
+    storage
+        .write_tuples(
+            &operation_context()?,
+            STORE_ID.parse()?,
+            vec!["document:cached#viewer@user:alice".parse()?],
+            Vec::new(),
+            TupleWriteOptions::default(),
+        )
+        .await?;
+    let higher = CheckCommand::new(
+        query_context_with_consistency(ConsistencyPreference::HigherConsistency)?,
+        "document:cached#viewer@user:alice".parse()?,
+    );
+    let fresh = evaluator
+        .check(
+            &higher,
+            model,
+            storage.clone(),
+            CheckBudget::default(),
+            None,
+            StorageCancellationToken::new(),
+        )
+        .await?;
+    assert!(!fresh.allowed());
+    assert_ne!(fresh.resolution(), CheckResolution::Cached);
+
+    shutdown(storage).await?;
+    Ok(())
+}
 
 #[tokio::test]
 async fn test_should_resolve_all_rewrites_usersets_wildcards_and_legal_recursion()
@@ -574,6 +658,28 @@ fn query_context_at(
         .principal(Principal::new(
             PrincipalKind::Internal,
             "phase1-tests".parse()?,
+        ))
+        .build())
+}
+
+fn query_context_with_consistency(
+    consistency: ConsistencyPreference,
+) -> Result<QueryContext, Box<dyn Error>> {
+    Ok(QueryContext::builder()
+        .store_id(STORE_ID.parse::<StoreId>()?)
+        .model_selection(ModelSelection::Explicit(
+            MODEL_ID.parse::<AuthorizationModelId>()?,
+        ))
+        .consistency(consistency)
+        .contextual_tuples(ContextualTuples::empty())
+        .condition_context(ConditionContext::empty())
+        .deadline(Deadline::from_timeout(
+            Instant::now(),
+            openfga_domain::RequestTimeout::new(Duration::from_secs(5))?,
+        )?)
+        .principal(Principal::new(
+            PrincipalKind::Internal,
+            "phase4-cache-tests".parse()?,
         ))
         .build())
 }

@@ -7,6 +7,15 @@
 
 #![forbid(unsafe_code)]
 
+mod decision;
+mod invalidation;
 mod model;
+mod tuple;
 
+pub use decision::{
+    DecisionCache, DecisionCacheConfig, DecisionCacheConfigError, DecisionKey, DecisionKeyHasher,
+    DecisionKeyHasherError,
+};
+pub use invalidation::InvalidationWatermark;
 pub use model::{CachedModelStorage, ModelCacheConfig, ModelCacheConfigError};
+pub use tuple::{CachedTupleStorage, TupleCacheConfig, TupleCacheConfigError};

@@ -25,6 +25,13 @@ cache:
     latestAliases: 10000
     immutableTtlSeconds: 604800
     latestAliasTtlSeconds: 10
+  decision:
+    weight: 100000
+    ttlSeconds: 10
+  tuple:
+    weight: 1000000
+    maximumResults: 10000
+    ttlSeconds: 10
 auth:
   mode: disabled
 transport:

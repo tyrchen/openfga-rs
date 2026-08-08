@@ -13,13 +13,17 @@ workspace = true
 
 [dependencies]
 async-trait.workspace = true
+getrandom.workspace = true
+hmac.workspace = true
 moka.workspace = true
 openfga-domain.workspace = true
 openfga-model.workspace = true
 openfga-storage.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
 openfga-condition.workspace = true
 openfga-storage-memory.workspace = true
+serde_json.workspace = true

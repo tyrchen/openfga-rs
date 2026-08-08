@@ -16,12 +16,17 @@ use anyhow::{Context, Result, bail};
 use axum::{Json, Router, http::StatusCode, routing::get};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use openfga_auth::{AuthenticationService, JwksActor, PresharedKey};
-use openfga_cache::{CachedModelStorage, ModelCacheConfig};
-use openfga_check::CheckBudget;
+use openfga_cache::{
+    CachedModelStorage, CachedTupleStorage, DecisionCache, DecisionCacheConfig, DecisionKeyHasher,
+    InvalidationWatermark, ModelCacheConfig, TupleCacheConfig,
+};
+use openfga_check::{CachedCheckEvaluator, CheckBudget, CheckEvaluator, DirectCheckEvaluator};
 use openfga_domain::{
     ConsistencyPreference, Deadline, InputLimits, Limit, RequestTimeout, TokenCodec, TokenKey,
 };
-use openfga_list::{CandidateBudget, ExpandBudget, ListObjectsBudget, ListUsersBudget};
+use openfga_list::{
+    CandidateBudget, DirectListObjectsEngine, ExpandBudget, ListObjectsBudget, ListUsersBudget,
+};
 use openfga_model::ModelCompiler;
 use openfga_service::{
     AssertionService, ChangeService, CheckService, ExpandService, IdentifierSource,
@@ -147,6 +152,13 @@ struct ServiceBudgets {
     list_objects: ListObjectsBudget,
     list_users: ListUsersBudget,
     expand: ExpandBudget,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ServiceCachePolicy {
+    models: ModelCacheConfig,
+    decisions: DecisionCacheConfig,
+    tuples: TupleCacheConfig,
 }
 
 impl fmt::Debug for ReadinessDependencies {
@@ -314,7 +326,11 @@ async fn assemble(config: &ServerConfig) -> Result<RuntimeAssembly> {
         list_users: list_users_budget(config)?,
         expand: expand_budget(config)?,
     };
-    let model_cache_config = config.model_cache_config()?;
+    let cache_policy = ServiceCachePolicy {
+        models: config.model_cache_config()?,
+        decisions: config.decision_cache_config()?,
+        tuples: config.tuple_cache_config()?,
+    };
     let (services, storage, health) = match config.storage.backend {
         StorageBackend::Memory => {
             let capacity = NonZeroUsize::new(config.storage.memory.actor_capacity)
@@ -333,8 +349,8 @@ async fn assemble(config: &ServerConfig) -> Result<RuntimeAssembly> {
                 identifier_service,
                 limits.clone(),
                 budgets,
-                model_cache_config,
-            );
+                cache_policy,
+            )?;
             (services, StorageOwner::Memory(storage), health)
         }
         StorageBackend::Postgres => {
@@ -350,8 +366,8 @@ async fn assemble(config: &ServerConfig) -> Result<RuntimeAssembly> {
                 identifier_service,
                 limits.clone(),
                 budgets,
-                model_cache_config,
-            );
+                cache_policy,
+            )?;
             (services, StorageOwner::Postgres(storage), health)
         }
     };
@@ -432,8 +448,8 @@ fn services<B>(
     identifiers: Arc<dyn IdentifierSource>,
     limits: InputLimits,
     budgets: ServiceBudgets,
-    model_cache_config: ModelCacheConfig,
-) -> OpenFgaServices
+    cache_policy: ServiceCachePolicy,
+) -> Result<OpenFgaServices>
 where
     B: AssertionReader
         + AssertionWriter
@@ -456,16 +472,31 @@ where
         storage_models,
         storage_model_writes,
         ModelCompiler::default(),
-        model_cache_config,
+        cache_policy.models,
     ));
     let models: Arc<dyn ModelReader> = cached_models.clone();
     let model_writes: Arc<dyn ModelWriter> = cached_models;
-    let tuples: Arc<dyn TupleReader> = storage.clone();
-    let tuple_writes: Arc<dyn TupleWriter> = storage.clone();
+    let invalidation = InvalidationWatermark::new();
+    let storage_tuples: Arc<dyn TupleReader> = storage.clone();
+    let storage_tuple_writes: Arc<dyn TupleWriter> = storage.clone();
+    let cached_tuples = Arc::new(CachedTupleStorage::new(
+        storage_tuples,
+        storage_tuple_writes,
+        invalidation.clone(),
+        cache_policy.tuples,
+    ));
+    let tuples: Arc<dyn TupleReader> = cached_tuples.clone();
+    let tuple_writes: Arc<dyn TupleWriter> = cached_tuples;
     let assertion_reads: Arc<dyn AssertionReader> = storage.clone();
     let assertion_writes: Arc<dyn AssertionWriter> = storage.clone();
     let changes: Arc<dyn ChangeReader> = storage;
-    OpenFgaServices::builder()
+    let evaluator: Arc<dyn CheckEvaluator> = Arc::new(CachedCheckEvaluator::new(
+        Arc::new(DirectCheckEvaluator::default()),
+        DecisionCache::new(cache_policy.decisions, invalidation),
+        DecisionKeyHasher::random().map_err(anyhow::Error::new)?,
+        limits.clone(),
+    ));
+    Ok(OpenFgaServices::builder()
         .stores(StoreService::new(
             stores.clone(),
             store_writes,
@@ -496,16 +527,17 @@ where
             limits.clone(),
         ))
         .changes(ChangeService::new(stores, changes))
-        .checks(CheckService::direct(
+        .checks(CheckService::new(
             Arc::clone(&models),
             Arc::clone(&tuples),
+            Arc::clone(&evaluator),
             budgets.check,
         ))
-        .list_objects(ListObjectsService::direct(
+        .list_objects(ListObjectsService::new(
             Arc::clone(&models),
             Arc::clone(&tuples),
+            Arc::new(DirectListObjectsEngine::new(limits.clone(), evaluator)),
             budgets.list_objects,
-            limits.clone(),
         ))
         .list_users(ListUsersService::direct(
             Arc::clone(&models),
@@ -519,7 +551,7 @@ where
             budgets.expand,
             limits,
         ))
-        .build()
+        .build())
 }
 
 fn check_budget(config: &ServerConfig) -> Result<CheckBudget> {
