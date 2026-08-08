@@ -3,7 +3,7 @@
 use std::{
     collections::{BTreeSet, HashSet},
     net::SocketAddr,
-    num::{NonZeroU32, NonZeroU64},
+    num::{NonZeroU32, NonZeroU64, NonZeroUsize},
     path::{Component, Path, PathBuf},
     time::Duration,
 };
@@ -13,7 +13,9 @@ use config::{Case, Config, Environment, File, FileFormat};
 use openfga_auth::{
     Action, AuthorizationPolicy, OidcAlgorithm, OidcConfig, PolicyBinding, StoreScope,
 };
-use openfga_cache::{DecisionCacheConfig, ModelCacheConfig, TupleCacheConfig};
+use openfga_cache::{
+    DecisionCacheConfig, InvalidationControllerConfig, ModelCacheConfig, TupleCacheConfig,
+};
 use openfga_domain::{Limit, PrincipalId, RequestTimeout, StoreId, TokenKeyId};
 use openfga_transport::AdmissionPolicy;
 use serde::{Deserialize, Serialize};
@@ -175,6 +177,8 @@ pub(crate) struct CacheConfig {
     pub(crate) decision: DecisionCachePolicy,
     #[serde(default)]
     pub(crate) tuple: TupleCachePolicy,
+    #[serde(default)]
+    pub(crate) controller: CacheControllerPolicy,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -239,6 +243,33 @@ impl Default for TupleCachePolicy {
             weight: default_tuple_weight(),
             maximum_results: default_tuple_cache_results(),
             ttl_seconds: default_mutable_cache_ttl_seconds(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct CacheControllerPolicy {
+    #[serde(default = "default_cache_controller_capacity")]
+    pub(crate) channel_capacity: usize,
+    #[serde(default = "default_cache_controller_page_size")]
+    pub(crate) page_size: u32,
+    #[serde(default = "default_cache_controller_poll_ms")]
+    pub(crate) poll_interval_ms: u64,
+    #[serde(default = "default_cache_controller_read_ms")]
+    pub(crate) read_timeout_ms: u64,
+    #[serde(default = "default_cache_controller_lag_ms")]
+    pub(crate) maximum_lag_ms: u64,
+}
+
+impl Default for CacheControllerPolicy {
+    fn default() -> Self {
+        Self {
+            channel_capacity: default_cache_controller_capacity(),
+            page_size: default_cache_controller_page_size(),
+            poll_interval_ms: default_cache_controller_poll_ms(),
+            read_timeout_ms: default_cache_controller_read_ms(),
+            maximum_lag_ms: default_cache_controller_lag_ms(),
         }
     }
 }
@@ -657,6 +688,7 @@ impl ServerConfig {
         self.model_cache_config()?;
         self.decision_cache_config()?;
         self.tuple_cache_config()?;
+        self.cache_controller_config()?;
         self.validate_transport()?;
         self.validate_evaluator()?;
         self.validate_list_objects()?;
@@ -669,6 +701,9 @@ impl ServerConfig {
             MAXIMUM_SHUTDOWN_DURATION,
             "shutdown drain timeout",
         )?;
+        if self.cache.controller.maximum_lag_ms > self.shutdown.drain_timeout_ms {
+            bail!("cache controller maximum lag cannot exceed shutdown drain timeout");
+        }
         bounded_duration(
             self.shutdown.health_interval_ms,
             MAXIMUM_HEALTH_INTERVAL,
@@ -749,6 +784,19 @@ impl ServerConfig {
             Duration::from_secs(self.cache.tuple.ttl_seconds),
         )
         .context("tuple cache configuration is invalid")
+    }
+
+    pub(crate) fn cache_controller_config(&self) -> Result<InvalidationControllerConfig> {
+        InvalidationControllerConfig::new(
+            NonZeroUsize::new(self.cache.controller.channel_capacity)
+                .context("cache controller channel capacity must be nonzero")?,
+            NonZeroU32::new(self.cache.controller.page_size)
+                .context("cache controller page size must be nonzero")?,
+            Duration::from_millis(self.cache.controller.poll_interval_ms),
+            Duration::from_millis(self.cache.controller.read_timeout_ms),
+            Duration::from_millis(self.cache.controller.maximum_lag_ms),
+        )
+        .context("cache controller configuration is invalid")
     }
 
     pub(crate) fn oidc_config(&self) -> OidcConfig {
@@ -1413,6 +1461,26 @@ const fn default_mutable_cache_ttl_seconds() -> u64 {
     10
 }
 
+const fn default_cache_controller_capacity() -> usize {
+    1_024
+}
+
+const fn default_cache_controller_page_size() -> u32 {
+    100
+}
+
+const fn default_cache_controller_poll_ms() -> u64 {
+    1_000
+}
+
+const fn default_cache_controller_read_ms() -> u64 {
+    1_000
+}
+
+const fn default_cache_controller_lag_ms() -> u64 {
+    10_000
+}
+
 #[cfg(test)]
 mod tests {
     use openfga_auth::Action;
@@ -1595,6 +1663,13 @@ evaluator: {}
 
         config.cache.decision.ttl_seconds = 10;
         config.cache.tuple.maximum_results = 100_001;
+        assert!(config.validate().is_err());
+
+        config.cache.tuple.maximum_results = 10_000;
+        config.cache.controller.maximum_lag_ms = 3_999;
+        assert!(config.validate().is_err());
+
+        config.cache.controller.maximum_lag_ms = 10_001;
         assert!(config.validate().is_err());
         Ok(())
     }

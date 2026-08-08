@@ -65,6 +65,23 @@ sequenceDiagram
 
 The initial watermark is process-global and therefore conservatively invalidates mutable entries for every store after any observed change. This sacrifices some multi-store hit rate but avoids an unproven relation/object scope. Exact, forward, userset, reverse, existence, count, and paged tuple shapes use distinct canonical fingerprints including every filter, bound, and cursor input. Partial streams and every error class remain ineligible.
 
+```mermaid
+flowchart LR
+    Cache[Decision and tuple caches] -->|bounded, deduplicated registration| Queue[Controller mpsc]
+    Queue --> Actor[Single invalidation actor]
+    Actor -->|higher-consistency read after ChangeId| Log[(Atomic tuple changelog)]
+    Log --> Validate{Store and strict ID order valid?}
+    Validate -->|yes, changes observed| Watermark[Advance process watermark]
+    Validate -->|empty and healthy| Active[Permit cache until maximum-lag deadline]
+    Validate -->|error, timeout, duplicate, order fault| Flush[Flush and disable mutable caches]
+    Overflow[Queue/store bound exceeded] --> Flush
+    Restart[Startup or restart gap] --> Flush
+    Shutdown[Shutdown] --> Disabled[Disable cache eligibility and join actor]
+    Flush --> Authoritative[Authoritative storage/evaluator fallback]
+```
+
+Registration and tracked-store cardinality share the configured finite controller capacity. A store remains cache-ineligible until its first successful poll, and each successful poll grants eligibility only through an absolute maximum-lag deadline. This deadline is checked on the request path, so a blocked controller cannot extend the stale window. Changelog identifiers are ordered but not consecutive, so an absent identifier cannot be inferred from ULID arithmetic; detectable store/order/cursor faults flush, while TTL and the maximum-lag deadline cover retention or otherwise unobservable gaps.
+
 ## Consistency behavior
 
 - `HigherConsistency`: read mutable tuples from primary, bypass decision and tuple-read caches, and do not populate them from that request.

@@ -18,6 +18,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use openfga_auth::{AuthenticationService, JwksActor, PresharedKey};
 use openfga_cache::{
     CachedModelStorage, CachedTupleStorage, DecisionCache, DecisionCacheConfig, DecisionKeyHasher,
+    InvalidationController, InvalidationControllerConfig, InvalidationControllerDiagnostics,
     InvalidationWatermark, ModelCacheConfig, TupleCacheConfig,
 };
 use openfga_check::{CachedCheckEvaluator, CheckBudget, CheckEvaluator, DirectCheckEvaluator};
@@ -132,6 +133,7 @@ struct RuntimeAssembly {
     storage: StorageOwner,
     health: Arc<dyn HealthCheck>,
     identifiers: Arc<SystemIdentifierSource>,
+    cache_controller: InvalidationController,
 }
 
 #[derive(Clone, Debug)]
@@ -144,6 +146,7 @@ struct TransportRuntime {
 struct ReadinessDependencies {
     storage: Arc<dyn HealthCheck>,
     authentication: AuthenticationService,
+    cache_controller: InvalidationControllerDiagnostics,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -159,6 +162,7 @@ struct ServiceCachePolicy {
     models: ModelCacheConfig,
     decisions: DecisionCacheConfig,
     tuples: TupleCacheConfig,
+    controller: InvalidationControllerConfig,
 }
 
 impl fmt::Debug for ReadinessDependencies {
@@ -167,6 +171,7 @@ impl fmt::Debug for ReadinessDependencies {
             .debug_struct("ReadinessDependencies")
             .field("storage", &"dyn HealthCheck")
             .field("authentication", &self.authentication)
+            .field("cache_controller", &self.cache_controller)
             .finish_non_exhaustive()
     }
 }
@@ -181,6 +186,7 @@ impl fmt::Debug for RuntimeAssembly {
             .field("storage", &self.storage)
             .field("health", &"dyn HealthCheck")
             .field("identifiers_running", &self.identifiers.is_running())
+            .field("cache_controller", &self.cache_controller)
             .finish()
     }
 }
@@ -196,6 +202,7 @@ pub(crate) async fn run(config: ServerConfig) -> Result<()> {
         storage,
         health,
         identifiers,
+        mut cache_controller,
     } = assembly;
     let http_listener = bind(config.listeners.http, "HTTP").await?;
     let grpc_listener = bind(config.listeners.grpc, "gRPC").await?;
@@ -244,6 +251,7 @@ pub(crate) async fn run(config: ServerConfig) -> Result<()> {
         ReadinessDependencies {
             storage: Arc::clone(&health),
             authentication,
+            cache_controller: cache_controller.diagnostics(),
         },
         Arc::clone(&health_state),
         health_reporter.clone(),
@@ -271,7 +279,7 @@ pub(crate) async fn run(config: ServerConfig) -> Result<()> {
     let drain_result = drain_tasks(&mut tasks, config.drain_timeout()).await;
     health_state.live.store(false, Ordering::Release);
     drop(health);
-    shutdown_resources(storage, identifiers).await?;
+    shutdown_resources(storage, identifiers, &mut cache_controller).await?;
     first_failure?;
     drain_result
 }
@@ -319,19 +327,8 @@ async fn assemble(config: &ServerConfig) -> Result<RuntimeAssembly> {
             .context("failed to start identifier actor")?,
     );
     let identifier_service: Arc<dyn IdentifierSource> = identifiers.clone();
-    let check = check_budget(config)?;
-    let budgets = ServiceBudgets {
-        check,
-        list_objects: list_objects_budget(config, check)?,
-        list_users: list_users_budget(config)?,
-        expand: expand_budget(config)?,
-    };
-    let cache_policy = ServiceCachePolicy {
-        models: config.model_cache_config()?,
-        decisions: config.decision_cache_config()?,
-        tuples: config.tuple_cache_config()?,
-    };
-    let (services, storage, health) = match config.storage.backend {
+    let (budgets, cache_policy) = service_policy(config)?;
+    let (services, storage, health, cache_controller) = match config.storage.backend {
         StorageBackend::Memory => {
             let capacity = NonZeroUsize::new(config.storage.memory.actor_capacity)
                 .context("memory actor capacity must be nonzero")?;
@@ -344,14 +341,19 @@ async fn assemble(config: &ServerConfig) -> Result<RuntimeAssembly> {
                 .context("failed to start memory storage actor")?,
             );
             let health: Arc<dyn HealthCheck> = storage.clone();
-            let services = services(
-                storage.clone(),
+            let (services, cache_controller) = services(
+                &storage,
                 identifier_service,
                 limits.clone(),
                 budgets,
                 cache_policy,
             )?;
-            (services, StorageOwner::Memory(storage), health)
+            (
+                services,
+                StorageOwner::Memory(storage),
+                health,
+                cache_controller,
+            )
         }
         StorageBackend::Postgres => {
             let postgres = postgres_config(config, config.storage.postgres.migrate_on_start)?;
@@ -361,14 +363,19 @@ async fn assemble(config: &ServerConfig) -> Result<RuntimeAssembly> {
                     .context("failed to connect PostgreSQL storage")?,
             );
             let health: Arc<dyn HealthCheck> = storage.clone();
-            let services = services(
-                storage.clone(),
+            let (services, cache_controller) = services(
+                &storage,
                 identifier_service,
                 limits.clone(),
                 budgets,
                 cache_policy,
             )?;
-            (services, StorageOwner::Postgres(storage), health)
+            (
+                services,
+                StorageOwner::Postgres(storage),
+                health,
+                cache_controller,
+            )
         }
     };
     let (token_key, verification_keys) = load_token_keys(config)?;
@@ -400,7 +407,25 @@ async fn assemble(config: &ServerConfig) -> Result<RuntimeAssembly> {
         storage,
         health,
         identifiers,
+        cache_controller,
     })
+}
+
+fn service_policy(config: &ServerConfig) -> Result<(ServiceBudgets, ServiceCachePolicy)> {
+    let check = check_budget(config)?;
+    let budgets = ServiceBudgets {
+        check,
+        list_objects: list_objects_budget(config, check)?,
+        list_users: list_users_budget(config)?,
+        expand: expand_budget(config)?,
+    };
+    let cache = ServiceCachePolicy {
+        models: config.model_cache_config()?,
+        decisions: config.decision_cache_config()?,
+        tuples: config.tuple_cache_config()?,
+        controller: config.cache_controller_config()?,
+    };
+    Ok((budgets, cache))
 }
 
 async fn authentication(
@@ -444,12 +469,12 @@ async fn authentication(
 }
 
 fn services<B>(
-    storage: Arc<B>,
+    storage: &Arc<B>,
     identifiers: Arc<dyn IdentifierSource>,
     limits: InputLimits,
     budgets: ServiceBudgets,
     cache_policy: ServiceCachePolicy,
-) -> Result<OpenFgaServices>
+) -> Result<(OpenFgaServices, InvalidationController)>
 where
     B: AssertionReader
         + AssertionWriter
@@ -477,26 +502,34 @@ where
     let models: Arc<dyn ModelReader> = cached_models.clone();
     let model_writes: Arc<dyn ModelWriter> = cached_models;
     let invalidation = InvalidationWatermark::new();
+    let changes: Arc<dyn ChangeReader> = storage.clone();
+    let cache_controller = InvalidationController::start(
+        Arc::clone(&changes),
+        invalidation.clone(),
+        cache_policy.controller,
+    )
+    .map_err(anyhow::Error::new)?;
+    let controller_handle = cache_controller.handle();
     let storage_tuples: Arc<dyn TupleReader> = storage.clone();
     let storage_tuple_writes: Arc<dyn TupleWriter> = storage.clone();
-    let cached_tuples = Arc::new(CachedTupleStorage::new(
+    let cached_tuples = Arc::new(CachedTupleStorage::with_controller(
         storage_tuples,
         storage_tuple_writes,
         invalidation.clone(),
         cache_policy.tuples,
+        controller_handle.clone(),
     ));
     let tuples: Arc<dyn TupleReader> = cached_tuples.clone();
     let tuple_writes: Arc<dyn TupleWriter> = cached_tuples;
     let assertion_reads: Arc<dyn AssertionReader> = storage.clone();
     let assertion_writes: Arc<dyn AssertionWriter> = storage.clone();
-    let changes: Arc<dyn ChangeReader> = storage;
     let evaluator: Arc<dyn CheckEvaluator> = Arc::new(CachedCheckEvaluator::new(
         Arc::new(DirectCheckEvaluator::default()),
-        DecisionCache::new(cache_policy.decisions, invalidation),
+        DecisionCache::with_controller(cache_policy.decisions, invalidation, controller_handle),
         DecisionKeyHasher::random().map_err(anyhow::Error::new)?,
         limits.clone(),
     ));
-    Ok(OpenFgaServices::builder()
+    let services = OpenFgaServices::builder()
         .stores(StoreService::new(
             stores.clone(),
             store_writes,
@@ -551,7 +584,8 @@ where
             budgets.expand,
             limits,
         ))
-        .build())
+        .build();
+    Ok((services, cache_controller))
 }
 
 fn check_budget(config: &ServerConfig) -> Result<CheckBudget> {
@@ -989,7 +1023,9 @@ fn spawn_health_monitor(
                 _ = ticker.tick() => {
                     let storage_ready = probe_storage(dependencies.storage.as_ref(), probe_timeout).await;
                     let authentication_ready = dependencies.authentication.is_ready();
-                    let ready = storage_ready && authentication_ready;
+                    let cache_controller_ready = dependencies.cache_controller.is_running()
+                        && dependencies.cache_controller.is_ready();
+                    let ready = storage_ready && authentication_ready && cache_controller_ready;
                     if *shutdown.borrow() {
                         return Ok(());
                     }
@@ -1001,6 +1037,7 @@ fn spawn_health_monitor(
                             dependency = "runtime",
                             storage.ready = storage_ready,
                             authentication.ready = authentication_ready,
+                            cache_controller.ready = cache_controller_ready,
                             "readiness dependency failed"
                         );
                     }
@@ -1078,7 +1115,12 @@ async fn drain_tasks(tasks: &mut JoinSet<Result<()>>, maximum: Duration) -> Resu
 async fn shutdown_resources(
     storage: StorageOwner,
     identifiers: Arc<SystemIdentifierSource>,
+    cache_controller: &mut InvalidationController,
 ) -> Result<()> {
+    cache_controller
+        .stop()
+        .await
+        .context("failed to stop cache invalidation controller")?;
     let mut identifiers = Arc::try_unwrap(identifiers)
         .map_err(|_| anyhow::anyhow!("identifier actor references remain after listener drain"))?;
     identifiers

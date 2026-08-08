@@ -10,7 +10,7 @@ use openfga_model::CompiledModel;
 use sha2::Sha256;
 use thiserror::Error;
 
-use crate::InvalidationWatermark;
+use crate::{InvalidationControllerHandle, InvalidationWatermark};
 
 const MAXIMUM_DECISION_TTL: Duration = Duration::from_hours(24);
 type HmacSha256 = Hmac<Sha256>;
@@ -158,6 +158,7 @@ where
 {
     entries: Cache<DecisionKey, Arc<DecisionEntry<V>>>,
     invalidation: InvalidationWatermark,
+    controller: Option<InvalidationControllerHandle>,
 }
 
 impl<V> DecisionCache<V>
@@ -175,7 +176,20 @@ where
         Self {
             entries,
             invalidation,
+            controller: None,
         }
+    }
+
+    /// Creates a cache that registers active stores with the changelog controller.
+    #[must_use]
+    pub fn with_controller(
+        config: DecisionCacheConfig,
+        invalidation: InvalidationWatermark,
+        controller: InvalidationControllerHandle,
+    ) -> Self {
+        let mut cache = Self::new(config, invalidation);
+        cache.controller = Some(controller);
+        cache
     }
 
     /// Captures the generation before an authoritative computation starts.
@@ -186,17 +200,36 @@ where
 
     /// Returns a decision only if no invalidation races with lookup.
     pub async fn get(&self, key: &DecisionKey) -> Option<V> {
+        if let Some(controller) = &self.controller {
+            controller.track(key.store_id);
+            if !controller.permits_caching(key.store_id) {
+                return None;
+            }
+        }
         let before = self.invalidation.current();
         let entry = self.entries.get(key).await;
         let after = self.invalidation.current();
         entry
-            .filter(|entry| before == after && entry.watermark == after)
+            .filter(|entry| {
+                before == after
+                    && entry.watermark == after
+                    && self
+                        .controller
+                        .as_ref()
+                        .is_none_or(|controller| controller.permits_caching(key.store_id))
+            })
             .map(|entry| entry.value.clone())
     }
 
     /// Inserts a successful result only if invalidation did not race computation.
     pub async fn insert_if_unchanged(&self, started_at: u64, key: DecisionKey, value: V) -> bool {
-        if self.invalidation.current() != started_at {
+        let store_id = key.store_id;
+        if self.invalidation.current() != started_at
+            || self
+                .controller
+                .as_ref()
+                .is_some_and(|controller| !controller.permits_caching(store_id))
+        {
             return false;
         }
         self.entries
@@ -209,6 +242,10 @@ where
             )
             .await;
         self.invalidation.current() == started_at
+            && self
+                .controller
+                .as_ref()
+                .is_none_or(|controller| controller.permits_caching(store_id))
     }
 }
 
@@ -221,6 +258,7 @@ where
             .debug_struct("DecisionCache")
             .field("entries", &self.entries.entry_count())
             .field("watermark", &self.invalidation.current())
+            .field("controller", &self.controller)
             .finish_non_exhaustive()
     }
 }
@@ -229,7 +267,7 @@ where
 mod tests {
     use std::{
         error::Error,
-        num::NonZeroU64,
+        num::{NonZeroU32, NonZeroU64, NonZeroUsize},
         sync::Arc,
         time::{Duration, Instant},
     };
@@ -243,10 +281,11 @@ mod tests {
         AuthorizationModelSource, DirectRestrictionSource, ModelCompiler, RelationSource,
         RestrictionKindSource, RewriteSource, TypeDefinitionSource,
     };
+    use openfga_storage_memory::{MemoryStorage, MemoryStorageConfig};
     use serde_json::json;
 
     use super::{DecisionCache, DecisionCacheConfig, DecisionKey, DecisionKeyHasher};
-    use crate::InvalidationWatermark;
+    use crate::{InvalidationController, InvalidationControllerConfig, InvalidationWatermark};
 
     #[tokio::test]
     async fn test_should_reject_entries_crossing_an_invalidation() -> Result<(), &'static str> {
@@ -259,6 +298,47 @@ mod tests {
         let key = test_key()?;
         assert!(!cache.insert_if_unchanged(started, key.clone(), true).await);
         assert_eq!(cache.get(&key).await, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_should_bypass_entries_until_store_controller_is_ready()
+    -> Result<(), Box<dyn Error + Send + Sync>> {
+        let storage = Arc::new(MemoryStorage::start(MemoryStorageConfig::default())?);
+        let watermark = InvalidationWatermark::new();
+        let mut controller = InvalidationController::start(
+            storage.clone(),
+            watermark.clone(),
+            InvalidationControllerConfig::new(
+                NonZeroUsize::new(8).ok_or("invalid controller capacity")?,
+                NonZeroU32::new(10).ok_or("invalid controller page size")?,
+                Duration::from_millis(5),
+                Duration::from_millis(20),
+                Duration::from_millis(100),
+            )?,
+        )?;
+        let mut cache = DecisionCache::new(
+            DecisionCacheConfig::new(NonZeroU64::MIN, Duration::from_secs(1))?,
+            watermark,
+        );
+        let key = test_key().map_err(str::to_owned)?;
+        let started = cache.begin_computation();
+        assert!(cache.insert_if_unchanged(started, key.clone(), true).await);
+        cache.controller = Some(controller.handle());
+        assert_eq!(cache.get(&key).await, None);
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while cache.get(&key).await.is_none() {
+            if Instant::now() >= deadline {
+                return Err("cache controller bootstrap timed out".into());
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        controller.stop().await?;
+        drop(cache);
+        drop(controller);
+        let mut storage = Arc::try_unwrap(storage).map_err(|_| "storage references remain")?;
+        storage.stop().await?;
         Ok(())
     }
 

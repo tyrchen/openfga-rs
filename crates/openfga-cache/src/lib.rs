@@ -7,11 +7,16 @@
 
 #![forbid(unsafe_code)]
 
+mod controller;
 mod decision;
 mod invalidation;
 mod model;
 mod tuple;
 
+pub use controller::{
+    InvalidationController, InvalidationControllerConfig, InvalidationControllerConfigError,
+    InvalidationControllerDiagnostics, InvalidationControllerError, InvalidationControllerHandle,
+};
 pub use decision::{
     DecisionCache, DecisionCacheConfig, DecisionCacheConfigError, DecisionKey, DecisionKeyHasher,
     DecisionKeyHasherError,

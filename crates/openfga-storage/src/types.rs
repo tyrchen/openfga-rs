@@ -1005,6 +1005,15 @@ impl PageOptions {
         }
     }
 
+    /// Creates an incremental changelog page after one exclusive change ID.
+    #[must_use]
+    pub fn after_change_id(maximum_results: NonZeroU32, change_id: ChangeId) -> Self {
+        Self {
+            maximum_results,
+            after: Some(StorageCursor(change_id.to_string().into_bytes())),
+        }
+    }
+
     /// Validates a page-size ceiling and optional verified cursor.
     ///
     /// # Errors
@@ -1107,16 +1116,17 @@ impl HealthStatus {
 
 #[cfg(test)]
 mod tests {
-    use std::{error::Error, sync::Arc, time::SystemTime};
+    use std::{error::Error, num::NonZeroU32, sync::Arc, time::SystemTime};
 
-    use openfga_domain::{InputLimits, Limit};
+    use openfga_domain::{ChangeId, InputLimits, Limit};
     use openfga_model::{
         AuthorizationModelSource, DirectRestrictionSource, ModelCompiler, ModelLimits,
         RelationSource, RestrictionKindSource, RewriteSource, TypeDefinitionSource,
     };
 
     use super::{
-        ConditionFilter, StorageCursor, StorageErrorKind, StoreName, StoredAuthorizationModel,
+        ConditionFilter, PageOptions, StorageCursor, StorageErrorKind, StoreName,
+        StoredAuthorizationModel,
     };
 
     #[test]
@@ -1142,6 +1152,20 @@ mod tests {
         assert!(ConditionFilter::named(Vec::new(), &InputLimits::default()).is_err());
         let cursor = StorageCursor::new(b"sensitive-cursor".to_vec())?;
         assert!(!format!("{cursor:?}").contains("sensitive"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_build_exclusive_change_cursor_without_unvalidated_bytes()
+    -> Result<(), Box<dyn Error>> {
+        let change_id: ChangeId = "01ARZ3NDEKTSV4RRFFQ69G5FAZ".parse()?;
+        let options =
+            PageOptions::after_change_id(NonZeroU32::new(10).ok_or("invalid limit")?, change_id);
+        assert_eq!(options.maximum_results(), 10);
+        assert_eq!(
+            options.after().ok_or("missing change cursor")?.as_bytes(),
+            change_id.to_string().as_bytes(),
+        );
         Ok(())
     }
 

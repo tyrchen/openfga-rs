@@ -24,7 +24,7 @@ clap = { version = "~4.6.5", default-features = false, features = ["derive", "er
 hmac = { version = "~0.13.0", default-features = false, features = ["zeroize"] }
 jiff = { version = "~0.2.35", default-features = false, features = ["std"] }
 jsonwebtoken = { version = "~11.0.0", default-features = false, features = ["aws_lc_rs"] }
-moka = { version = "~0.12.15", default-features = false, features = ["future"] }
+moka = { version = "~0.12.15", default-features = false, features = ["future", "sync"] }
 pbjson = { version = "~0.9.0", default-features = false }
 pbjson-build = { version = "~0.9.0", default-features = false }
 pbjson-types = { version = "~0.9.0", default-features = false }

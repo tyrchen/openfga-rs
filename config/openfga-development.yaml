@@ -32,6 +32,12 @@ cache:
     weight: 1000000
     maximumResults: 10000
     ttlSeconds: 10
+  controller:
+    channelCapacity: 1024
+    pageSize: 100
+    pollIntervalMs: 1000
+    readTimeoutMs: 1000
+    maximumLagMs: 10000
 auth:
   mode: disabled
 transport:

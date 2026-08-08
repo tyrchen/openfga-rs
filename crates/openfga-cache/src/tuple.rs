@@ -15,7 +15,7 @@ use openfga_storage::{
 };
 use thiserror::Error;
 
-use crate::InvalidationWatermark;
+use crate::{InvalidationControllerHandle, InvalidationWatermark};
 
 const MAXIMUM_TUPLE_CACHE_TTL: Duration = Duration::from_hours(24);
 const MAXIMUM_CACHED_RESULTS: usize = 100_000;
@@ -123,6 +123,7 @@ pub struct CachedTupleStorage {
     entries: Cache<TupleReadKey, Arc<TupleCacheEntry>>,
     invalidation: InvalidationWatermark,
     maximum_results: usize,
+    controller: Option<InvalidationControllerHandle>,
 }
 
 impl CachedTupleStorage {
@@ -145,25 +146,59 @@ impl CachedTupleStorage {
             entries,
             invalidation,
             maximum_results: config.maximum_results,
+            controller: None,
         }
     }
 
-    async fn cached(&self, key: &TupleReadKey) -> Option<TupleCacheValue> {
+    /// Creates tuple storage that registers active stores with the changelog controller.
+    #[must_use]
+    pub fn with_controller(
+        reader: Arc<dyn TupleReader>,
+        writer: Arc<dyn TupleWriter>,
+        invalidation: InvalidationWatermark,
+        config: TupleCacheConfig,
+        controller: InvalidationControllerHandle,
+    ) -> Self {
+        let mut storage = Self::new(reader, writer, invalidation, config);
+        storage.controller = Some(controller);
+        storage
+    }
+
+    fn track(&self, store_id: StoreId) {
+        if let Some(controller) = &self.controller {
+            controller.track(store_id);
+        }
+    }
+
+    async fn cached(&self, store_id: StoreId, key: &TupleReadKey) -> Option<TupleCacheValue> {
         let before = self.invalidation.current();
         let entry = self.entries.get(key).await;
         let after = self.invalidation.current();
         entry
-            .filter(|entry| before == after && entry.watermark == after)
+            .filter(|entry| {
+                before == after
+                    && entry.watermark == after
+                    && self
+                        .controller
+                        .as_ref()
+                        .is_none_or(|controller| controller.permits_caching(store_id))
+            })
             .map(|entry| entry.value.clone())
     }
 
     async fn insert_if_unchanged(
         &self,
         started_at: u64,
+        store_id: StoreId,
         key: TupleReadKey,
         value: TupleCacheValue,
     ) {
-        if self.invalidation.current() != started_at {
+        if self.invalidation.current() != started_at
+            || self
+                .controller
+                .as_ref()
+                .is_some_and(|controller| !controller.permits_caching(store_id))
+        {
             return;
         }
         self.entries
@@ -177,19 +212,24 @@ impl CachedTupleStorage {
             .await;
     }
 
-    fn eligible(context: &OperationContext) -> bool {
+    fn eligible(&self, context: &OperationContext, store_id: StoreId) -> bool {
         context.consistency() == ConsistencyPreference::MinimizeLatency
+            && self
+                .controller
+                .as_ref()
+                .is_none_or(|controller| controller.permits_caching(store_id))
     }
 
     async fn read_stream(
         &self,
         context: &OperationContext,
+        store_id: StoreId,
         key: TupleReadKey,
         load: impl std::future::Future<Output = Result<TupleStream, StorageError>>,
     ) -> Result<TupleStream, StorageError> {
         context.check()?;
-        if Self::eligible(context)
-            && let Some(TupleCacheValue::Tuples(tuples)) = self.cached(&key).await
+        if self.eligible(context, store_id)
+            && let Some(TupleCacheValue::Tuples(tuples)) = self.cached(store_id, &key).await
         {
             context.check()?;
             return Ok(TupleStream::from_tuples(tuples.to_vec()));
@@ -210,9 +250,10 @@ impl CachedTupleStorage {
                 }
             }
         }
-        if Self::eligible(context) && tuples.len() <= self.maximum_results {
+        if self.eligible(context, store_id) && tuples.len() <= self.maximum_results {
             self.insert_if_unchanged(
                 started_at,
+                store_id,
                 key,
                 TupleCacheValue::Tuples(Arc::from(tuples.clone())),
             )
@@ -231,6 +272,7 @@ impl fmt::Debug for CachedTupleStorage {
             .field("entries", &self.entries.entry_count())
             .field("watermark", &self.invalidation.current())
             .field("maximum_results", &self.maximum_results)
+            .field("controller", &self.controller)
             .finish_non_exhaustive()
     }
 }
@@ -244,10 +286,11 @@ impl TupleReader for CachedTupleStorage {
         filter: &TupleReadFilter,
         options: &PageOptions,
     ) -> Result<Page<StoredTuple>, StorageError> {
+        self.track(store_id);
         context.check()?;
         let key = page_key(store_id, filter, options);
-        if Self::eligible(context)
-            && let Some(TupleCacheValue::Page(page)) = self.cached(&key).await
+        if self.eligible(context, store_id)
+            && let Some(TupleCacheValue::Page(page)) = self.cached(store_id, &key).await
         {
             context.check()?;
             return Ok(page);
@@ -257,9 +300,14 @@ impl TupleReader for CachedTupleStorage {
             .reader
             .read_tuples(context, store_id, filter, options)
             .await?;
-        if Self::eligible(context) && page.items().len() <= self.maximum_results {
-            self.insert_if_unchanged(started_at, key, TupleCacheValue::Page(page.clone()))
-                .await;
+        if self.eligible(context, store_id) && page.items().len() <= self.maximum_results {
+            self.insert_if_unchanged(
+                started_at,
+                store_id,
+                key,
+                TupleCacheValue::Page(page.clone()),
+            )
+            .await;
         }
         Ok(page)
     }
@@ -270,19 +318,25 @@ impl TupleReader for CachedTupleStorage {
         store_id: StoreId,
         key: &TupleKey,
     ) -> Result<StoredTuple, StorageError> {
+        self.track(store_id);
         context.check()?;
         let cache_key = exact_key("exact", store_id, key);
-        if Self::eligible(context)
-            && let Some(TupleCacheValue::Exact(tuple)) = self.cached(&cache_key).await
+        if self.eligible(context, store_id)
+            && let Some(TupleCacheValue::Exact(tuple)) = self.cached(store_id, &cache_key).await
         {
             context.check()?;
             return Ok(tuple);
         }
         let started_at = self.invalidation.current();
         let tuple = self.reader.read_exact_tuple(context, store_id, key).await?;
-        if Self::eligible(context) {
-            self.insert_if_unchanged(started_at, cache_key, TupleCacheValue::Exact(tuple.clone()))
-                .await;
+        if self.eligible(context, store_id) {
+            self.insert_if_unchanged(
+                started_at,
+                store_id,
+                cache_key,
+                TupleCacheValue::Exact(tuple.clone()),
+            )
+            .await;
         }
         Ok(tuple)
     }
@@ -294,8 +348,10 @@ impl TupleReader for CachedTupleStorage {
         filter: &ObjectRelationFilter,
         options: ReadOptions,
     ) -> Result<TupleStream, StorageError> {
+        self.track(store_id);
         self.read_stream(
             context,
+            store_id,
             object_relation_key("object_relation", store_id, filter, options),
             self.reader
                 .read_object_relation(context, store_id, filter, options),
@@ -310,8 +366,10 @@ impl TupleReader for CachedTupleStorage {
         filter: &UsersetTupleFilter,
         options: ReadOptions,
     ) -> Result<TupleStream, StorageError> {
+        self.track(store_id);
         self.read_stream(
             context,
+            store_id,
             userset_key(store_id, filter, options),
             self.reader
                 .read_userset_tuples(context, store_id, filter, options),
@@ -326,8 +384,10 @@ impl TupleReader for CachedTupleStorage {
         filter: &ReverseTupleFilter,
         options: ReadOptions,
     ) -> Result<TupleStream, StorageError> {
+        self.track(store_id);
         self.read_stream(
             context,
+            store_id,
             reverse_key(store_id, filter, options),
             self.reader
                 .read_reverse_tuples(context, store_id, filter, options),
@@ -341,19 +401,25 @@ impl TupleReader for CachedTupleStorage {
         store_id: StoreId,
         key: &TupleKey,
     ) -> Result<bool, StorageError> {
+        self.track(store_id);
         context.check()?;
         let cache_key = exact_key("exists", store_id, key);
-        if Self::eligible(context)
-            && let Some(TupleCacheValue::Exists(exists)) = self.cached(&cache_key).await
+        if self.eligible(context, store_id)
+            && let Some(TupleCacheValue::Exists(exists)) = self.cached(store_id, &cache_key).await
         {
             context.check()?;
             return Ok(exists);
         }
         let started_at = self.invalidation.current();
         let exists = self.reader.tuple_exists(context, store_id, key).await?;
-        if Self::eligible(context) {
-            self.insert_if_unchanged(started_at, cache_key, TupleCacheValue::Exists(exists))
-                .await;
+        if self.eligible(context, store_id) {
+            self.insert_if_unchanged(
+                started_at,
+                store_id,
+                cache_key,
+                TupleCacheValue::Exists(exists),
+            )
+            .await;
         }
         Ok(exists)
     }
@@ -364,6 +430,7 @@ impl TupleReader for CachedTupleStorage {
         store_id: StoreId,
         filter: &ObjectRelationFilter,
     ) -> Result<u64, StorageError> {
+        self.track(store_id);
         context.check()?;
         let cache_key = object_relation_key(
             "count_object_relation",
@@ -371,8 +438,8 @@ impl TupleReader for CachedTupleStorage {
             filter,
             ReadOptions::from_limit(openfga_domain::Limit::MIN),
         );
-        if Self::eligible(context)
-            && let Some(TupleCacheValue::Count(count)) = self.cached(&cache_key).await
+        if self.eligible(context, store_id)
+            && let Some(TupleCacheValue::Count(count)) = self.cached(store_id, &cache_key).await
         {
             context.check()?;
             return Ok(count);
@@ -382,9 +449,14 @@ impl TupleReader for CachedTupleStorage {
             .reader
             .count_object_relation(context, store_id, filter)
             .await?;
-        if Self::eligible(context) {
-            self.insert_if_unchanged(started_at, cache_key, TupleCacheValue::Count(count))
-                .await;
+        if self.eligible(context, store_id) {
+            self.insert_if_unchanged(
+                started_at,
+                store_id,
+                cache_key,
+                TupleCacheValue::Count(count),
+            )
+            .await;
         }
         Ok(count)
     }
@@ -400,6 +472,7 @@ impl TupleWriter for CachedTupleStorage {
         writes: Vec<RelationshipTuple>,
         options: TupleWriteOptions,
     ) -> Result<MutationOutcome, StorageError> {
+        self.track(store_id);
         let outcome = self
             .writer
             .write_tuples(context, store_id, deletes, writes, options)
