@@ -18,6 +18,7 @@ use serde_json::Value;
 use tower::limit::ConcurrencyLimitLayer;
 use tower_http::{limit::RequestBodyLimitLayer, timeout::TimeoutLayer};
 
+mod authzen_probe;
 mod check_corpus;
 mod check_probe;
 mod config;
@@ -109,6 +110,15 @@ enum Command {
         #[arg(long)]
         go_url: String,
         /// Base URL of the Rust server.
+        #[arg(long)]
+        rust_url: String,
+    },
+    /// Compare the pinned `AuthZEN` HTTP surface against the vendored Go server.
+    DifferentialAuthzen {
+        /// Base URL of the vendored Go baseline.
+        #[arg(long)]
+        go_url: String,
+        /// Base URL of the complete Rust server.
         #[arg(long)]
         rust_url: String,
     },
@@ -228,6 +238,9 @@ async fn main() -> Result<()> {
         Command::DifferentialCheckCorpus { corpus } => check_corpus::run(corpus).await,
         Command::DifferentialEnumeration { go_url, rust_url } => {
             enumeration_probe::run(&go_url, &rust_url).await
+        }
+        Command::DifferentialAuthzen { go_url, rust_url } => {
+            authzen_probe::run(&go_url, &rust_url).await
         }
         Command::Phase4ConsistencyFaults {
             rust_url,

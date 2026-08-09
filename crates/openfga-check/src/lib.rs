@@ -26,11 +26,16 @@
 #![forbid(unsafe_code)]
 
 mod budget;
+mod coalescing;
 mod error;
 mod evaluator;
 mod outcome;
 
 pub use budget::{CheckBudget, CheckBudgetBuilder, CheckWorkMeter};
+pub use coalescing::{
+    CheckCoalescingConfig, CheckCoalescingConfigError, CheckCoalescingMode,
+    CoalescingCheckEvaluator,
+};
 pub use error::{CheckError, CheckErrorKind};
 pub use evaluator::{CachedCheckEvaluator, CheckEvaluator, DirectCheckEvaluator};
 pub use outcome::{

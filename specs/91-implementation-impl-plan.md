@@ -1,13 +1,14 @@
 # Engineering implementation plan
 
-Status: OpenFGA v1 GA complete 2026-08-08 · Phase 6 planned · Depends on: all preceding specs
+Status: OpenFGA v1 GA and Phase 6 complete 2026-08-08 · Depends on: all preceding specs
 
 ## Readiness assessment
 
 Phases 0–5 are complete: the exact protocol/CEL baseline, semantic engines, secure durable API,
 enumeration, consistency/scale controls, PostgreSQL/MySQL/SQLite matrix, upstream conversion, and GA
-release evidence are implemented and independently reviewed. Phase 6 remains an optional post-GA
-frontier; no Phase 6 capability is implied by the OpenFGA v1 compatibility claim.
+release evidence are implemented and independently reviewed. Phase 6 now adds a separately pinned
+AuthZEN surface and one graduated Check-coalescing strategy without changing the OpenFGA v1 GA
+compatibility baseline.
 
 Before each implementation phase, re-check dependency versions and security posture; research versions are dated evidence. Every phase is an end-to-end, independently reviewed change set with no incomplete code or temporary fallback.
 
@@ -135,7 +136,7 @@ Exit gate: zero unexplained differential mismatches across advertised backends; 
 
 Verification: all Rust gates; every backend contract/API/differential/fault/migration suite; security/audit/deny/secret/SBOM gates; docs/link checks; release-artifact load/soak.
 
-## Phase 6 — AuthZEN and proven optimization tracks (M6, 6–12 weeks each)
+## Phase 6 — AuthZEN and proven optimization tracks (M6, complete 2026-08-08)
 
 | # | Independent track | Spec | Effort |
 | --- | --- | --- | ---: |
@@ -144,6 +145,8 @@ Verification: all Rust gates; every backend contract/API/differential/fault/migr
 | 6.3 | Run zero-mismatch differential/fault/cancellation and material performance graduation dossier before defaulting a strategy on. | 71, 72 | 2–4 weeks each |
 
 Exit gate: AuthZEN evidence names its pin. Each optimization has an independent zero-mismatch dossier, measurable win, observability, and instant rollback. Phase 6 is not required for OpenFGA v1 GA correctness.
+
+Completion evidence: the [Phase 6 AuthZEN and Check-coalescing report](../docs/research/phase6-authzen-coalescing-report.md), `make authzen-conformance`, `make authzen-differential`, real HTTP/gRPC transport tests, coalescing shadow/fault/cancellation/budget/mutation-race tests, and Criterion evidence showing a 23.0% reduction for 32 simultaneous identical cold checks while retaining enabled-mode oracle sampling.
 
 ## Per-phase completion discipline
 

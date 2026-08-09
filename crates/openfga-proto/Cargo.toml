@@ -1,6 +1,6 @@
 [package]
 name = "openfga-proto"
-description = "Pinned generated protobuf and gRPC types for the OpenFGA v1 API"
+description = "Pinned generated protobuf and gRPC types for the OpenFGA and AuthZEN v1 APIs"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true

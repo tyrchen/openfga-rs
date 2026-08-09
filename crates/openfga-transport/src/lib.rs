@@ -4,6 +4,7 @@
 
 mod admission;
 mod api;
+mod authzen;
 mod config;
 mod convert;
 mod error;
@@ -15,12 +16,13 @@ mod validation;
 pub use admission::{AdmissionPolicy, AdmissionPolicyBuilder, EndpointClass};
 pub use api::OpenFgaApi;
 pub use config::{
-    OpenFgaServices, OpenFgaServicesBuilder, TransportConfig, TransportConfigBuilder,
+    AuthZenConfig, OpenFgaServices, OpenFgaServicesBuilder, TransportConfig, TransportConfigBuilder,
 };
 pub use convert::{assertion_from_wire, model_definition_from_wire, relationship_tuple_from_wire};
 pub use error::ApiError;
 pub use grpc::{
-    AuthenticatedGrpcService, GrpcAuthenticationInterceptor, GrpcListObjectsStream, grpc_service,
+    AuthenticatedAuthZenGrpcService, AuthenticatedGrpcService, GrpcAuthenticationInterceptor,
+    GrpcListObjectsStream, authzen_grpc_service, grpc_service,
 };
 pub use http::http_router;
 

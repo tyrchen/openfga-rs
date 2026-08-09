@@ -11,9 +11,15 @@ use std::{
 use openfga_auth::{Action, AuthenticationService};
 use openfga_domain::{Deadline, Principal, RequestTimeout};
 use openfga_list::ListObjectsStream;
-use openfga_proto::openfga::v1::{
-    self as pb,
-    open_fga_service_server::{OpenFgaService, OpenFgaServiceServer},
+use openfga_proto::{
+    authzen::v1::{
+        self as az,
+        auth_zen_service_server::{AuthZenService, AuthZenServiceServer},
+    },
+    openfga::v1::{
+        self as pb,
+        open_fga_service_server::{OpenFgaService, OpenFgaServiceServer},
+    },
 };
 use openfga_service::ServiceError;
 use prost_reflect::ReflectMessage;
@@ -24,6 +30,7 @@ use crate::{
     ApiError, EndpointClass, OpenFgaApi,
     admission::AdmissionControl,
     api::{EndpointPermit, with_request_deadline},
+    authzen::{AUTHORIZATION_MODEL_ID_HEADER, authorization_model_id},
 };
 
 /// gRPC object stream retaining its endpoint concurrency permit until termination.
@@ -69,6 +76,10 @@ impl fmt::Debug for GrpcListObjectsStream {
 /// An authenticated bounded Tonic service adapter.
 pub type AuthenticatedGrpcService =
     InterceptedService<OpenFgaServiceServer<OpenFgaApi>, GrpcAuthenticationInterceptor>;
+
+/// An authenticated bounded `AuthZEN` Tonic service adapter.
+pub type AuthenticatedAuthZenGrpcService =
+    InterceptedService<AuthZenServiceServer<OpenFgaApi>, GrpcAuthenticationInterceptor>;
 
 /// Request-metadata authenticator that runs before protobuf message decoding.
 #[derive(Clone, Debug)]
@@ -117,6 +128,26 @@ pub fn grpc_service(
     let maximum = api.config.maximum_message_bytes;
     let admission = api.admission.clone();
     let service = OpenFgaServiceServer::new(api)
+        .max_decoding_message_size(maximum)
+        .max_encoding_message_size(maximum);
+    InterceptedService::new(
+        service,
+        GrpcAuthenticationInterceptor {
+            authentication,
+            admission,
+        },
+    )
+}
+
+/// Creates the authenticated bounded `AuthZEN` Tonic service adapter.
+#[must_use]
+pub fn authzen_grpc_service(
+    api: OpenFgaApi,
+    authentication: AuthenticationService,
+) -> AuthenticatedAuthZenGrpcService {
+    let maximum = api.config.maximum_message_bytes;
+    let admission = api.admission.clone();
+    let service = AuthZenServiceServer::new(api)
         .max_decoding_message_size(maximum)
         .max_encoding_message_size(maximum);
     InterceptedService::new(
@@ -177,6 +208,58 @@ macro_rules! unary {
     }};
 }
 
+macro_rules! authzen_unary {
+    ($self:ident, $request:ident, $method:ident, $class:expr, $action:expr) => {{
+        $self.ensure_authzen_enabled().map_err(Status::from)?;
+        let principal = $request
+            .extensions()
+            .get::<Principal>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("authentication context is missing"))?;
+        let store_id = $request.get_ref().store_id.as_str();
+        $self
+            .preauthorize(&principal, $action, Some(store_id))
+            .map_err(Status::from)?;
+        let request_deadline = grpc_deadline($self, &$request)?;
+        $self
+            .admission
+            .admit_principal(&principal, $class)
+            .map_err(Status::from)?;
+        let mut endpoint_permit = $self
+            .acquire_endpoint_permit($class)
+            .map_err(Status::from)?;
+        let request_deadline = match request_deadline {
+            GrpcDeadline::Elapsed => {
+                endpoint_permit.complete("timeout");
+                return Err(Status::deadline_exceeded("Request Deadline Exceeded"));
+            }
+            GrpcDeadline::At(deadline) => deadline,
+        };
+        if let Err(error) = ApiError::validate_grpc($request.get_ref()) {
+            endpoint_permit.complete("client_error");
+            return Err(Status::from(error));
+        }
+        let model_id = authorization_model_id(
+            $request
+                .metadata()
+                .get(AUTHORIZATION_MODEL_ID_HEADER)
+                .and_then(|value| value.to_str().ok()),
+        );
+        let response = with_request_deadline(
+            request_deadline,
+            $self.$method(&principal, $request.into_inner(), &model_id),
+        )
+        .await
+        .map(Response::new)
+        .map_err(Status::from);
+        endpoint_permit.complete(match &response {
+            Ok(_) => "success",
+            Err(status) => grpc_completion(status.code()),
+        });
+        response
+    }};
+}
+
 #[derive(Clone, Copy, Debug)]
 enum GrpcDeadline {
     Elapsed,
@@ -217,6 +300,87 @@ fn parse_grpc_timeout(value: &str) -> Option<Duration> {
         "u" => Some(Duration::from_micros(number)),
         "n" => Some(Duration::from_nanos(number)),
         _ => None,
+    }
+}
+
+#[tonic::async_trait]
+impl AuthZenService for OpenFgaApi {
+    async fn evaluation(
+        &self,
+        request: Request<az::EvaluationRequest>,
+    ) -> Result<Response<az::EvaluationResponse>, Status> {
+        authzen_unary!(
+            self,
+            request,
+            authzen_evaluation,
+            EndpointClass::Check,
+            Action::Check
+        )
+    }
+
+    async fn evaluations(
+        &self,
+        request: Request<az::EvaluationsRequest>,
+    ) -> Result<Response<az::EvaluationsResponse>, Status> {
+        authzen_unary!(
+            self,
+            request,
+            authzen_evaluations,
+            EndpointClass::Check,
+            Action::BatchCheck
+        )
+    }
+
+    async fn subject_search(
+        &self,
+        request: Request<az::SubjectSearchRequest>,
+    ) -> Result<Response<az::SubjectSearchResponse>, Status> {
+        authzen_unary!(
+            self,
+            request,
+            authzen_subject_search,
+            EndpointClass::Enumeration,
+            Action::ListUsers
+        )
+    }
+
+    async fn resource_search(
+        &self,
+        request: Request<az::ResourceSearchRequest>,
+    ) -> Result<Response<az::ResourceSearchResponse>, Status> {
+        authzen_unary!(
+            self,
+            request,
+            authzen_resource_search,
+            EndpointClass::Enumeration,
+            Action::StreamedListObjects
+        )
+    }
+
+    async fn action_search(
+        &self,
+        request: Request<az::ActionSearchRequest>,
+    ) -> Result<Response<az::ActionSearchResponse>, Status> {
+        authzen_unary!(
+            self,
+            request,
+            authzen_action_search,
+            EndpointClass::Enumeration,
+            Action::BatchCheck
+        )
+    }
+
+    async fn get_configuration(
+        &self,
+        request: Request<az::GetConfigurationRequest>,
+    ) -> Result<Response<az::GetConfigurationResponse>, Status> {
+        authzen_unary!(
+            self,
+            request,
+            authzen_configuration,
+            EndpointClass::Administration,
+            Action::GetStore
+        )
     }
 }
 

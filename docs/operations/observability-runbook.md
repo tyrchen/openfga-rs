@@ -18,6 +18,8 @@ controller maximum lag, or pool size changes.
 | `openfga.transport.in_flight` | `openfga_transport_in_flight` | `endpoint_class` | requests holding endpoint permits, including live streams |
 | `openfga.transport.request.duration` | `openfga_transport_request_duration_seconds` | `endpoint_class`, `result` | admitted lifetime histogram split into bounded success, client/server error, timeout, cancellation, overload, stream-error, and unimplemented classes |
 | `openfga.cache.requests` | `openfga_cache_requests_total` | `cache`, `result` | hit, miss, invalidated, or explicit bypass |
+| `openfga.check.coalescing.requests` | `openfga_check_coalescing_requests_total` | `result` | leader, coalesced waiter, bypass, error retry, verification sample, match/mismatch, disabled, or BatchCheck bypass |
+| `openfga.check.coalescing.killed` | `openfga_check_coalescing_killed` | none | persistent process-local strategy kill state (zero or one) |
 | `openfga.cache.controller.running` | `openfga_cache_controller_running` | none | controller task lifecycle |
 | `openfga.cache.controller.ready` | `openfga_cache_controller_ready` | none | every tracked store caught up within lag policy |
 | `openfga.cache.controller.tracked_stores` | `openfga_cache_controller_tracked_stores` | none | bounded active-store cardinality |
@@ -39,6 +41,7 @@ principal, DSN, or SQL parameter values.
 
 | Alert | Immediate interpretation and action |
 | --- | --- |
+| `OpenFgaCheckCoalescingMismatch` | The automatic kill switch has already returned Check to the oracle. Set `evaluator.coalescingMode: disabled`, preserve the redacted metric/log window, and treat promotion as blocked until the mismatch is reproduced and fixed. |
 | `OpenFgaCacheControllerDown` | Mutable caches are disabled; remove the instance from admission, inspect the supervised task, and restart only after preserving the error |
 | `OpenFgaCacheControllerPollStale` | Cache eligibility is at risk; check changelog storage latency/backlog and do not raise `maximumLagMs` during diagnosis |
 | `OpenFgaCacheControllerFailures` / `Overflow` | Conservative flushes are protecting correctness; check channel/store cardinality and storage errors |

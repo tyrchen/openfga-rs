@@ -80,12 +80,15 @@ const EXPECTED_PROTOC_BINARY_SHA256: &[(&str, &str)] = &[
     ),
 ];
 const GENERATED_FILES: &[&str] = &[
+    "authzen.v1.rs",
+    "authzen.v1.serde.rs",
     "openfga.v1.rs",
     "openfga.v1.serde.rs",
     "openfga_descriptor.bin",
     "route_metadata.rs",
 ];
 const OPENFGA_PROTO_FILES: &[&str] = &[
+    "authzen/v1/authzen_service.proto",
     "openfga/v1/authzmodel.proto",
     "openfga/v1/errors_ignore.proto",
     "openfga/v1/openapi.proto",
@@ -232,10 +235,29 @@ async fn main() -> Result<()> {
         .out_dir(&arguments.output)
         .register_descriptors(&descriptors)
         .context("failed to register protocol descriptors for protobuf JSON")?
-        .build(&[".openfga.v1"])
+        .build(&[".authzen.v1", ".openfga.v1"])
         .context("failed to generate protobuf JSON implementations")?;
     reject_duplicate_generated_map_keys(&arguments.output.join("openfga.v1.serde.rs")).await?;
-    reject_unknown_generated_numeric_enums(&arguments.output.join("openfga.v1.serde.rs")).await?;
+    reject_unknown_generated_numeric_enums(
+        &arguments.output.join("authzen.v1.serde.rs"),
+        &["EvaluationsSemantic"],
+    )
+    .await?;
+    emit_authzen_required_defaults(&arguments.output.join("authzen.v1.serde.rs")).await?;
+    reject_unknown_generated_numeric_enums(
+        &arguments.output.join("openfga.v1.serde.rs"),
+        &[
+            "AuthErrorCode",
+            "ConsistencyPreference",
+            "ErrorCode",
+            "InternalErrorCode",
+            "NotFoundErrorCode",
+            "TupleOperation",
+            "UnprocessableContentErrorCode",
+            "condition_param_type_ref::TypeName",
+        ],
+    )
+    .await?;
 
     generate_route_metadata(
         &api_root.join("docs/openapiv2/apidocs.swagger.json"),
@@ -247,24 +269,14 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn reject_unknown_generated_numeric_enums(path: &Path) -> Result<()> {
-    const ENUMS: &[&str] = &[
-        "AuthErrorCode",
-        "ConsistencyPreference",
-        "ErrorCode",
-        "InternalErrorCode",
-        "NotFoundErrorCode",
-        "TupleOperation",
-        "UnprocessableContentErrorCode",
-        "condition_param_type_ref::TypeName",
-    ];
+async fn reject_unknown_generated_numeric_enums(path: &Path, enums: &[&str]) -> Result<()> {
     let mut generated = tokio::fs::read_to_string(path).await.with_context(|| {
         format!(
             "failed to read generated protobuf JSON at {}",
             path.display()
         )
     })?;
-    for name in ENUMS {
+    for name in enums {
         let permissive = format!("x.try_into().ok().or_else(|| Some({name}::default()))");
         let replacements = generated.matches(&permissive).count();
         if replacements == 0 {
@@ -272,6 +284,35 @@ async fn reject_unknown_generated_numeric_enums(path: &Path) -> Result<()> {
         }
         generated = generated.replace(&permissive, "x.try_into().ok()");
     }
+    tokio::fs::write(path, generated)
+        .await
+        .with_context(|| format!("failed to harden protobuf JSON at {}", path.display()))?;
+    Ok(())
+}
+
+async fn emit_authzen_required_defaults(path: &Path) -> Result<()> {
+    const GENERATED_LENGTH: &str =
+        "let mut len = 0;\n        if self.decision {\n            len += 1;\n        }";
+    const REQUIRED_LENGTH: &str = "let mut len = 1;";
+    const GENERATED_FIELD: &str =
+        "if self.decision {\n            struct_ser.serialize_field(\"decision\", \
+         &self.decision)?;\n        }";
+    const REQUIRED_FIELD: &str = "struct_ser.serialize_field(\"decision\", &self.decision)?;";
+
+    let mut generated = tokio::fs::read_to_string(path).await.with_context(|| {
+        format!(
+            "failed to read generated protobuf JSON at {}",
+            path.display()
+        )
+    })?;
+    if generated.matches(GENERATED_LENGTH).count() != 1
+        || generated.matches(GENERATED_FIELD).count() != 1
+    {
+        bail!("pbjson output does not contain the required AuthZEN decision serializer shape");
+    }
+    generated = generated
+        .replace(GENERATED_LENGTH, REQUIRED_LENGTH)
+        .replace(GENERATED_FIELD, REQUIRED_FIELD);
     tokio::fs::write(path, generated)
         .await
         .with_context(|| format!("failed to harden protobuf JSON at {}", path.display()))?;
@@ -788,9 +829,6 @@ async fn generate_route_metadata(swagger_path: &Path, output_path: &Path) -> Res
 
     let mut routes = Vec::new();
     for (path, operations) in paths {
-        if path.contains("/access/v1/") || path.contains("authzen") {
-            continue;
-        }
         let operations = operations
             .as_object()
             .ok_or_else(|| anyhow!("OpenAPI route {path} is not an object"))?;
@@ -816,8 +854,9 @@ async fn generate_route_metadata(swagger_path: &Path, output_path: &Path) -> Res
     routes.sort();
 
     let mut generated = String::from(
-        "// @generated by openfga-proto-codegen. Do not edit.\n\n/// `OpenFGA` v1 HTTP routes \
-         from the pinned API source.\npub const OPENFGA_HTTP_ROUTES: &[HttpRoute] = &[\n",
+        "// @generated by openfga-proto-codegen. Do not edit.\n\n/// `OpenFGA` and `AuthZEN` v1 \
+         HTTP routes from the pinned API source.\npub const OPENFGA_HTTP_ROUTES: &[HttpRoute] = \
+         &[\n",
     );
     for route in routes {
         write!(

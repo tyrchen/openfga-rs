@@ -6,9 +6,10 @@ use openfga_check::{
     BatchCheckOutcome, CheckBudget, CheckEvaluator, CheckOutcome, DirectCheckEvaluator,
 };
 use openfga_domain::{
-    BatchCheckCommand, CheckCommand, ConsistencyPreference, Deadline, ModelSelection, QueryContext,
-    StoreId,
+    AuthorizationModelId, BatchCheckCommand, CheckCommand, ConsistencyPreference, Deadline,
+    ModelSelection, QueryContext, RelationName, StoreId, TypeName,
 };
+use openfga_model::ModelLookupError;
 use openfga_storage::{
     ModelReader, OperationContext, StorageCancellationToken, StoredAuthorizationModel, TupleReader,
 };
@@ -18,6 +19,37 @@ use crate::ServiceError;
 /// An immutable model selected before hostile Check payload conversion.
 #[derive(Debug)]
 pub struct ResolvedCheckModel(Arc<StoredAuthorizationModel>);
+
+impl ResolvedCheckModel {
+    /// Returns the concrete immutable model selected for this request.
+    #[must_use]
+    pub fn authorization_model_id(&self) -> AuthorizationModelId {
+        *self.0.compiled().model_id()
+    }
+
+    /// Returns every relation declared on an object type in deterministic source order.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed model lookup error when the object type is absent or compiled metadata is
+    /// internally inconsistent.
+    pub fn relation_names(
+        &self,
+        object_type: &TypeName,
+    ) -> Result<Vec<RelationName>, ModelLookupError> {
+        let compiled = self.0.compiled();
+        let type_id = compiled.type_id(object_type)?;
+        compiled
+            .relations_for_type(type_id)?
+            .iter()
+            .map(|relation_id| {
+                compiled
+                    .relation(*relation_id)
+                    .map(|relation| relation.name().clone())
+            })
+            .collect()
+    }
+}
 
 /// Transport-neutral Check and `BatchCheck` orchestration.
 #[derive(Clone)]

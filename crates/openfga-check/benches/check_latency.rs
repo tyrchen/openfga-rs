@@ -10,7 +10,10 @@ use std::{
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use openfga_cache::{DecisionCache, DecisionCacheConfig, DecisionKeyHasher, InvalidationWatermark};
-use openfga_check::{CachedCheckEvaluator, CheckBudget, CheckEvaluator, DirectCheckEvaluator};
+use openfga_check::{
+    CachedCheckEvaluator, CheckBudget, CheckCoalescingConfig, CheckCoalescingMode, CheckEvaluator,
+    CoalescingCheckEvaluator, DirectCheckEvaluator,
+};
 use openfga_domain::{
     AuthorizationModelId, CheckCommand, ConditionContext, ConsistencyPreference, ContextualTuples,
     Deadline, InputLimits, ModelSelection, Principal, PrincipalKind, QueryContext,
@@ -67,6 +70,12 @@ fn benchmark_check_latency(criterion: &mut Criterion) {
     group.bench_function("warm_decision_cache_hit", |bencher| {
         bencher.iter(|| fixture.run(&fixture.cached));
     });
+    group.bench_function("identical_burst_direct_32", |bencher| {
+        bencher.iter(|| fixture.run_burst(&fixture.direct, 32));
+    });
+    group.bench_function("identical_burst_coalesced_32", |bencher| {
+        bencher.iter(|| fixture.run_burst(&fixture.coalesced, 32));
+    });
     group.finish();
     fixture.shutdown();
 }
@@ -103,6 +112,7 @@ struct Fixture {
     command: CheckCommand,
     direct: Arc<dyn CheckEvaluator>,
     cached: Arc<dyn CheckEvaluator>,
+    coalesced: Arc<dyn CheckEvaluator>,
 }
 
 impl Fixture {
@@ -152,6 +162,14 @@ impl Fixture {
             DecisionKeyHasher::random()?,
             InputLimits::default(),
         ));
+        let coalesced: Arc<dyn CheckEvaluator> = Arc::new(CoalescingCheckEvaluator::new(
+            Arc::clone(&direct),
+            CheckCoalescingConfig::new(
+                CheckCoalescingMode::Enabled,
+                NonZeroU64::new(4_096).ok_or("invalid coalescing capacity")?,
+            )?,
+            DecisionKeyHasher::random()?,
+        ));
         Ok(Self {
             runtime,
             storage,
@@ -159,6 +177,7 @@ impl Fixture {
             command,
             direct,
             cached,
+            coalesced,
         })
     }
 
@@ -182,8 +201,45 @@ impl Fixture {
         black_box(outcome.ok());
     }
 
+    fn run_burst(&self, evaluator: &Arc<dyn CheckEvaluator>, callers: usize) {
+        let outcomes = self.runtime.block_on(async {
+            let mut tasks = tokio::task::JoinSet::new();
+            for _ in 0..callers {
+                let evaluator = Arc::clone(evaluator);
+                let command = self.command.clone();
+                let model = Arc::clone(&self.model);
+                let tuples = self.storage.clone();
+                tasks.spawn(async move {
+                    evaluator
+                        .check(
+                            &command,
+                            model,
+                            tuples,
+                            CheckBudget::default(),
+                            None,
+                            StorageCancellationToken::new(),
+                        )
+                        .await
+                });
+            }
+            let mut outcomes = Vec::with_capacity(callers);
+            while let Some(outcome) = tasks.join_next().await {
+                outcomes.push(outcome);
+            }
+            outcomes
+        });
+        assert_eq!(outcomes.len(), callers);
+        assert!(outcomes.iter().all(|outcome| {
+            outcome
+                .as_ref()
+                .is_ok_and(|outcome| outcome.as_ref().is_ok_and(|result| result.allowed()))
+        }));
+        black_box(outcomes);
+    }
+
     fn shutdown(self) {
         drop(self.cached);
+        drop(self.coalesced);
         drop(self.direct);
         let storage = Arc::try_unwrap(self.storage);
         assert!(storage.is_ok(), "benchmark storage references must drain");

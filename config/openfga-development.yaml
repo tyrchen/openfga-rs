@@ -76,6 +76,9 @@ transport:
     writes: 2000
     checks: 20000
     enumeration: 1000
+authzen:
+  enabled: true
+  baseUrl: http://127.0.0.1:8080
 evaluator:
   depth: 25
   dispatches: 10000
@@ -84,6 +87,8 @@ evaluator:
   conditionCost: 100000
   concurrentReads: 8
   batchConcurrency: 8
+  coalescingMode: shadow
+  coalescingMaximumInFlightKeys: 4096
 listObjects:
   candidateDepth: 25
   candidateDispatches: 10000

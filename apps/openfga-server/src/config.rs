@@ -16,8 +16,9 @@ use openfga_auth::{
 use openfga_cache::{
     DecisionCacheConfig, InvalidationControllerConfig, ModelCacheConfig, TupleCacheConfig,
 };
+use openfga_check::{CheckCoalescingConfig, CheckCoalescingMode};
 use openfga_domain::{Limit, PrincipalId, RequestTimeout, StoreId, TokenKeyId};
-use openfga_transport::AdmissionPolicy;
+use openfga_transport::{AdmissionPolicy, AuthZenConfig};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 
@@ -48,6 +49,7 @@ pub(crate) struct ServerConfig {
     pub(crate) cache: CacheConfig,
     pub(crate) auth: AuthConfig,
     pub(crate) transport: TransportPolicy,
+    pub(crate) authzen: AuthZenPolicy,
     pub(crate) evaluator: EvaluatorPolicy,
     pub(crate) list_objects: ListObjectsPolicy,
     pub(crate) list_users: ListUsersPolicy,
@@ -420,6 +422,16 @@ pub(crate) struct TransportPolicy {
     pub(crate) admission: AdmissionConfig,
 }
 
+/// `AuthZEN` compatibility surface and discovery metadata policy.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct AuthZenPolicy {
+    #[serde(default)]
+    pub(crate) enabled: bool,
+    #[serde(default)]
+    pub(crate) base_url: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct TokenKeyConfig {
@@ -486,6 +498,29 @@ pub(crate) struct EvaluatorPolicy {
     pub(crate) concurrent_reads: u32,
     #[serde(default = "default_batch_concurrency")]
     pub(crate) batch_concurrency: u32,
+    #[serde(default)]
+    pub(crate) coalescing_mode: CoalescingRollout,
+    #[serde(default = "default_coalescing_in_flight_keys")]
+    pub(crate) coalescing_maximum_in_flight_keys: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum CoalescingRollout {
+    #[default]
+    Disabled,
+    Shadow,
+    Enabled,
+}
+
+impl From<CoalescingRollout> for CheckCoalescingMode {
+    fn from(value: CoalescingRollout) -> Self {
+        match value {
+            CoalescingRollout::Disabled => Self::Disabled,
+            CoalescingRollout::Shadow => Self::Shadow,
+            CoalescingRollout::Enabled => Self::Enabled,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -649,6 +684,8 @@ struct RawServerConfig {
     cache: CacheConfig,
     auth: AuthConfig,
     transport: TransportPolicy,
+    #[serde(default)]
+    authzen: AuthZenPolicy,
     evaluator: EvaluatorPolicy,
     #[serde(default)]
     list_objects: ListObjectsPolicy,
@@ -672,6 +709,7 @@ impl From<RawServerConfig> for ServerConfig {
             cache: raw.cache,
             auth: raw.auth,
             transport: raw.transport,
+            authzen: raw.authzen,
             evaluator: raw.evaluator,
             list_objects: raw.list_objects,
             list_users: raw.list_users,
@@ -720,6 +758,7 @@ impl ServerConfig {
         self.validate_cache_capacity()?;
         self.cache_controller_config()?;
         self.validate_transport()?;
+        self.authzen_config()?;
         self.validate_evaluator()?;
         self.validate_list_objects()?;
         self.validate_list_users()?;
@@ -745,6 +784,20 @@ impl ServerConfig {
     pub(crate) fn request_timeout(&self) -> Result<RequestTimeout> {
         RequestTimeout::new(Duration::from_millis(self.transport.request_timeout_ms))
             .context("request timeout is outside the domain safety range")
+    }
+
+    pub(crate) fn authzen_config(&self) -> Result<AuthZenConfig> {
+        let base_url =
+            (!self.authzen.base_url.is_empty()).then_some(self.authzen.base_url.as_str());
+        if self.profile == Profile::Production
+            && self.authzen.enabled
+            && base_url.is_some_and(|value| !value.starts_with("https://"))
+        {
+            bail!("production AuthZEN discovery requires an https base URL");
+        }
+        AuthZenConfig::new(self.authzen.enabled, base_url)
+            .map_err(anyhow::Error::msg)
+            .context("AuthZEN configuration is invalid")
     }
 
     pub(crate) fn admission_policy(&self) -> Result<AdmissionPolicy> {
@@ -804,6 +857,15 @@ impl ServerConfig {
             Duration::from_secs(self.cache.decision.ttl_seconds),
         )
         .context("decision cache configuration is invalid")
+    }
+
+    pub(crate) fn check_coalescing_config(&self) -> Result<CheckCoalescingConfig> {
+        CheckCoalescingConfig::new(
+            self.evaluator.coalescing_mode.into(),
+            NonZeroU64::new(self.evaluator.coalescing_maximum_in_flight_keys)
+                .context("evaluator coalescing maximum in-flight keys must be non-zero")?,
+        )
+        .context("invalid Check request-coalescing policy")
     }
 
     pub(crate) fn tuple_cache_config(&self) -> Result<TupleCacheConfig> {
@@ -1134,6 +1196,7 @@ impl ServerConfig {
             .context("evaluator concurrent read limit is invalid")?;
         Limit::<1_000>::new(self.evaluator.batch_concurrency)
             .context("evaluator batch concurrency is invalid")?;
+        self.check_coalescing_config()?;
         Ok(())
     }
 
@@ -1532,6 +1595,10 @@ const fn default_batch_concurrency() -> u32 {
     8
 }
 
+const fn default_coalescing_in_flight_keys() -> u64 {
+    4_096
+}
+
 const fn default_candidates() -> u32 {
     10_000
 }
@@ -1670,6 +1737,31 @@ evaluator: {}
         let config = ServerConfig::from(parse(VALID.as_bytes())?);
         config.validate()?;
         assert_eq!(config.profile, Profile::Development);
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_validate_authzen_and_coalescing_rollout_controls() -> anyhow::Result<()> {
+        let configured = VALID.replace(
+            "evaluator: {}",
+            "authzen:\n  enabled: true\n  baseUrl: http://127.0.0.1:8080\nevaluator:\n  \
+             coalescingMode: enabled\n  coalescingMaximumInFlightKeys: 4096",
+        );
+        ServerConfig::from(parse(configured.as_bytes())?).validate()?;
+
+        let invalid_capacity = configured.replace(
+            "coalescingMaximumInFlightKeys: 4096",
+            "coalescingMaximumInFlightKeys: 0",
+        );
+        assert!(
+            ServerConfig::from(parse(invalid_capacity.as_bytes())?)
+                .validate()
+                .is_err()
+        );
+
+        let mut production = ServerConfig::from(parse(configured.as_bytes())?);
+        production.profile = Profile::Production;
+        assert!(production.authzen_config().is_err());
         Ok(())
     }
 

@@ -1285,7 +1285,7 @@ impl OpenFgaApi {
         })
     }
 
-    fn deadline(&self) -> Result<Deadline, ApiError> {
+    pub(crate) fn deadline(&self) -> Result<Deadline, ApiError> {
         if let Ok(deadline) = REQUEST_DEADLINE.try_with(|deadline| *deadline) {
             return Ok(deadline);
         }

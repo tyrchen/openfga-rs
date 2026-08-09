@@ -34,5 +34,6 @@
 | [Phase 3 enumeration differential report](./research/phase3-enumeration-differential-report.md) | Generated-set equivalence, live Go/Rust list/Expand parity, disconnect cleanup, and query-plan controls | Passing |
 | [Phase 4 scale and benchmark report](./research/phase4-scale-benchmark-report.md) | Cross-process consistency, full Go reference matrix, p95/heap budgets, 30-minute soak, PostgreSQL pool smoke, and rolling drain | Passing |
 | [Phase 5 GA release evidence](./research/phase5-ga-release-evidence.md) | Backend matrix, upstream conversion, supply-chain controls, artifact contract, and release blockers | Passing locally; live MySQL enforced in CI |
+| [Phase 6 AuthZEN and Check-coalescing report](./research/phase6-authzen-coalescing-report.md) | Pinned AuthZEN parity plus the zero-mismatch, fault, rollback, observability, and performance dossier for identical-Check coalescing | Passing locally |
 
 The OpenFGA study is pinned to `vendors/openfga` commit `4e4f79ed841513dfd61746a75ef473f6198299f7`. The Rust survey was checked on 2026-08-05 and must be refreshed before dependency changes.

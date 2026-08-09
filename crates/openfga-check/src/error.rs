@@ -94,6 +94,11 @@ impl CheckError {
     pub const fn code(&self) -> &'static str {
         self.code
     }
+
+    pub(crate) fn with_code(mut self, code: &'static str) -> Self {
+        self.code = code;
+        self
+    }
 }
 
 impl From<StorageError> for CheckError {

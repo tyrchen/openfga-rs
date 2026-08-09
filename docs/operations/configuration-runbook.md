@@ -109,6 +109,9 @@ transport:
     writes: 2000
     checks: 20000
     enumeration: 1000
+authzen:
+  enabled: true
+  baseUrl: https://openfga.example.com
 evaluator:
   depth: 25
   dispatches: 10000
@@ -117,6 +120,8 @@ evaluator:
   conditionCost: 100000
   concurrentReads: 8
   batchConcurrency: 8
+  coalescingMode: shadow
+  coalescingMaximumInFlightKeys: 4096
 telemetry:
   logFormat: json
   logFilter: info
@@ -126,6 +131,16 @@ shutdown:
   drainTimeoutMs: 10000
   healthIntervalMs: 1000
 ```
+
+`authzen.enabled` gates every AuthZEN handler. `baseUrl` is the sole discovery authority and must
+be HTTPS in production when configured; never populate it from a request Host header. It may be
+omitted when only evaluation/search is needed, in which case discovery returns a typed
+FailedPrecondition. Roll back the Check optimization at startup by setting `coalescingMode:
+disabled` and performing the normal bounded restart. `shadow` returns oracle results while
+recording comparisons; promote to `enabled` only after the deployment has observed zero
+mismatches. Enabled instances retain a one-in-64 verification sample. Any mismatch immediately
+engages the in-process kill switch, exposes `openfga.check.coalescing.killed = 1`, and routes
+subsequent Checks through the permanent oracle without waiting for a restart.
 
 Omit `replicaUrlEnv` when there is no replica. Latency-preferring reads use a configured replica
 only while its replay lag is within `replicaMaxLagMs`; otherwise they conservatively use the

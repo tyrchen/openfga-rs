@@ -1,4 +1,4 @@
-//! Pinned `OpenFGA` v1 protobuf messages, gRPC services, and HTTP route metadata.
+//! Pinned `OpenFGA` and `AuthZEN` v1 protobuf messages, gRPC services, and HTTP route metadata.
 //!
 //! Generated files are checked in and reproduced with `make proto`. The source and tool pins are
 //! recorded in `proto.lock.json`; generated files must never be edited by hand.
@@ -104,6 +104,17 @@ impl<T: Display> Display for BoundedDisplay<'_, T> {
     }
 }
 
+/// `AuthZEN` protocol packages.
+pub mod authzen {
+    /// Version 1 of the AuthZEN API.
+    // Upstream-generated Tonic/Prost code is kept byte-reproducible and is not project-owned style.
+    #[allow(clippy::all, clippy::pedantic, missing_docs)]
+    pub mod v1 {
+        include!("generated/authzen.v1.rs");
+        include!("generated/authzen.v1.serde.rs");
+    }
+}
+
 /// `OpenFGA` protocol packages.
 pub mod openfga {
     /// Version 1 of the OpenFGA API.
@@ -153,15 +164,22 @@ mod tests {
     use super::{HttpMethod, OPENFGA_HTTP_ROUTES, openfga::v1 as pb};
 
     #[test]
-    fn test_should_generate_every_openfga_v1_http_route() {
-        assert_eq!(OPENFGA_HTTP_ROUTES.len(), 18);
+    fn test_should_generate_every_openfga_and_authzen_v1_http_route() {
+        assert_eq!(OPENFGA_HTTP_ROUTES.len(), 24);
         assert!(OPENFGA_HTTP_ROUTES.iter().any(|route| {
             route.method == HttpMethod::Post
                 && route.path == "/stores/{store_id}/check"
                 && route.operation_id == "Check"
         }));
-        assert!(OPENFGA_HTTP_ROUTES.iter().all(|route| {
-            !route.path.contains("/access/v1/") && !route.path.contains("authzen")
+        assert!(OPENFGA_HTTP_ROUTES.iter().any(|route| {
+            route.method == HttpMethod::Post
+                && route.path == "/stores/{store_id}/access/v1/evaluation"
+                && route.operation_id == "Evaluation"
+        }));
+        assert!(OPENFGA_HTTP_ROUTES.iter().any(|route| {
+            route.method == HttpMethod::Get
+                && route.path == "/.well-known/authzen-configuration/{store_id}"
+                && route.operation_id == "GetConfiguration"
         }));
     }
 

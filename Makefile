@@ -11,6 +11,8 @@ RUST_HTTP_ADDR ?= 127.0.0.1:18083
 RUST_GRPC_ADDR ?= 127.0.0.1:18084
 RUST_WRITER_HTTP_ADDR ?= 127.0.0.1:18085
 RUST_WRITER_GRPC_ADDR ?= 127.0.0.1:18086
+RUST_AUTHZEN_DISABLED_HTTP_ADDR ?= 127.0.0.1:18087
+RUST_AUTHZEN_DISABLED_GRPC_ADDR ?= 127.0.0.1:18088
 FUZZ_TIME ?= 15
 POSTGRES_TEST_URL ?=
 MYSQL_TEST_URL ?=
@@ -423,6 +425,114 @@ enumeration-differential: $(GO_BASELINE) build
 	done; \
 	$(CARGO) run --quiet -p openfga-server -- differential-enumeration \
 		--go-url "http://$(GO_HTTP_ADDR)/" --rust-url "http://$(RUST_HTTP_ADDR)/"
+
+authzen-baseline: verify-go-tool verify-go-pin
+	@cd vendors/openfga && \
+		GOTOOLCHAIN=local GOFLAGS=-mod=readonly ../../$(GO_TOOL) test ./tests/authzen -count=1
+
+authzen-differential: $(GO_BASELINE) build
+	@set -eu; \
+	phase6_tmp=$$(mktemp -d); \
+	go_pid=""; rust_pid=""; \
+	cleanup() { \
+		test -z "$$go_pid" || kill "$$go_pid" 2>/dev/null || true; \
+		test -z "$$rust_pid" || kill "$$rust_pid" 2>/dev/null || true; \
+		test -z "$$go_pid" || wait "$$go_pid" 2>/dev/null || true; \
+		test -z "$$rust_pid" || wait "$$rust_pid" 2>/dev/null || true; \
+		rm -rf "$$phase6_tmp"; \
+	}; \
+	trap cleanup EXIT INT TERM; \
+	$(GO_BASELINE) run --http-addr $(GO_HTTP_ADDR) --grpc-addr $(GO_GRPC_ADDR) \
+		--playground-enabled=false --experimentals authzen \
+		--authzen-base-url "http://$(GO_HTTP_ADDR)" \
+		>"$$phase6_tmp/go.log" 2>&1 & go_pid=$$!; \
+	token_key=$$(openssl rand -base64 32); \
+	OPENFGA__LISTENERS__HTTP=$(RUST_HTTP_ADDR) \
+	OPENFGA__LISTENERS__GRPC=$(RUST_GRPC_ADDR) \
+	OPENFGA__AUTHZEN__ENABLED=true \
+	OPENFGA__AUTHZEN__BASE_URL="http://$(RUST_HTTP_ADDR)" \
+	OPENFGA_TOKEN_KEY="$$token_key" \
+	$(CARGO) run --quiet -p openfga-server -- run \
+		--config config/openfga-development.yaml \
+		>"$$phase6_tmp/rust.log" 2>&1 & rust_pid=$$!; \
+	for endpoint in "http://$(GO_HTTP_ADDR)/healthz" "http://$(RUST_HTTP_ADDR)/readyz"; do \
+		attempt=0; \
+		until curl --fail --silent "$$endpoint" >/dev/null; do \
+			if ! kill -0 "$$go_pid" 2>/dev/null || ! kill -0 "$$rust_pid" 2>/dev/null; then \
+				echo "an AuthZEN differential server exited before readiness" >&2; \
+				tail -100 "$$phase6_tmp/go.log" "$$phase6_tmp/rust.log" >&2; \
+				exit 1; \
+			fi; \
+			attempt=$$((attempt + 1)); \
+			if test "$$attempt" -ge 100; then \
+				echo "AuthZEN server did not become ready: $$endpoint" >&2; \
+				tail -100 "$$phase6_tmp/go.log" "$$phase6_tmp/rust.log" >&2; \
+				exit 1; \
+			fi; \
+			sleep 0.1; \
+		done; \
+	done; \
+	$(CARGO) run --quiet -p openfga-server -- differential-authzen \
+		--go-url "http://$(GO_HTTP_ADDR)/" --rust-url "http://$(RUST_HTTP_ADDR)/"
+
+authzen-conformance: authzen-baseline build
+	@set -eu; \
+	phase6_tmp=$$(mktemp -d); \
+	repository_root=$$(pwd); \
+	corpus_dir=$$(mktemp -d "$$repository_root/vendors/openfga/.authzen-external.XXXXXX"); \
+	rust_pid=""; \
+	disabled_rust_pid=""; \
+	cleanup() { \
+		test -z "$$rust_pid" || kill "$$rust_pid" 2>/dev/null || true; \
+		test -z "$$disabled_rust_pid" || kill "$$disabled_rust_pid" 2>/dev/null || true; \
+		test -z "$$rust_pid" || wait "$$rust_pid" 2>/dev/null || true; \
+		test -z "$$disabled_rust_pid" || wait "$$disabled_rust_pid" 2>/dev/null || true; \
+		case "$$corpus_dir" in "$$repository_root"/vendors/openfga/.authzen-external.*) rm -rf "$$corpus_dir" ;; *) exit 1 ;; esac; \
+		rm -rf "$$phase6_tmp"; \
+	}; \
+	trap cleanup EXIT INT TERM; \
+	cp vendors/openfga/tests/authzen/*.go "$$corpus_dir/"; \
+	patch -d "$$corpus_dir" -p1 < tests/conformance/authzen-external-server.patch; \
+	token_key=$$(openssl rand -base64 32); \
+	OPENFGA__LISTENERS__HTTP=$(RUST_HTTP_ADDR) \
+	OPENFGA__LISTENERS__GRPC=$(RUST_GRPC_ADDR) \
+	OPENFGA__AUTHZEN__ENABLED=true \
+	OPENFGA__AUTHZEN__BASE_URL="http://openfga.example" \
+	OPENFGA_TOKEN_KEY="$$token_key" \
+	$(CARGO) run --quiet -p openfga-server -- run \
+		--config config/openfga-development.yaml \
+		>"$$phase6_tmp/rust.log" 2>&1 & rust_pid=$$!; \
+	OPENFGA__LISTENERS__HTTP=$(RUST_AUTHZEN_DISABLED_HTTP_ADDR) \
+	OPENFGA__LISTENERS__GRPC=$(RUST_AUTHZEN_DISABLED_GRPC_ADDR) \
+	OPENFGA__AUTHZEN__ENABLED=false \
+	OPENFGA_TOKEN_KEY="$$token_key" \
+	$(CARGO) run --quiet -p openfga-server -- run \
+		--config config/openfga-development.yaml \
+		>"$$phase6_tmp/rust-disabled.log" 2>&1 & disabled_rust_pid=$$!; \
+	for endpoint in "http://$(RUST_HTTP_ADDR)/readyz" "http://$(RUST_AUTHZEN_DISABLED_HTTP_ADDR)/readyz"; do \
+		attempt=0; \
+		until curl --fail --silent "$$endpoint" >/dev/null; do \
+			if ! kill -0 "$$rust_pid" 2>/dev/null || ! kill -0 "$$disabled_rust_pid" 2>/dev/null; then \
+				echo "a Rust AuthZEN conformance server exited before readiness" >&2; \
+				tail -100 "$$phase6_tmp/rust.log" "$$phase6_tmp/rust-disabled.log" >&2; \
+				exit 1; \
+			fi; \
+			attempt=$$((attempt + 1)); \
+			if test "$$attempt" -ge 100; then \
+				echo "Rust AuthZEN conformance server did not become ready: $$endpoint" >&2; \
+				tail -100 "$$phase6_tmp/rust.log" "$$phase6_tmp/rust-disabled.log" >&2; \
+				exit 1; \
+			fi; \
+			sleep 0.1; \
+		done; \
+	done; \
+	corpus_package="./$$(basename "$$corpus_dir")"; \
+	cd vendors/openfga && \
+	OPENFGA_AUTHZEN_TEST_GRPC_ADDR=$(RUST_GRPC_ADDR) \
+	OPENFGA_AUTHZEN_TEST_HTTP_ADDR=$(RUST_HTTP_ADDR) \
+	OPENFGA_AUTHZEN_DISABLED_TEST_GRPC_ADDR=$(RUST_AUTHZEN_DISABLED_GRPC_ADDR) \
+	OPENFGA_AUTHZEN_DISABLED_TEST_HTTP_ADDR=$(RUST_AUTHZEN_DISABLED_HTTP_ADDR) \
+	GOTOOLCHAIN=local GOFLAGS=-mod=readonly ../../$(GO_TOOL) test "$$corpus_package" -count=1
 
 phase4-scale: $(GO_BASELINE) build-release
 	@set -eu; \

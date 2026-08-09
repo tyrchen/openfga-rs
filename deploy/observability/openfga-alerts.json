@@ -106,6 +106,17 @@
           "expr": "sum(rate(openfga_cache_requests_total{result=\"hit\"}[10m])) / clamp_min(sum(rate(openfga_cache_requests_total{result=~\"hit|miss\"}[10m])), 0.001) < 0.5 and sum(rate(openfga_cache_requests_total{result=~\"hit|miss\"}[10m])) > 1",
           "for": "10m",
           "labels": { "severity": "warning" }
+        },
+        {
+          "alert": "OpenFgaCheckCoalescingMismatch",
+          "annotations": {
+            "description": "A Check coalescing comparison mismatched the permanent oracle; the in-process kill switch remains engaged.",
+            "runbook": "docs/operations/observability-runbook.md#alert-response",
+            "summary": "OpenFGA Check coalescing was disabled after a semantic mismatch"
+          },
+          "expr": "max(openfga_check_coalescing_killed) > 0",
+          "for": "0m",
+          "labels": { "severity": "critical" }
         }
       ]
     }

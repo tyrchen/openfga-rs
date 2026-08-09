@@ -1,8 +1,8 @@
 # Compatibility matrix
 
 This release implements the OpenFGA v1 API against one immutable upstream baseline. Compatibility
-claims apply only to the operations and environments in this matrix; AuthZEN is not part of the GA
-claim.
+claims apply only to the operations and environments in this matrix. AuthZEN is a separately
+verified post-GA surface and does not change the OpenFGA v1 GA claim.
 
 ## Exact pins
 
@@ -10,6 +10,7 @@ claim.
 | --- | --- |
 | OpenFGA behavioral oracle | `4e4f79ed841513dfd61746a75ef473f6198299f7` |
 | OpenFGA API source | `f153694bfc20f7be303e33cabe72b668596c5a06` |
+| AuthZEN Authorization API 1.0 source | `f153694bfc20f7be303e33cabe72b668596c5a06` (AuthZEN proto checksum in `proto.lock.json`) |
 | Rust | `1.97.1` (`8bab26f4f`, edition 2024) |
 | SQLx | `0.9.0`, locked by `Cargo.lock` |
 | PostgreSQL CI | `18.4` |
@@ -47,6 +48,13 @@ The vendored Go server remains the executable oracle. Run `make differential-smo
 `make check-spike`, and `make enumeration-differential` to reproduce semantic evidence. For a SQL
 backend, also run its storage target and the backend-specific Phase 2 compatibility target described
 in the [Phase 5 release evidence](research/phase5-ga-release-evidence.md).
+
+The optional AuthZEN HTTP and gRPC surface provides Evaluation, Evaluations, Subject Search,
+Resource Search, Action Search, and per-store discovery. Run `make authzen-conformance` and
+`make authzen-differential`; the former executes the complete vendored corpus against both the Go
+baseline and Rust, while the latter compares all six HTTP operations. Exact mappings, rollout
+boundaries, and the zero-mismatch result are in
+the [Phase 6 report](research/phase6-authzen-coalescing-report.md).
 
 ## Compatibility changes
 

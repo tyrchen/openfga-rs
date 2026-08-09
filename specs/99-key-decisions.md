@@ -1,6 +1,6 @@
 # Key decisions
 
-Status: Accepted through GA hardening · Last decision date: 2026-08-08
+Status: Accepted through Phase 6 · Last decision date: 2026-08-08
 
 Each decision may be revisited only when its trigger occurs and the replacement preserves the PRD and verification gates.
 
@@ -31,6 +31,8 @@ Each decision may be revisited only when its trigger occurs and the replacement 
 | KD-023 | Implement MySQL and SQLite behind the same capability contracts with dialect-specific migrations/locking/upsert/error seams; serialize SQLite through exactly one connection. | Duplicate backend crates; SQLite multi-connection retries; PostgreSQL-only GA. | [storage](13-storage-design.md), [compatibility](../docs/compatibility.md) | A backend cannot preserve the shared contract or a proven native implementation is materially safer/simpler. |
 | KD-024 | Convert upstream data only from the exact pinned OpenFGA SQLite migration version into an empty destination; preserve semantic identities but reset changelog history as cutover writes. | In-place conversion; copy physical changelog cursors; best-effort multi-version importer. | [runtime](21-runtime-operations-design.md), [migration runbook](../docs/operations/migration-runbook.md) | Upstream baseline changes or another source backend/version is explicitly added and tested. |
 | KD-025 | Release checksummed per-platform archives with CycloneDX/SPDX SBOMs and GitHub OIDC/Sigstore provenance after advisory, license, secret, backend and compatibility gates. | Unsigned binary attachment; source-only SBOM; mutable unpinned scanners/actions. | [security](70-security-design.md), [Phase 5 evidence](../docs/research/phase5-ga-release-evidence.md) | Release platform changes while preserving or strengthening provenance and SBOM verification. |
+| KD-026 | Implement AuthZEN Authorization API 1.0 from the pinned API commit, map it onto the existing service core, and publish discovery only from a configured canonical URL. | Independent authorization engine; Host-derived discovery URLs; floating AuthZEN schema. | [transport](20-api-transport-design.md), [Phase 6 evidence](../docs/research/phase6-authzen-coalescing-report.md) | Pinned OpenFGA/API baseline changes or AuthZEN publishes a new final version. |
+| KD-027 | Coalesce only simultaneous identical Check roots behind bounded disabled/shadow/enabled rollout; bypass higher consistency/work meters, retry shared failures, and atomically kill on mismatch. | Unbounded singleflight; leader-coupled cancellation; replacing the oracle; sharing errors. | [Check](14-check-engine-design.md), [performance](71-performance-design.md), [Phase 6 evidence](../docs/research/phase6-authzen-coalescing-report.md) | Deployment shadow evidence regresses or a strategy proves a larger safe win. |
 
 ## Rejected alternatives
 

@@ -13,11 +13,13 @@ workspace = true
 
 [dependencies]
 async-trait.workspace = true
+moka.workspace = true
 openfga-condition.workspace = true
 openfga-cache.workspace = true
 openfga-domain.workspace = true
 openfga-model.workspace = true
 openfga-storage.workspace = true
+opentelemetry.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true

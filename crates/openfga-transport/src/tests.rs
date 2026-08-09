@@ -21,9 +21,14 @@ use openfga_domain::{
 };
 use openfga_list::{ExpandBudget, ListObjectsBudget, ListUsersBudget};
 use openfga_model::ModelCompiler;
-use openfga_proto::openfga::{
-    v1 as pb,
-    v1::{open_fga_service_client::OpenFgaServiceClient, open_fga_service_server::OpenFgaService},
+use openfga_proto::{
+    authzen::v1::{self as az, auth_zen_service_client::AuthZenServiceClient},
+    openfga::{
+        v1 as pb,
+        v1::{
+            open_fga_service_client::OpenFgaServiceClient, open_fga_service_server::OpenFgaService,
+        },
+    },
 };
 use openfga_service::{
     AssertionService, ChangeService, CheckService, ExpandService, IdentifierSource,
@@ -40,11 +45,12 @@ use prost::Message;
 use secrecy::SecretString;
 use tokio::sync::oneshot;
 use tokio_stream::{StreamExt, wrappers::TcpListenerStream};
-use tonic::transport::Server;
+use tonic::transport::{Channel, Server};
 use tower::ServiceExt;
 
 use crate::{
-    AdmissionPolicy, ApiError, EndpointClass, OpenFgaApi, OpenFgaServices, TransportConfig,
+    AdmissionPolicy, ApiError, AuthZenConfig, EndpointClass, OpenFgaApi, OpenFgaServices,
+    TransportConfig,
 };
 
 const STORE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
@@ -91,6 +97,13 @@ struct TestRuntime {
 }
 
 fn test_runtime(maximum_message_bytes: usize) -> Result<TestRuntime, Box<dyn Error>> {
+    test_runtime_with_authzen(maximum_message_bytes, AuthZenConfig::disabled())
+}
+
+fn test_runtime_with_authzen(
+    maximum_message_bytes: usize,
+    authzen: AuthZenConfig,
+) -> Result<TestRuntime, Box<dyn Error>> {
     let storage = Arc::new(MemoryStorage::start(MemoryStorageConfig::default())?);
     let stores: Arc<dyn StoreReader> = storage.clone();
     let store_writes: Arc<dyn StoreWriter> = storage.clone();
@@ -171,6 +184,7 @@ fn test_runtime(maximum_message_bytes: usize) -> Result<TestRuntime, Box<dyn Err
             )?))
             .request_timeout(RequestTimeout::new(Duration::from_secs(5))?)
             .maximum_message_bytes(maximum_message_bytes)
+            .authzen(authzen)
             .build(),
     )?;
     Ok(TestRuntime {
@@ -372,6 +386,466 @@ fn test_should_cancel_in_flight_work_when_request_guard_drops() {
     let token = guard.token();
     drop(guard);
     assert!(token.is_cancelled());
+}
+
+#[tokio::test]
+async fn test_should_gate_authzen_before_request_validation() -> Result<(), Box<dyn Error>> {
+    let TestRuntime {
+        storage,
+        api,
+        principal,
+        authentication,
+    } = test_runtime(1_024)?;
+    let error = api
+        .authzen_evaluation(&principal, az::EvaluationRequest::default(), "")
+        .await
+        .err()
+        .ok_or("disabled AuthZEN request unexpectedly succeeded")?;
+    assert_eq!(error.code(), "unimplemented");
+    assert_eq!(error.http_status(), StatusCode::NOT_IMPLEMENTED);
+
+    drop(authentication);
+    drop(api);
+    let mut storage = Arc::try_unwrap(storage).map_err(|_| "storage references remain")?;
+    storage.stop().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the six-operation AuthZEN compatibility scenario shares one pinned model and tuple"
+)]
+async fn test_should_map_all_authzen_operations_and_ignore_host_poisoning()
+-> Result<(), Box<dyn Error>> {
+    let TestRuntime {
+        storage,
+        api,
+        principal,
+        authentication,
+    } = test_runtime_with_authzen(
+        300_000,
+        AuthZenConfig::new(true, Some("https://pdp.example.test/root/"))?,
+    )?;
+    api.write_authorization_model(&principal, model_request())
+        .await?;
+    api.write(
+        &principal,
+        pb::WriteRequest {
+            store_id: STORE_ID.to_owned(),
+            writes: Some(pb::WriteRequestWrites {
+                tuple_keys: vec![relationship_tuple()],
+                on_duplicate: String::new(),
+            }),
+            deletes: None,
+            authorization_model_id: MODEL_ID.to_owned(),
+        },
+    )
+    .await?;
+
+    let subject = az::Subject {
+        r#type: "user".to_owned(),
+        id: "anne".to_owned(),
+        properties: None,
+    };
+    let resource = az::Resource {
+        r#type: "document".to_owned(),
+        id: "roadmap".to_owned(),
+        properties: None,
+    };
+    let action = az::Action {
+        name: "viewer".to_owned(),
+        properties: None,
+    };
+    let evaluation = api
+        .authzen_evaluation(
+            &principal,
+            az::EvaluationRequest {
+                store_id: STORE_ID.to_owned(),
+                subject: Some(subject.clone()),
+                resource: Some(resource.clone()),
+                action: Some(action.clone()),
+                context: None,
+            },
+            MODEL_ID,
+        )
+        .await?;
+    assert!(evaluation.decision);
+
+    let evaluations = api
+        .authzen_evaluations(
+            &principal,
+            az::EvaluationsRequest {
+                store_id: STORE_ID.to_owned(),
+                subject: Some(subject.clone()),
+                action: Some(action.clone()),
+                resource: None,
+                context: None,
+                evaluations: vec![
+                    az::EvaluationsItemRequest {
+                        resource: Some(resource.clone()),
+                        ..az::EvaluationsItemRequest::default()
+                    },
+                    az::EvaluationsItemRequest {
+                        resource: Some(az::Resource {
+                            r#type: "document".to_owned(),
+                            id: "private".to_owned(),
+                            properties: None,
+                        }),
+                        ..az::EvaluationsItemRequest::default()
+                    },
+                ],
+                options: Some(az::EvaluationsOptions {
+                    evaluations_semantic: az::EvaluationsSemantic::DenyOnFirstDeny as i32,
+                }),
+            },
+            "",
+        )
+        .await?;
+    assert_eq!(
+        evaluations
+            .evaluations
+            .iter()
+            .map(|result| result.decision)
+            .collect::<Vec<_>>(),
+        vec![true, false],
+    );
+
+    let subjects = api
+        .authzen_subject_search(
+            &principal,
+            az::SubjectSearchRequest {
+                store_id: STORE_ID.to_owned(),
+                resource: Some(resource.clone()),
+                action: Some(action.clone()),
+                subject: Some(az::SubjectFilter {
+                    r#type: "user".to_owned(),
+                    id: Some("ignored".to_owned()),
+                    properties: None,
+                }),
+                context: None,
+                page: Some(az::PageRequest {
+                    token: Some("ignored".to_owned()),
+                    limit: Some(1),
+                }),
+            },
+            MODEL_ID,
+        )
+        .await?;
+    assert_eq!(subjects.results, vec![subject.clone()]);
+    assert!(subjects.page.is_none());
+
+    let resources = api
+        .authzen_resource_search(
+            &principal,
+            az::ResourceSearchRequest {
+                store_id: STORE_ID.to_owned(),
+                subject: Some(subject.clone()),
+                action: Some(action),
+                resource: Some(az::ResourceFilter {
+                    r#type: "document".to_owned(),
+                    id: Some("ignored".to_owned()),
+                    properties: None,
+                }),
+                context: None,
+                page: None,
+            },
+            MODEL_ID,
+        )
+        .await?;
+    assert_eq!(resources.results, vec![resource.clone()]);
+
+    let actions = api
+        .authzen_action_search(
+            &principal,
+            az::ActionSearchRequest {
+                store_id: STORE_ID.to_owned(),
+                subject: Some(subject),
+                resource: Some(resource),
+                context: None,
+                page: None,
+            },
+            MODEL_ID,
+        )
+        .await?;
+    assert_eq!(actions.results.len(), 1);
+    assert_eq!(
+        actions.results.first().map(|action| action.name.as_str()),
+        Some("viewer"),
+    );
+
+    let router = crate::http_router(api.clone(), authentication.clone());
+    let response = router
+        .oneshot(
+            Request::get(format!("/.well-known/authzen-configuration/{STORE_ID}"))
+                .header("host", "attacker.invalid")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 64 * 1_024).await?;
+    let configuration = serde_json::from_slice::<az::GetConfigurationResponse>(&bytes)?;
+    assert_eq!(
+        configuration.policy_decision_point,
+        format!("https://pdp.example.test/root/stores/{STORE_ID}"),
+    );
+    assert!(!configuration.policy_decision_point.contains("attacker"));
+
+    drop(authentication);
+    drop(api);
+    let mut storage = Arc::try_unwrap(storage).map_err(|_| "storage references remain")?;
+    storage.stop().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_should_serve_authzen_over_real_grpc() -> Result<(), Box<dyn Error>> {
+    let TestRuntime {
+        storage,
+        api,
+        principal,
+        authentication,
+    } = test_runtime_with_authzen(
+        300_000,
+        AuthZenConfig::new(true, Some("https://pdp.example.test"))?,
+    )?;
+    api.write_authorization_model(&principal, model_request())
+        .await?;
+    api.write(
+        &principal,
+        pb::WriteRequest {
+            store_id: STORE_ID.to_owned(),
+            writes: Some(pb::WriteRequestWrites {
+                tuple_keys: vec![relationship_tuple()],
+                on_duplicate: String::new(),
+            }),
+            deletes: None,
+            authorization_model_id: MODEL_ID.to_owned(),
+        },
+    )
+    .await?;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let (shutdown_sender, shutdown_receiver) = oneshot::channel::<()>();
+    let server_api = api.clone();
+    let server_authentication = authentication.clone();
+    let server = tokio::spawn(async move {
+        Server::builder()
+            .add_service(crate::authzen_grpc_service(
+                server_api,
+                server_authentication,
+            ))
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                let _shutdown = shutdown_receiver.await;
+            })
+            .await
+    });
+
+    let scenario = async {
+        let mut client = AuthZenServiceClient::connect(format!("http://{address}")).await?;
+        let (subject, resource, action) = authzen_test_entities();
+        assert_authzen_grpc_evaluations(&mut client, &subject, &resource, &action).await?;
+        assert_authzen_grpc_searches(&mut client, subject, resource, action).await?;
+        let configuration = client
+            .get_configuration(az::GetConfigurationRequest {
+                store_id: STORE_ID.to_owned(),
+            })
+            .await?
+            .into_inner();
+        assert_eq!(
+            configuration.policy_decision_point,
+            format!("https://pdp.example.test/stores/{STORE_ID}"),
+        );
+        Ok::<(), Box<dyn Error>>(())
+    }
+    .await;
+    let _ = shutdown_sender.send(());
+    server.await??;
+    scenario?;
+
+    drop(authentication);
+    drop(api);
+    let mut storage = Arc::try_unwrap(storage).map_err(|_| "storage references remain")?;
+    storage.stop().await?;
+    Ok(())
+}
+
+fn authzen_test_entities() -> (az::Subject, az::Resource, az::Action) {
+    (
+        az::Subject {
+            r#type: "user".to_owned(),
+            id: "anne".to_owned(),
+            properties: None,
+        },
+        az::Resource {
+            r#type: "document".to_owned(),
+            id: "roadmap".to_owned(),
+            properties: None,
+        },
+        az::Action {
+            name: "viewer".to_owned(),
+            properties: None,
+        },
+    )
+}
+
+async fn assert_authzen_grpc_evaluations(
+    client: &mut AuthZenServiceClient<Channel>,
+    subject: &az::Subject,
+    resource: &az::Resource,
+    action: &az::Action,
+) -> Result<(), Box<dyn Error>> {
+    let mut request = tonic::Request::new(az::EvaluationRequest {
+        store_id: STORE_ID.to_owned(),
+        subject: Some(subject.clone()),
+        resource: Some(resource.clone()),
+        action: Some(action.clone()),
+        context: None,
+    });
+    request
+        .metadata_mut()
+        .insert("openfga-authorization-model-id", MODEL_ID.parse()?);
+    assert!(client.evaluation(request).await?.into_inner().decision);
+    let evaluations = client
+        .evaluations(az::EvaluationsRequest {
+            store_id: STORE_ID.to_owned(),
+            subject: Some(subject.clone()),
+            resource: Some(resource.clone()),
+            action: None,
+            context: None,
+            evaluations: vec![
+                az::EvaluationsItemRequest {
+                    action: Some(action.clone()),
+                    ..az::EvaluationsItemRequest::default()
+                },
+                az::EvaluationsItemRequest {
+                    action: Some(az::Action {
+                        name: "owner".to_owned(),
+                        properties: None,
+                    }),
+                    ..az::EvaluationsItemRequest::default()
+                },
+            ],
+            options: None,
+        })
+        .await?
+        .into_inner();
+    assert_eq!(
+        evaluations
+            .evaluations
+            .iter()
+            .map(|evaluation| evaluation.decision)
+            .collect::<Vec<_>>(),
+        vec![true, false],
+    );
+    Ok(())
+}
+
+async fn assert_authzen_grpc_searches(
+    client: &mut AuthZenServiceClient<Channel>,
+    subject: az::Subject,
+    resource: az::Resource,
+    action: az::Action,
+) -> Result<(), Box<dyn Error>> {
+    let subjects = client
+        .subject_search(az::SubjectSearchRequest {
+            store_id: STORE_ID.to_owned(),
+            resource: Some(resource.clone()),
+            action: Some(action.clone()),
+            subject: Some(az::SubjectFilter {
+                r#type: "user".to_owned(),
+                id: None,
+                properties: None,
+            }),
+            context: None,
+            page: None,
+        })
+        .await?
+        .into_inner();
+    assert_eq!(subjects.results, vec![subject.clone()]);
+    let resources = client
+        .resource_search(az::ResourceSearchRequest {
+            store_id: STORE_ID.to_owned(),
+            subject: Some(subject.clone()),
+            action: Some(action),
+            resource: Some(az::ResourceFilter {
+                r#type: "document".to_owned(),
+                id: None,
+                properties: None,
+            }),
+            context: None,
+            page: None,
+        })
+        .await?
+        .into_inner();
+    assert_eq!(resources.results, vec![resource.clone()]);
+    let actions = client
+        .action_search(az::ActionSearchRequest {
+            store_id: STORE_ID.to_owned(),
+            subject: Some(subject),
+            resource: Some(resource),
+            context: None,
+            page: None,
+        })
+        .await?
+        .into_inner();
+    assert_eq!(
+        actions
+            .results
+            .iter()
+            .map(|result| result.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["viewer"],
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_should_gate_malformed_authzen_request_over_real_grpc() -> Result<(), Box<dyn Error>> {
+    let TestRuntime {
+        storage,
+        api,
+        authentication,
+        ..
+    } = test_runtime(1_024)?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let (shutdown_sender, shutdown_receiver) = oneshot::channel::<()>();
+    let server_api = api.clone();
+    let server_authentication = authentication.clone();
+    let server = tokio::spawn(async move {
+        Server::builder()
+            .add_service(crate::authzen_grpc_service(
+                server_api,
+                server_authentication,
+            ))
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                let _shutdown = shutdown_receiver.await;
+            })
+            .await
+    });
+
+    let mut client = AuthZenServiceClient::connect(format!("http://{address}")).await?;
+    let error = client
+        .evaluation(az::EvaluationRequest::default())
+        .await
+        .err()
+        .ok_or("disabled malformed AuthZEN gRPC request unexpectedly succeeded")?;
+    assert_eq!(error.code(), tonic::Code::Unimplemented);
+    assert!(
+        error
+            .message()
+            .contains("AuthZEN endpoints are experimental")
+    );
+    let _ = shutdown_sender.send(());
+    server.await??;
+
+    drop(authentication);
+    drop(api);
+    let mut storage = Arc::try_unwrap(storage).map_err(|_| "storage references remain")?;
+    storage.stop().await?;
+    Ok(())
 }
 
 #[tokio::test]

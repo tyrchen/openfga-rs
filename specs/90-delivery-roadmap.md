@@ -1,6 +1,6 @@
 # Delivery roadmap
 
-Status: M0–M5 complete 2026-08-08 · M6 planned · Audience: stakeholders and release owners
+Status: M0–M6 complete 2026-08-08 · Audience: stakeholders and release owners
 
 This roadmap states usable outcomes and release evidence. Detailed build order is in [`91-implementation-impl-plan.md`](91-implementation-impl-plan.md); milestone numbers map one-to-one to its phases.
 
@@ -26,7 +26,7 @@ M6 AuthZEN/optimization ◀─ M5 GA hardening ◀─ M4 consistency/scale
 | M3 — Enumeration parity (complete 2026-08-06) | Applications can use ListObjects, streaming, ListUsers, and Expand with bounded behavior. | 8–12 weeks | Complex recursive/wildcard/intersection/difference cases under client cancellation. | Differential enumeration report, set properties, stream cleanup, query plans. |
 | M4 — Consistency and scale (complete 2026-08-08) | Production workloads gain safe caching, replicas, graceful operations, and measured capacity. | 6–9 weeks | Higher-consistency read after write, cache invalidation/lag failure, overload, rolling shutdown. | Consistency faults, soak/load, telemetry/redaction, runbooks. |
 | M5 — Backend and GA compatibility (complete 2026-08-08) | OpenFGA v1 compatibility is GA across advertised databases. | 8–12 weeks | PostgreSQL/MySQL/SQLite/in-memory matrix and upstream migration drill. | Full release gate, SBOM/audit, migration matrix, published compatibility statement. |
-| M6 — AuthZEN and proven optimizations | Additional compatibility and faster strategies ship without changing decisions. | 6–12 weeks per track | AuthZEN client scenarios; shadowed strategies with instant rollback. | AuthZEN differential report and per-optimization graduation dossiers. |
+| M6 — AuthZEN and proven optimizations (complete 2026-08-08) | Additional compatibility and faster strategies ship without changing decisions. | 6–12 weeks per track | AuthZEN client scenarios; shadowed strategies with instant rollback. | Passing AuthZEN differential and Check-coalescing graduation report. |
 
 ## Release policy
 

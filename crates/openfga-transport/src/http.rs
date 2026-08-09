@@ -20,7 +20,7 @@ use axum::{
         ConnectInfo, DefaultBodyLimit, Extension, Path, Query, State,
         rejection::{JsonRejection, QueryRejection},
     },
-    http::{HeaderName, HeaderValue, Request, StatusCode},
+    http::{HeaderMap, HeaderName, HeaderValue, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -28,7 +28,7 @@ use axum::{
 use openfga_auth::{Action, AuthenticationService};
 use openfga_domain::{ObjectRef, Principal};
 use openfga_list::ListError;
-use openfga_proto::openfga::v1 as pb;
+use openfga_proto::{authzen::v1 as az, openfga::v1 as pb};
 use openfga_service::ServiceError;
 use prost_reflect::{DescriptorPool, Kind, MessageDescriptor};
 use serde::{
@@ -47,7 +47,10 @@ use tower_http::{
 };
 
 use crate::{
-    ApiError, EndpointClass, OpenFgaApi, admission::AdmissionControl, api::EndpointPermit,
+    ApiError, EndpointClass, OpenFgaApi,
+    admission::AdmissionControl,
+    api::EndpointPermit,
+    authzen::{AUTHORIZATION_MODEL_ID_HEADER, authorization_model_id},
     error::HttpCompletionClass,
 };
 
@@ -79,6 +82,30 @@ pub fn http_router(api: OpenFgaApi, authentication: AuthenticationService) -> Ro
             get(read_authorization_model),
         )
         .route("/stores/{store_id}/batch-check", post(batch_check))
+        .route(
+            "/stores/{store_id}/access/v1/evaluation",
+            post(authzen_evaluation),
+        )
+        .route(
+            "/stores/{store_id}/access/v1/evaluations",
+            post(authzen_evaluations),
+        )
+        .route(
+            "/stores/{store_id}/access/v1/search/subject",
+            post(authzen_subject_search),
+        )
+        .route(
+            "/stores/{store_id}/access/v1/search/resource",
+            post(authzen_resource_search),
+        )
+        .route(
+            "/stores/{store_id}/access/v1/search/action",
+            post(authzen_action_search),
+        )
+        .route(
+            "/.well-known/authzen-configuration/{store_id}",
+            get(authzen_configuration),
+        )
         .route("/stores/{store_id}/changes", get(read_changes))
         .route("/stores/{store_id}/check", post(check))
         .route("/stores/{store_id}/read", post(read_tuples))
@@ -258,32 +285,56 @@ fn request_message_descriptor(
     path: &str,
 ) -> Result<Option<MessageDescriptor>, ApiError> {
     let segments = path.trim_matches('/').split('/').collect::<Vec<_>>();
-    let name = match (method, segments.as_slice()) {
-        (&axum::http::Method::POST, ["stores"]) => Some("CreateStoreRequest"),
+    let descriptor = match (method, segments.as_slice()) {
+        (&axum::http::Method::POST, ["stores"]) => Some(("openfga.v1", "CreateStoreRequest")),
         (&axum::http::Method::PUT, ["stores", _, "assertions", _]) => {
-            Some("WriteAssertionsRequest")
+            Some(("openfga.v1", "WriteAssertionsRequest"))
         }
         (&axum::http::Method::POST, ["stores", _, "authorization-models"]) => {
-            Some("WriteAuthorizationModelRequest")
+            Some(("openfga.v1", "WriteAuthorizationModelRequest"))
         }
-        (&axum::http::Method::POST, ["stores", _, "batch-check"]) => Some("BatchCheckRequest"),
-        (&axum::http::Method::POST, ["stores", _, "check"]) => Some("CheckRequest"),
-        (&axum::http::Method::POST, ["stores", _, "read"]) => Some("ReadRequest"),
-        (&axum::http::Method::POST, ["stores", _, "write"]) => Some("WriteRequest"),
-        (&axum::http::Method::POST, ["stores", _, "expand"]) => Some("ExpandRequest"),
-        (&axum::http::Method::POST, ["stores", _, "list-objects"]) => Some("ListObjectsRequest"),
-        (&axum::http::Method::POST, ["stores", _, "list-users"]) => Some("ListUsersRequest"),
+        (&axum::http::Method::POST, ["stores", _, "batch-check"]) => {
+            Some(("openfga.v1", "BatchCheckRequest"))
+        }
+        (&axum::http::Method::POST, ["stores", _, "check"]) => Some(("openfga.v1", "CheckRequest")),
+        (&axum::http::Method::POST, ["stores", _, "read"]) => Some(("openfga.v1", "ReadRequest")),
+        (&axum::http::Method::POST, ["stores", _, "write"]) => Some(("openfga.v1", "WriteRequest")),
+        (&axum::http::Method::POST, ["stores", _, "expand"]) => {
+            Some(("openfga.v1", "ExpandRequest"))
+        }
+        (&axum::http::Method::POST, ["stores", _, "list-objects"]) => {
+            Some(("openfga.v1", "ListObjectsRequest"))
+        }
+        (&axum::http::Method::POST, ["stores", _, "list-users"]) => {
+            Some(("openfga.v1", "ListUsersRequest"))
+        }
         (&axum::http::Method::POST, ["stores", _, "streamed-list-objects"]) => {
-            Some("StreamedListObjectsRequest")
+            Some(("openfga.v1", "StreamedListObjectsRequest"))
+        }
+        (&axum::http::Method::POST, ["stores", _, "access", "v1", "evaluation"]) => {
+            Some(("authzen.v1", "EvaluationRequest"))
+        }
+        (&axum::http::Method::POST, ["stores", _, "access", "v1", "evaluations"]) => {
+            Some(("authzen.v1", "EvaluationsRequest"))
+        }
+        (&axum::http::Method::POST, ["stores", _, "access", "v1", "search", "subject"]) => {
+            Some(("authzen.v1", "SubjectSearchRequest"))
+        }
+        (&axum::http::Method::POST, ["stores", _, "access", "v1", "search", "resource"]) => {
+            Some(("authzen.v1", "ResourceSearchRequest"))
+        }
+        (&axum::http::Method::POST, ["stores", _, "access", "v1", "search", "action"]) => {
+            Some(("authzen.v1", "ActionSearchRequest"))
         }
         _ => None,
     };
-    name.map(|name| {
-        descriptor_pool()?
-            .get_message_by_name(&format!("openfga.v1.{name}"))
-            .ok_or_else(ApiError::internal)
-    })
-    .transpose()
+    descriptor
+        .map(|(package, name)| {
+            descriptor_pool()?
+                .get_message_by_name(&format!("{package}.{name}"))
+                .ok_or_else(ApiError::internal)
+        })
+        .transpose()
 }
 
 fn descriptor_pool() -> Result<&'static DescriptorPool, ApiError> {
@@ -665,14 +716,31 @@ fn route_authorization<'a>(
         (&axum::http::Method::POST, ["stores", store, "authorization-models"]) => {
             Some((Action::WriteAuthorizationModel, Some(store)))
         }
-        (&axum::http::Method::POST, ["stores", store, "batch-check"]) => {
-            Some((Action::BatchCheck, Some(store)))
+        (
+            &axum::http::Method::POST,
+            ["stores", store, "batch-check"]
+            | ["stores", store, "access", "v1", "evaluations"]
+            | ["stores", store, "access", "v1", "search", "action"],
+        ) => Some((Action::BatchCheck, Some(store))),
+        (
+            &axum::http::Method::POST,
+            ["stores", store, "access", "v1", "evaluation"] | ["stores", store, "check"],
+        ) => Some((Action::Check, Some(store))),
+        (
+            &axum::http::Method::POST,
+            ["stores", store, "access", "v1", "search", "subject"]
+            | ["stores", store, "list-users"],
+        ) => Some((Action::ListUsers, Some(store))),
+        (
+            &axum::http::Method::POST,
+            ["stores", store, "access", "v1", "search", "resource"]
+            | ["stores", store, "streamed-list-objects"],
+        ) => Some((Action::StreamedListObjects, Some(store))),
+        (&axum::http::Method::GET, [".well-known", "authzen-configuration", store]) => {
+            Some((Action::GetStore, Some(store)))
         }
         (&axum::http::Method::GET, ["stores", store, "changes"]) => {
             Some((Action::ReadChanges, Some(store)))
-        }
-        (&axum::http::Method::POST, ["stores", store, "check"]) => {
-            Some((Action::Check, Some(store)))
         }
         (&axum::http::Method::POST, ["stores", store, "read"]) => Some((Action::Read, Some(store))),
         (&axum::http::Method::POST, ["stores", store, "write"]) => {
@@ -684,18 +752,16 @@ fn route_authorization<'a>(
         (&axum::http::Method::POST, ["stores", store, "list-objects"]) => {
             Some((Action::ListObjects, Some(store)))
         }
-        (&axum::http::Method::POST, ["stores", store, "list-users"]) => {
-            Some((Action::ListUsers, Some(store)))
-        }
-        (&axum::http::Method::POST, ["stores", store, "streamed-list-objects"]) => {
-            Some((Action::StreamedListObjects, Some(store)))
-        }
         _ => None,
     }
 }
 
 fn endpoint_class(_method: &axum::http::Method, path: &str) -> EndpointClass {
-    if path.ends_with("/check") || path.ends_with("/batch-check") {
+    if path.ends_with("/check")
+        || path.ends_with("/batch-check")
+        || path.ends_with("/access/v1/evaluation")
+        || path.ends_with("/access/v1/evaluations")
+    {
         EndpointClass::Check
     } else if path.ends_with("/write") {
         EndpointClass::Write
@@ -705,6 +771,7 @@ fn endpoint_class(_method: &axum::http::Method, path: &str) -> EndpointClass {
         || path.ends_with("/list-objects")
         || path.ends_with("/streamed-list-objects")
         || path.ends_with("/list-users")
+        || path.contains("/access/v1/search/")
     {
         EndpointClass::Enumeration
     } else {
@@ -943,6 +1010,99 @@ async fn batch_check(
     let mut request = json(body)?;
     request.store_id = store_id;
     api.batch_check(&principal, request).await.map(Json)
+}
+
+async fn authzen_evaluation(
+    State(api): State<Arc<OpenFgaApi>>,
+    Extension(principal): Extension<Principal>,
+    Path(store_id): Path<String>,
+    headers: HeaderMap,
+    body: Result<Json<az::EvaluationRequest>, JsonRejection>,
+) -> Result<Json<az::EvaluationResponse>, ApiError> {
+    let mut request = json(body)?;
+    request.store_id = store_id;
+    let model_id = authzen_model_id(&headers);
+    api.authzen_evaluation(&principal, request, &model_id)
+        .await
+        .map(Json)
+}
+
+async fn authzen_evaluations(
+    State(api): State<Arc<OpenFgaApi>>,
+    Extension(principal): Extension<Principal>,
+    Path(store_id): Path<String>,
+    headers: HeaderMap,
+    body: Result<Json<az::EvaluationsRequest>, JsonRejection>,
+) -> Result<Json<az::EvaluationsResponse>, ApiError> {
+    let mut request = json(body)?;
+    request.store_id = store_id;
+    let model_id = authzen_model_id(&headers);
+    api.authzen_evaluations(&principal, request, &model_id)
+        .await
+        .map(Json)
+}
+
+async fn authzen_subject_search(
+    State(api): State<Arc<OpenFgaApi>>,
+    Extension(principal): Extension<Principal>,
+    Path(store_id): Path<String>,
+    headers: HeaderMap,
+    body: Result<Json<az::SubjectSearchRequest>, JsonRejection>,
+) -> Result<Json<az::SubjectSearchResponse>, ApiError> {
+    let mut request = json(body)?;
+    request.store_id = store_id;
+    let model_id = authzen_model_id(&headers);
+    api.authzen_subject_search(&principal, request, &model_id)
+        .await
+        .map(Json)
+}
+
+async fn authzen_resource_search(
+    State(api): State<Arc<OpenFgaApi>>,
+    Extension(principal): Extension<Principal>,
+    Path(store_id): Path<String>,
+    headers: HeaderMap,
+    body: Result<Json<az::ResourceSearchRequest>, JsonRejection>,
+) -> Result<Json<az::ResourceSearchResponse>, ApiError> {
+    let mut request = json(body)?;
+    request.store_id = store_id;
+    let model_id = authzen_model_id(&headers);
+    api.authzen_resource_search(&principal, request, &model_id)
+        .await
+        .map(Json)
+}
+
+async fn authzen_action_search(
+    State(api): State<Arc<OpenFgaApi>>,
+    Extension(principal): Extension<Principal>,
+    Path(store_id): Path<String>,
+    headers: HeaderMap,
+    body: Result<Json<az::ActionSearchRequest>, JsonRejection>,
+) -> Result<Json<az::ActionSearchResponse>, ApiError> {
+    let mut request = json(body)?;
+    request.store_id = store_id;
+    let model_id = authzen_model_id(&headers);
+    api.authzen_action_search(&principal, request, &model_id)
+        .await
+        .map(Json)
+}
+
+async fn authzen_configuration(
+    State(api): State<Arc<OpenFgaApi>>,
+    Extension(principal): Extension<Principal>,
+    Path(store_id): Path<String>,
+) -> Result<Json<az::GetConfigurationResponse>, ApiError> {
+    api.authzen_configuration(&principal, az::GetConfigurationRequest { store_id }, "")
+        .await
+        .map(Json)
+}
+
+fn authzen_model_id(headers: &HeaderMap) -> String {
+    authorization_model_id(
+        headers
+            .get(AUTHORIZATION_MODEL_ID_HEADER)
+            .and_then(|value| value.to_str().ok()),
+    )
 }
 
 async fn read_changes(

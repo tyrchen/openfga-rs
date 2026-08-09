@@ -1,0 +1,39 @@
+diff --git a/authzen_test.go b/authzen_test.go
+index 93d59cb..5d27ab2 100644
+--- a/authzen_test.go
++++ b/authzen_test.go
+@@ -3,5 +3,6 @@ package authzen_test
+ import (
+ 	"context"
++	"os"
+ 	"strings"
+ 	"testing"
+ 
+@@ -51,6 +52,27 @@ type testContext struct {
+ func setupTestContextWithExperimentals(t *testing.T, experimentals []string) *testContext {
+ 	t.Helper()
+ 
++	grpcEnv := "OPENFGA_AUTHZEN_TEST_GRPC_ADDR"
++	httpEnv := "OPENFGA_AUTHZEN_TEST_HTTP_ADDR"
++	if len(experimentals) == 0 {
++		grpcEnv = "OPENFGA_AUTHZEN_DISABLED_TEST_GRPC_ADDR"
++		httpEnv = "OPENFGA_AUTHZEN_DISABLED_TEST_HTTP_ADDR"
++	}
++	grpcAddr := os.Getenv(grpcEnv)
++	if grpcAddr != "" {
++		httpAddr := os.Getenv(httpEnv)
++		require.NotEmpty(t, httpAddr, "OPENFGA_AUTHZEN_TEST_HTTP_ADDR is required with the external gRPC address")
++		conn := testutils.CreateGrpcConnection(t, grpcAddr)
++
++		return &testContext{
++			t:             t,
++			grpcAddr:      grpcAddr,
++			httpAddr:      httpAddr,
++			openfgaClient: openfgav1.NewOpenFGAServiceClient(conn),
++			authzenClient: authzenv1.NewAuthZenServiceClient(conn),
++		}
++	}
++
+ 	cfg := testutils.MustDefaultConfig()
+ 	cfg.Experimentals = experimentals
+ 	cfg.Log.Level = "error"

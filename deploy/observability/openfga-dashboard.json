@@ -157,6 +157,19 @@
       ],
       "title": "PostgreSQL work permits available",
       "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "min": 0, "unit": "ops" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 32 },
+      "id": 12,
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "expr": "sum by (result) (rate(openfga_check_coalescing_requests_total[$__rate_interval]))", "legendFormat": "{{result}}", "refId": "A" },
+        { "expr": "max(openfga_check_coalescing_killed)", "legendFormat": "kill switch", "refId": "B" }
+      ],
+      "title": "Check coalescing rollout",
+      "type": "timeseries"
     }
   ],
   "refresh": "10s",

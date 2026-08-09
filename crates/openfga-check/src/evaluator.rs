@@ -34,6 +34,9 @@ use crate::{
     CheckOutcome, CheckResolution, CheckWorkMeter,
 };
 
+const CHECK_CANCELLED_CODE: &str = "check_cancelled";
+const CHECK_DEADLINE_ELAPSED_CODE: &str = "check_deadline_elapsed";
+
 type Evaluation = Result<Decision, CheckError>;
 type WorkId = usize;
 
@@ -133,17 +136,18 @@ impl CheckEvaluator for CachedCheckEvaluator {
         cancellation: StorageCancellationToken,
     ) -> Result<CheckOutcome, CheckError> {
         if cancellation.is_cancelled() {
-            return Err(cancelled("decision_cache_lookup_cancelled"));
+            return Err(cancelled(CHECK_CANCELLED_CODE));
         }
         if command.query().deadline().is_elapsed(Instant::now()) {
-            return Err(timed_out("decision_cache_lookup_deadline_elapsed"));
+            return Err(timed_out(CHECK_DEADLINE_ELAPSED_CODE));
         }
         if command.query().consistency() == ConsistencyPreference::HigherConsistency {
             self.decisions.record_bypass();
             return self
                 .delegate
                 .check(command, model, tuples, budget, work_meter, cancellation)
-                .await;
+                .await
+                .map_err(canonicalize_check_control_error);
         }
         let key = DecisionKey::for_check(
             command,
@@ -153,10 +157,10 @@ impl CheckEvaluator for CachedCheckEvaluator {
         );
         if let Some(allowed) = self.decisions.get(&key).await {
             if cancellation.is_cancelled() {
-                return Err(cancelled("decision_cache_hit_cancelled"));
+                return Err(cancelled(CHECK_CANCELLED_CODE));
             }
             if command.query().deadline().is_elapsed(Instant::now()) {
-                return Err(timed_out("decision_cache_hit_deadline_elapsed"));
+                return Err(timed_out(CHECK_DEADLINE_ELAPSED_CODE));
             }
             return Ok(cached_outcome(allowed));
         }
@@ -164,7 +168,8 @@ impl CheckEvaluator for CachedCheckEvaluator {
         let outcome = self
             .delegate
             .check(command, model, tuples, budget, work_meter, cancellation)
-            .await?;
+            .await
+            .map_err(canonicalize_check_control_error)?;
         self.decisions
             .insert_if_unchanged(started_at, key, outcome.allowed())
             .await;
@@ -347,6 +352,7 @@ impl CheckEvaluator for DirectCheckEvaluator {
             cancellation,
         )
         .await
+        .map_err(canonicalize_check_control_error)
     }
 
     async fn batch_check(
@@ -1136,10 +1142,10 @@ impl Scheduler {
             let joined = tokio::select! {
                 biased;
                 () = self.operation.cancellation().cancelled() => {
-                    return Err(cancelled("check_cancelled"));
+                    return Err(cancelled(CHECK_CANCELLED_CODE));
                 }
                 () = sleep_until(deadline) => {
-                    return Err(timed_out("check_deadline_elapsed"));
+                    return Err(timed_out(CHECK_DEADLINE_ELAPSED_CODE));
                 }
                 joined = self.reads.join_next() => joined,
             };
@@ -2049,6 +2055,14 @@ const fn cancelled(code: &'static str) -> CheckError {
 
 const fn timed_out(code: &'static str) -> CheckError {
     CheckError::new(CheckErrorKind::Timeout, code)
+}
+
+fn canonicalize_check_control_error(error: CheckError) -> CheckError {
+    match error.kind() {
+        CheckErrorKind::Cancelled => error.with_code(CHECK_CANCELLED_CODE),
+        CheckErrorKind::Timeout => error.with_code(CHECK_DEADLINE_ELAPSED_CODE),
+        _ => error,
+    }
 }
 
 const fn internal(code: &'static str) -> CheckError {

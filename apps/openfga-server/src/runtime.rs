@@ -19,9 +19,12 @@ use openfga_auth::{AuthenticationService, JwksActor, PresharedKey};
 use openfga_cache::{
     CachedModelStorage, CachedTupleStorage, DecisionCache, DecisionCacheConfig, DecisionKeyHasher,
     InvalidationController, InvalidationControllerConfig, InvalidationControllerDiagnostics,
-    InvalidationWatermark, ModelCacheConfig, TupleCacheConfig,
+    InvalidationControllerHandle, InvalidationWatermark, ModelCacheConfig, TupleCacheConfig,
 };
-use openfga_check::{CachedCheckEvaluator, CheckBudget, CheckEvaluator, DirectCheckEvaluator};
+use openfga_check::{
+    CachedCheckEvaluator, CheckBudget, CheckCoalescingConfig, CheckEvaluator,
+    CoalescingCheckEvaluator, DirectCheckEvaluator,
+};
 use openfga_domain::{
     ConsistencyPreference, Deadline, InputLimits, Limit, RequestTimeout, TokenCodec, TokenKey,
 };
@@ -44,8 +47,8 @@ use openfga_storage_sql::{
     PostgresStorageConfig,
 };
 use openfga_transport::{
-    AuthenticatedGrpcService, OpenFgaApi, OpenFgaServices, TransportConfig, grpc_service,
-    http_router,
+    AuthenticatedGrpcService, OpenFgaApi, OpenFgaServices, TransportConfig, authzen_grpc_service,
+    grpc_service, http_router,
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::Serialize;
@@ -203,6 +206,7 @@ struct ServiceCachePolicy {
     decisions: DecisionCacheConfig,
     tuples: TupleCacheConfig,
     controller: InvalidationControllerConfig,
+    check_coalescing: CheckCoalescingConfig,
 }
 
 impl fmt::Debug for ReadinessDependencies {
@@ -446,6 +450,7 @@ async fn assemble(config: &ServerConfig) -> Result<RuntimeAssembly> {
         .maximum_message_bytes(config.transport.maximum_message_bytes)
         .maximum_concurrency(config.transport.maximum_concurrency)
         .admission_policy(config.admission_policy()?)
+        .authzen(config.authzen_config()?)
         .build();
     let api = OpenFgaApi::new(services, transport)
         .map_err(anyhow::Error::msg)
@@ -561,6 +566,7 @@ fn service_policy(config: &ServerConfig) -> Result<(ServiceBudgets, ServiceCache
         decisions: config.decision_cache_config()?,
         tuples: config.tuple_cache_config()?,
         controller: config.cache_controller_config()?,
+        check_coalescing: config.check_coalescing_config()?,
     };
     Ok((budgets, cache))
 }
@@ -660,12 +666,13 @@ where
     let tuple_writes: Arc<dyn TupleWriter> = cached_tuples;
     let assertion_reads: Arc<dyn AssertionReader> = storage.clone();
     let assertion_writes: Arc<dyn AssertionWriter> = storage.clone();
-    let evaluator: Arc<dyn CheckEvaluator> = Arc::new(CachedCheckEvaluator::new(
-        Arc::new(DirectCheckEvaluator::default()),
-        DecisionCache::with_controller(cache_policy.decisions, invalidation, controller_handle),
-        DecisionKeyHasher::random().map_err(anyhow::Error::new)?,
+    let evaluator = check_evaluator(
+        cache_policy.decisions,
+        cache_policy.check_coalescing,
+        invalidation,
+        controller_handle,
         limits.clone(),
-    ));
+    )?;
     let services = OpenFgaServices::builder()
         .stores(StoreService::new(
             stores.clone(),
@@ -723,6 +730,27 @@ where
         ))
         .build();
     Ok((services, cache_controller))
+}
+
+fn check_evaluator(
+    decision_policy: DecisionCacheConfig,
+    coalescing_policy: CheckCoalescingConfig,
+    invalidation: InvalidationWatermark,
+    controller: InvalidationControllerHandle,
+    limits: InputLimits,
+) -> Result<Arc<dyn CheckEvaluator>> {
+    let cached: Arc<dyn CheckEvaluator> = Arc::new(CachedCheckEvaluator::new(
+        Arc::new(DirectCheckEvaluator::default()),
+        DecisionCache::with_controller(decision_policy, invalidation.clone(), controller),
+        DecisionKeyHasher::random().map_err(anyhow::Error::new)?,
+        limits,
+    ));
+    Ok(Arc::new(CoalescingCheckEvaluator::with_invalidation(
+        cached,
+        coalescing_policy,
+        DecisionKeyHasher::random().map_err(anyhow::Error::new)?,
+        invalidation,
+    )))
 }
 
 fn check_budget(config: &ServerConfig) -> Result<CheckBudget> {
@@ -1100,8 +1128,11 @@ where
             config.transport.maximum_concurrency.min(1_024),
         );
         tasks.spawn(async move {
+            let authzen =
+                authzen_grpc_service(transport.api.clone(), transport.authentication.clone());
             server
                 .add_service(health_service)
+                .add_service(authzen)
                 .add_service(grpc_service(transport.api, transport.authentication))
                 .serve_with_incoming_shutdown(incoming, wait_for_shutdown(shutdown))
                 .await
@@ -1111,8 +1142,10 @@ where
     }
     let incoming = TcpListenerStream::new(listener);
     tasks.spawn(async move {
+        let authzen = authzen_grpc_service(transport.api.clone(), transport.authentication.clone());
         server
             .add_service(health_service)
+            .add_service(authzen)
             .add_service(grpc_service(transport.api, transport.authentication))
             .serve_with_incoming_shutdown(incoming, wait_for_shutdown(shutdown))
             .await

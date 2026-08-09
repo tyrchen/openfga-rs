@@ -381,6 +381,24 @@ impl ApiError {
         )
     }
 
+    pub(crate) const fn authzen_disabled() -> Self {
+        Self::new(
+            StatusCode::NOT_IMPLEMENTED,
+            Code::Unimplemented,
+            "unimplemented",
+            "AuthZEN endpoints are experimental. Enable with authzen.enabled: true",
+        )
+    }
+
+    pub(crate) const fn authzen_discovery_unconfigured() -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            Code::FailedPrecondition,
+            "failed_precondition",
+            "AuthZEN discovery base URL is not configured; set authzen.baseUrl",
+        )
+    }
+
     pub(crate) const fn deadline_exceeded() -> Self {
         Self::new(
             StatusCode::INTERNAL_SERVER_ERROR,
