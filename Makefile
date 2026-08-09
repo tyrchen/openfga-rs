@@ -15,6 +15,7 @@ RUST_WRITER_HTTP_ADDR ?= 127.0.0.1:18085
 RUST_WRITER_GRPC_ADDR ?= 127.0.0.1:18086
 RUST_AUTHZEN_DISABLED_HTTP_ADDR ?= 127.0.0.1:18087
 RUST_AUTHZEN_DISABLED_GRPC_ADDR ?= 127.0.0.1:18088
+SERVER_READINESS_ATTEMPTS ?= 600
 FUZZ_TIME ?= 15
 POSTGRES_TEST_URL ?=
 MYSQL_TEST_URL ?=
@@ -189,13 +190,13 @@ differential-smoke: $(GO_BASELINE) build
 		until curl --fail --silent "$$endpoint" >/dev/null; do \
 			if ! kill -0 "$$go_pid" 2>/dev/null || ! kill -0 "$$rust_pid" 2>/dev/null; then \
 				echo "a compatibility server exited before readiness" >&2; \
-				tail -100 "$$phase0_tmp/go.log" "$$phase0_tmp/rust.log" >&2; \
+				tail -n 100 "$$phase0_tmp/go.log" "$$phase0_tmp/rust.log" >&2; \
 				exit 1; \
 			fi; \
 			attempt=$$((attempt + 1)); \
-			if test "$$attempt" -ge 100; then \
+			if test "$$attempt" -ge "$(SERVER_READINESS_ATTEMPTS)"; then \
 				echo "server did not become ready: $$endpoint" >&2; \
-				tail -100 "$$phase0_tmp/go.log" "$$phase0_tmp/rust.log" >&2; \
+				tail -n 100 "$$phase0_tmp/go.log" "$$phase0_tmp/rust.log" >&2; \
 				exit 1; \
 			fi; \
 			sleep 0.1; \
@@ -264,13 +265,13 @@ phase2-compatibility: $(GO_BASELINE) build
 		until curl --insecure --fail --silent "$$endpoint" >/dev/null; do \
 			if ! kill -0 "$$go_pid" 2>/dev/null || ! kill -0 "$$rust_pid" 2>/dev/null; then \
 				echo "a Phase 2 compatibility server exited before readiness" >&2; \
-				tail -100 "$$phase2_tmp/go.log" "$$phase2_tmp/rust.log" >&2; \
+				tail -n 100 "$$phase2_tmp/go.log" "$$phase2_tmp/rust.log" >&2; \
 				exit 1; \
 			fi; \
 			attempt=$$((attempt + 1)); \
-			if test "$$attempt" -ge 150; then \
+			if test "$$attempt" -ge "$(SERVER_READINESS_ATTEMPTS)"; then \
 				echo "Phase 2 server did not become ready: $$endpoint" >&2; \
-				tail -100 "$$phase2_tmp/go.log" "$$phase2_tmp/rust.log" >&2; \
+				tail -n 100 "$$phase2_tmp/go.log" "$$phase2_tmp/rust.log" >&2; \
 				exit 1; \
 			fi; \
 			sleep 0.1; \
@@ -408,13 +409,13 @@ check-differential: $(GO_BASELINE) build
 		until curl --fail --silent "$$endpoint" >/dev/null; do \
 			if ! kill -0 "$$go_pid" 2>/dev/null || ! kill -0 "$$rust_pid" 2>/dev/null; then \
 				echo "a Check compatibility server exited before readiness" >&2; \
-				tail -100 "$$phase1_tmp/go.log" "$$phase1_tmp/rust.log" >&2; \
+				tail -n 100 "$$phase1_tmp/go.log" "$$phase1_tmp/rust.log" >&2; \
 				exit 1; \
 			fi; \
 			attempt=$$((attempt + 1)); \
-			if test "$$attempt" -ge 100; then \
+			if test "$$attempt" -ge "$(SERVER_READINESS_ATTEMPTS)"; then \
 				echo "Check server did not become ready: $$endpoint" >&2; \
-				tail -100 "$$phase1_tmp/go.log" "$$phase1_tmp/rust.log" >&2; \
+				tail -n 100 "$$phase1_tmp/go.log" "$$phase1_tmp/rust.log" >&2; \
 				exit 1; \
 			fi; \
 			sleep 0.1; \
@@ -449,13 +450,13 @@ enumeration-differential: $(GO_BASELINE) build
 		until curl --fail --silent "$$endpoint" >/dev/null; do \
 			if ! kill -0 "$$go_pid" 2>/dev/null || ! kill -0 "$$rust_pid" 2>/dev/null; then \
 				echo "an enumeration differential server exited before readiness" >&2; \
-				tail -100 "$$phase3_tmp/go.log" "$$phase3_tmp/rust.log" >&2; \
+				tail -n 100 "$$phase3_tmp/go.log" "$$phase3_tmp/rust.log" >&2; \
 				exit 1; \
 			fi; \
 			attempt=$$((attempt + 1)); \
-			if test "$$attempt" -ge 100; then \
+			if test "$$attempt" -ge "$(SERVER_READINESS_ATTEMPTS)"; then \
 				echo "enumeration server did not become ready: $$endpoint" >&2; \
-				tail -100 "$$phase3_tmp/go.log" "$$phase3_tmp/rust.log" >&2; \
+				tail -n 100 "$$phase3_tmp/go.log" "$$phase3_tmp/rust.log" >&2; \
 				exit 1; \
 			fi; \
 			sleep 0.1; \
@@ -498,13 +499,13 @@ authzen-differential: $(GO_BASELINE) build
 		until curl --fail --silent "$$endpoint" >/dev/null; do \
 			if ! kill -0 "$$go_pid" 2>/dev/null || ! kill -0 "$$rust_pid" 2>/dev/null; then \
 				echo "an AuthZEN differential server exited before readiness" >&2; \
-				tail -100 "$$phase6_tmp/go.log" "$$phase6_tmp/rust.log" >&2; \
+				tail -n 100 "$$phase6_tmp/go.log" "$$phase6_tmp/rust.log" >&2; \
 				exit 1; \
 			fi; \
 			attempt=$$((attempt + 1)); \
-			if test "$$attempt" -ge 100; then \
+			if test "$$attempt" -ge "$(SERVER_READINESS_ATTEMPTS)"; then \
 				echo "AuthZEN server did not become ready: $$endpoint" >&2; \
-				tail -100 "$$phase6_tmp/go.log" "$$phase6_tmp/rust.log" >&2; \
+				tail -n 100 "$$phase6_tmp/go.log" "$$phase6_tmp/rust.log" >&2; \
 				exit 1; \
 			fi; \
 			sleep 0.1; \
@@ -552,13 +553,13 @@ authzen-conformance: authzen-baseline build
 		until curl --fail --silent "$$endpoint" >/dev/null; do \
 			if ! kill -0 "$$rust_pid" 2>/dev/null || ! kill -0 "$$disabled_rust_pid" 2>/dev/null; then \
 				echo "a Rust AuthZEN conformance server exited before readiness" >&2; \
-				tail -100 "$$phase6_tmp/rust.log" "$$phase6_tmp/rust-disabled.log" >&2; \
+				tail -n 100 "$$phase6_tmp/rust.log" "$$phase6_tmp/rust-disabled.log" >&2; \
 				exit 1; \
 			fi; \
 			attempt=$$((attempt + 1)); \
-			if test "$$attempt" -ge 100; then \
+			if test "$$attempt" -ge "$(SERVER_READINESS_ATTEMPTS)"; then \
 				echo "Rust AuthZEN conformance server did not become ready: $$endpoint" >&2; \
-				tail -100 "$$phase6_tmp/rust.log" "$$phase6_tmp/rust-disabled.log" >&2; \
+				tail -n 100 "$$phase6_tmp/rust.log" "$$phase6_tmp/rust-disabled.log" >&2; \
 				exit 1; \
 			fi; \
 			sleep 0.1; \
@@ -587,7 +588,7 @@ phase4-scale: $(GO_BASELINE) build-release
 		test -z "$$rust_pid" || wait "$$rust_pid" 2>/dev/null || true; \
 		test -z "$$writer_pid" || wait "$$writer_pid" 2>/dev/null || true; \
 		if test "$$phase4_status" -ne 0; then \
-			tail -100 "$$phase4_tmp/go.log" "$$phase4_tmp/rust.log" "$$phase4_tmp/writer.log" 2>/dev/null || true; \
+			tail -n 100 "$$phase4_tmp/go.log" "$$phase4_tmp/rust.log" "$$phase4_tmp/writer.log" 2>/dev/null || true; \
 		fi; \
 		rm -rf "$$phase4_tmp"; \
 		return "$$phase4_status"; \
@@ -621,11 +622,11 @@ phase4-scale: $(GO_BASELINE) build-release
 		until curl --fail --silent "$$endpoint" >/dev/null; do \
 			if ! kill -0 "$$go_pid" 2>/dev/null || ! kill -0 "$$rust_pid" 2>/dev/null; then \
 				echo "a Phase 4 scale server exited before readiness" >&2; \
-				tail -100 "$$phase4_tmp/go.log" "$$phase4_tmp/rust.log" >&2; \
+				tail -n 100 "$$phase4_tmp/go.log" "$$phase4_tmp/rust.log" >&2; \
 				exit 1; \
 			fi; \
 			attempt=$$((attempt + 1)); \
-			test "$$attempt" -lt 150 || { echo "Phase 4 server did not become ready: $$endpoint" >&2; exit 1; }; \
+			test "$$attempt" -lt "$(SERVER_READINESS_ATTEMPTS)" || { echo "Phase 4 server did not become ready: $$endpoint" >&2; exit 1; }; \
 			sleep 0.1; \
 		done; \
 	done; \
@@ -651,11 +652,11 @@ phase4-scale: $(GO_BASELINE) build-release
 		until curl --fail --silent "http://$(RUST_WRITER_HTTP_ADDR)/readyz" >/dev/null; do \
 			if ! kill -0 "$$writer_pid" 2>/dev/null; then \
 				echo "the Phase 4 writer server exited before readiness" >&2; \
-				tail -100 "$$phase4_tmp/writer.log" >&2; \
+				tail -n 100 "$$phase4_tmp/writer.log" >&2; \
 				exit 1; \
 			fi; \
 			attempt=$$((attempt + 1)); \
-			test "$$attempt" -lt 150 || { echo "Phase 4 writer did not become ready" >&2; exit 1; }; \
+			test "$$attempt" -lt "$(SERVER_READINESS_ATTEMPTS)" || { echo "Phase 4 writer did not become ready" >&2; exit 1; }; \
 			sleep 0.1; \
 		done; \
 		writer_arg="--writer-url http://$(RUST_WRITER_HTTP_ADDR)/"; \
