@@ -21,7 +21,7 @@ impl OpenFgaApi {
         authorization_model_id: &str,
     ) -> Result<az::EvaluationResponse, ApiError> {
         self.ensure_authzen_enabled()?;
-        ApiError::validate(&request)?;
+        ApiError::validate_cached(&self.wire_cache, &request)?;
         let check = build_check_request(
             request.store_id,
             authorization_model_id,
@@ -44,7 +44,7 @@ impl OpenFgaApi {
         authorization_model_id: &str,
     ) -> Result<az::EvaluationsResponse, ApiError> {
         self.ensure_authzen_enabled()?;
-        ApiError::validate(&request)?;
+        ApiError::validate_cached(&self.wire_cache, &request)?;
         if request.evaluations.is_empty() {
             let response = self
                 .authzen_evaluation(
@@ -186,7 +186,7 @@ impl OpenFgaApi {
         authorization_model_id: &str,
     ) -> Result<az::SubjectSearchResponse, ApiError> {
         self.ensure_authzen_enabled()?;
-        ApiError::validate(&request)?;
+        ApiError::validate_cached(&self.wire_cache, &request)?;
         let resource = request
             .resource
             .as_ref()
@@ -256,7 +256,7 @@ impl OpenFgaApi {
         authorization_model_id: &str,
     ) -> Result<az::ResourceSearchResponse, ApiError> {
         self.ensure_authzen_enabled()?;
-        ApiError::validate(&request)?;
+        ApiError::validate_cached(&self.wire_cache, &request)?;
         let subject = request
             .subject
             .as_ref()
@@ -314,7 +314,7 @@ impl OpenFgaApi {
     ) -> Result<az::ActionSearchResponse, ApiError> {
         self.ensure_authzen_enabled()?;
         self.preauthorize(principal, PolicyAction::BatchCheck, Some(&request.store_id))?;
-        ApiError::validate(&request)?;
+        ApiError::validate_cached(&self.wire_cache, &request)?;
         self.authorize_store(principal, PolicyAction::BatchCheck, &request.store_id)?;
         let subject = request
             .subject
@@ -410,7 +410,7 @@ impl OpenFgaApi {
     ) -> Result<az::GetConfigurationResponse, ApiError> {
         self.ensure_authzen_enabled()?;
         self.preauthorize(principal, PolicyAction::GetStore, Some(&request.store_id))?;
-        ApiError::validate(&request)?;
+        ApiError::validate_cached(&self.wire_cache, &request)?;
         self.authorize_store(principal, PolicyAction::GetStore, &request.store_id)?;
         let base = self
             .config

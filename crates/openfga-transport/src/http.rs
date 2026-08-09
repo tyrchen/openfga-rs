@@ -7,7 +7,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     pin::Pin,
     sync::{
-        Arc, OnceLock,
+        Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     task::{Context, Poll},
@@ -30,7 +30,7 @@ use openfga_domain::{ObjectRef, Principal};
 use openfga_list::ListError;
 use openfga_proto::{authzen::v1 as az, openfga::v1 as pb};
 use openfga_service::ServiceError;
-use prost_reflect::{DescriptorPool, Kind, MessageDescriptor};
+use prost_reflect::{Kind, MessageDescriptor};
 use serde::{
     Deserialize, Deserializer, Serialize,
     de::{DeserializeSeed, Error as _, IgnoredAny, MapAccess, SeqAccess, Visitor},
@@ -52,6 +52,7 @@ use crate::{
     api::EndpointPermit,
     authzen::{AUTHORIZATION_MODEL_ID_HEADER, authorization_model_id},
     error::HttpCompletionClass,
+    validation::{WireCache, with_http_validation_key},
 };
 
 const REQUEST_ID_HEADER: HeaderName = HeaderName::from_static("x-request-id");
@@ -257,6 +258,15 @@ async fn normalize_proto_json(
     let Ok(bytes) = to_bytes(body, api.config.maximum_message_bytes).await else {
         return ApiError::payload_too_large().into_response();
     };
+    let validation_key =
+        WireCache::http_validation_key(&descriptor, parts.uri.path(), bytes.clone());
+    if let Some(normalized) = api.wire_cache.normalized_json(&descriptor, &bytes) {
+        return with_http_validation_key(
+            validation_key,
+            next.run(Request::from_parts(parts, Body::from(normalized))),
+        )
+        .await;
+    }
     let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
     let mut value = match JsonSeed::Message(descriptor.clone()).deserialize(&mut deserializer) {
         Ok(value) => value.0,
@@ -273,11 +283,17 @@ async fn normalize_proto_json(
         Ok(_) => {}
         Err(error) => return error.into_response(),
     }
-    let body = match serde_json::to_vec(&value) {
-        Ok(value) => Body::from(value),
+    let normalized = match serde_json::to_vec(&value) {
+        Ok(value) => Bytes::from(value),
         Err(_) => return ApiError::internal().into_response(),
     };
-    next.run(Request::from_parts(parts, body)).await
+    api.wire_cache
+        .cache_normalized_json(&descriptor, bytes, normalized.clone());
+    with_http_validation_key(
+        validation_key,
+        next.run(Request::from_parts(parts, Body::from(normalized))),
+    )
+    .await
 }
 
 fn request_message_descriptor(
@@ -330,22 +346,11 @@ fn request_message_descriptor(
     };
     descriptor
         .map(|(package, name)| {
-            descriptor_pool()?
+            openfga_proto::DESCRIPTOR_POOL
                 .get_message_by_name(&format!("{package}.{name}"))
                 .ok_or_else(ApiError::internal)
         })
         .transpose()
-}
-
-fn descriptor_pool() -> Result<&'static DescriptorPool, ApiError> {
-    static POOL: OnceLock<DescriptorPool> = OnceLock::new();
-    if let Some(pool) = POOL.get() {
-        return Ok(pool);
-    }
-    let pool = DescriptorPool::decode(openfga_proto::FILE_DESCRIPTOR_SET)
-        .map_err(|_| ApiError::internal())?;
-    let _ = POOL.set(pool);
-    POOL.get().ok_or_else(ApiError::internal)
 }
 
 fn normalize_message_json(

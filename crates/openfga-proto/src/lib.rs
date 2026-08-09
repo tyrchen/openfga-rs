@@ -10,8 +10,10 @@ use std::{
     fmt::{self, Display},
     hash::Hash,
     marker::PhantomData,
+    sync::LazyLock,
 };
 
+use prost_reflect::DescriptorPool;
 use serde::de::{Deserialize, Deserializer, Error as _, MapAccess, Visitor};
 
 #[doc(hidden)]
@@ -156,6 +158,16 @@ include!("generated/route_metadata.rs");
 
 /// Deterministic descriptor set emitted by the pinned protobuf compiler.
 pub const FILE_DESCRIPTOR_SET: &[u8] = include_bytes!("generated/openfga_descriptor.bin");
+
+/// Process-wide protocol descriptor pool shared by every reflected message.
+///
+/// The checked-in descriptor is validated by code generation and `check-proto`. An empty pool is
+/// retained only as a defensive fallback for a corrupted build artifact; reflected descriptor
+/// lookup will then fail explicitly at the generated message boundary.
+#[doc(hidden)]
+pub static DESCRIPTOR_POOL: LazyLock<DescriptorPool> = LazyLock::new(|| {
+    DescriptorPool::decode(FILE_DESCRIPTOR_SET).unwrap_or_else(|_| DescriptorPool::new())
+});
 
 #[cfg(test)]
 mod tests {

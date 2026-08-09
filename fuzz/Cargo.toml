@@ -4,7 +4,7 @@ version = "0.0.0"
 publish = false
 edition = "2024"
 authors = ["Tyr Chen"]
-license = "MIT"
+license = "Apache-2.0"
 rust-version = "1.97.1"
 
 [package.metadata]

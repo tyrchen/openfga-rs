@@ -68,6 +68,7 @@ transport:
   requestTimeoutMs: 5000
   tokenTtlSeconds: 86400
   maximumMessageBytes: 1048576
+  maximumWireCacheBytes: 67108864
   maximumConcurrency: 64
   tokenKeyId: primary
   tokenKeyEnv: OPENFGA_TOKEN_KEY

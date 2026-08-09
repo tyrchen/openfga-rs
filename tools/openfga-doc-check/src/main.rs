@@ -8,10 +8,22 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use config::{Config, File, FileFormat};
+
+const ROOT_MARKDOWN_FILES: &[&str] = &[
+    "README.md",
+    "CHANGELOG.md",
+    "CODE_OF_CONDUCT.md",
+    "CONTRIBUTING.md",
+    "SECURITY.md",
+];
 
 fn main() -> Result<()> {
     let workspace = workspace_root()?;
-    let mut markdown_files = vec![workspace.join("README.md")];
+    let mut markdown_files = ROOT_MARKDOWN_FILES
+        .iter()
+        .map(|file| workspace.join(file))
+        .collect::<Vec<_>>();
     collect_files(&workspace.join("docs"), "md", &mut markdown_files)?;
     collect_files(&workspace.join("specs"), "md", &mut markdown_files)?;
 
@@ -31,6 +43,15 @@ fn main() -> Result<()> {
     )?;
     for file in json_files {
         check_json(&file)?;
+    }
+    let mut yaml_files = Vec::new();
+    collect_files(&workspace.join(".github"), "yml", &mut yaml_files)?;
+    collect_files(&workspace.join(".github"), "yaml", &mut yaml_files)?;
+    for file in yaml_files {
+        check_yaml(&file)?;
+        if file.starts_with(workspace.join(".github/workflows")) {
+            check_workflow_pins(&file)?;
+        }
     }
     Ok(())
 }
@@ -77,6 +98,71 @@ fn check_json(file: &Path) -> Result<()> {
 
 fn parse_json(contents: &str) -> std::result::Result<serde_json::Value, serde_json::Error> {
     serde_json::from_str(contents)
+}
+
+fn check_yaml(file: &Path) -> Result<()> {
+    Config::builder()
+        .add_source(File::from(file).format(FileFormat::Yaml).required(true))
+        .build()
+        .with_context(|| format!("invalid YAML in {}", file.display()))?;
+    Ok(())
+}
+
+// This finite command-line scan has no async runtime in which synchronous filesystem work blocks.
+#[allow(clippy::disallowed_methods)]
+fn check_workflow_pins(file: &Path) -> Result<()> {
+    let contents =
+        fs::read_to_string(file).with_context(|| format!("failed to read {}", file.display()))?;
+    for (index, line) in contents.lines().enumerate() {
+        let value = line.trim_start().trim_start_matches("- ");
+        if let Some(action) = value.strip_prefix("uses:").map(str::trim) {
+            let action = action
+                .split_once('#')
+                .map_or(action, |(value, _)| value)
+                .trim();
+            if action.starts_with("./") {
+                continue;
+            }
+            let Some((_, revision)) = action.rsplit_once('@') else {
+                bail!(
+                    "GitHub Action is not versioned at {}:{}",
+                    file.display(),
+                    index.saturating_add(1),
+                );
+            };
+            if !is_lower_hex(revision, 40) {
+                bail!(
+                    "GitHub Action is not pinned to a lowercase commit SHA at {}:{}",
+                    file.display(),
+                    index.saturating_add(1),
+                );
+            }
+        }
+        if let Some(image) = value.strip_prefix("image:").map(str::trim) {
+            let Some((_, digest)) = image.rsplit_once("@sha256:") else {
+                bail!(
+                    "workflow service image is not digest-pinned at {}:{}",
+                    file.display(),
+                    index.saturating_add(1),
+                );
+            };
+            if !is_lower_hex(digest, 64) {
+                bail!(
+                    "workflow service image has an invalid SHA-256 digest at {}:{}",
+                    file.display(),
+                    index.saturating_add(1),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_lower_hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 // This finite command-line scan has no async runtime in which synchronous filesystem work blocks.
@@ -142,7 +228,7 @@ fn is_external_or_anchor(target: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{inline_link_targets, parse_json};
+    use super::{inline_link_targets, is_lower_hex, parse_json};
 
     #[test]
     fn test_should_extract_multiple_inline_markdown_links() {
@@ -156,5 +242,13 @@ mod tests {
             parse_json(r#"{"groups": [}"#),
             Err(error) if error.is_syntax() || error.is_eof()
         ));
+    }
+
+    #[test]
+    fn test_should_accept_only_exact_lowercase_hex_pins() {
+        assert!(is_lower_hex("0123456789abcdef", 16));
+        assert!(!is_lower_hex("0123456789ABCDEF", 16));
+        assert!(!is_lower_hex("0123456789abcde", 16));
+        assert!(!is_lower_hex("0123456789abcdeg", 16));
     }
 }

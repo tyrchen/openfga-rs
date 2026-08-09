@@ -1,5 +1,7 @@
 CARGO ?= cargo
 RUSTFMT_TOOLCHAIN := nightly-2026-07-29
+ACTIONLINT_VERSION := 1.7.12
+ACTIONLINT_TOOL := .tools/actionlint-$(ACTIONLINT_VERSION)/actionlint
 GO_VERSION := 1.26.5
 GO_TOOL := .tools/go/bin/go
 GO_BASELINE_COMMIT := 4e4f79ed841513dfd61746a75ef473f6198299f7
@@ -20,10 +22,12 @@ COMPAT_STORAGE_BACKEND ?= postgres
 COMPAT_DATABASE_URL ?= $(POSTGRES_TEST_URL)
 CONFIG ?= config/openfga-development.yaml
 PHASE4_BENCH_REQUESTS ?= 25
+PHASE4_BENCH_MUTATION_REQUESTS ?= 5
 PHASE4_CONSISTENCY_ITERATIONS ?= 32
 PHASE4_SOAK_CLIENTS ?= 100
 PHASE4_SOAK_SECONDS ?= 1800
 PHASE4_RSS_GROWTH_KIB ?= 65536
+PHASE4_MAXIMUM_CONCURRENCY ?= 256
 PHASE4_ARTIFACT_DIR ?= target/phase4
 PHASE4_STORAGE_BACKEND ?= memory
 PHASE4_POSTGRES_MIGRATE ?= false
@@ -52,6 +56,7 @@ phase4-criterion:
 	@$(CARGO) bench -p openfga-check --bench check_latency
 	@$(CARGO) bench -p openfga-model --bench model_compile
 	@$(CARGO) bench -p openfga-model --bench model_compile_memory
+	@$(CARGO) bench -p openfga-service --bench identifier_allocation
 
 test:
 	@$(CARGO) test --workspace --all-targets
@@ -67,11 +72,17 @@ clippy-strict:
 	@$(CARGO) clippy --workspace --all-targets -- \
 		-D warnings -W clippy::pedantic -W clippy::unwrap_used \
 		-W clippy::expect_used -W clippy::indexing_slicing -W clippy::panic
+	@$(CARGO) clippy --manifest-path fuzz/Cargo.toml --all-targets -- \
+		-D warnings -W clippy::pedantic -W clippy::unwrap_used \
+		-W clippy::expect_used -W clippy::indexing_slicing -W clippy::panic
 
 doc:
 	@RUSTDOCFLAGS="-D warnings" $(CARGO) doc --workspace --no-deps
 
-check: check-proto check-docs build test fmt clippy doc
+check: check-proto check-docs check-actions check-fuzz build test fmt clippy doc
+
+check-fuzz:
+	@$(CARGO) check --manifest-path fuzz/Cargo.toml --all-targets
 
 validate-config:
 	@$(CARGO) run --quiet -p openfga-server -- validate-config --config "$(CONFIG)"
@@ -87,6 +98,32 @@ migrate-status:
 
 check-docs:
 	@$(CARGO) run --quiet -p openfga-doc-check
+
+$(ACTIONLINT_TOOL):
+	@actionlint_tmp=$$(mktemp -d); \
+	trap 'rm -rf "$$actionlint_tmp"' EXIT; \
+	case "$$(uname -s)-$$(uname -m)" in \
+		Darwin-arm64) platform=darwin_arm64; sha=aba9ced2dee8d27fecca3dc7feb1a7f9a52caefa1eb46f3271ea66b6e0e6953f ;; \
+		Darwin-x86_64) platform=darwin_amd64; sha=5b44c3bc2255115c9b69e30efc0fecdf498fdb63c5d58e17084fd5f16324c644 ;; \
+		Linux-aarch64) platform=linux_arm64; sha=325e971b6ba9bfa504672e29be93c24981eeb1c07576d730e9f7c8805afff0c6 ;; \
+		Linux-x86_64) platform=linux_amd64; sha=8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8 ;; \
+		*) echo "unsupported actionlint platform: $$(uname -s)-$$(uname -m)" >&2; exit 1 ;; \
+	esac; \
+	archive="actionlint_$(ACTIONLINT_VERSION)_$$platform.tar.gz"; \
+	curl --fail --location --silent --show-error \
+		"https://github.com/rhysd/actionlint/releases/download/v$(ACTIONLINT_VERSION)/$$archive" \
+		--output "$$actionlint_tmp/$$archive"; \
+	if command -v shasum >/dev/null 2>&1; then \
+		actual_sha=$$(shasum -a 256 "$$actionlint_tmp/$$archive" | awk '{print $$1}'); \
+	else \
+		actual_sha=$$(sha256sum "$$actionlint_tmp/$$archive" | awk '{print $$1}'); \
+	fi; \
+	test "$$actual_sha" = "$$sha"; \
+	mkdir -p "$(@D)"; \
+	tar -xzf "$$actionlint_tmp/$$archive" -C "$(@D)" actionlint
+
+check-actions: $(ACTIONLINT_TOOL)
+	@$(ACTIONLINT_TOOL) -color
 
 proto:
 	@$(CARGO) run -p openfga-proto-codegen -- --output $(PROTO_OUTPUT)
@@ -574,6 +611,7 @@ phase4-scale: $(GO_BASELINE) build-release
 	OPENFGA__TRANSPORT__ADMISSION__WRITES=1000000 \
 	OPENFGA__TRANSPORT__ADMISSION__CHECKS=1000000 \
 	OPENFGA__TRANSPORT__ADMISSION__ENUMERATION=1000000 \
+	OPENFGA__TRANSPORT__MAXIMUM_CONCURRENCY=$(PHASE4_MAXIMUM_CONCURRENCY) \
 	OPENFGA_DATABASE_URL="$(POSTGRES_TEST_URL)" \
 	OPENFGA_TOKEN_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= \
 	"$$server_binary" run --config config/openfga-development.yaml \
@@ -604,6 +642,7 @@ phase4-scale: $(GO_BASELINE) build-release
 		OPENFGA__TRANSPORT__ADMISSION__WRITES=1000000 \
 		OPENFGA__TRANSPORT__ADMISSION__CHECKS=1000000 \
 		OPENFGA__TRANSPORT__ADMISSION__ENUMERATION=1000000 \
+		OPENFGA__TRANSPORT__MAXIMUM_CONCURRENCY=$(PHASE4_MAXIMUM_CONCURRENCY) \
 		OPENFGA_DATABASE_URL="$(POSTGRES_TEST_URL)" \
 		OPENFGA_TOKEN_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= \
 		"$$server_binary" run --config config/openfga-development.yaml \
@@ -632,6 +671,7 @@ phase4-scale: $(GO_BASELINE) build-release
 		--go-pid "$$go_pid" \
 		--rust-pid "$$rust_pid" \
 		--requests-per-client "$(PHASE4_BENCH_REQUESTS)" \
+		--mutation-requests-per-client "$(PHASE4_BENCH_MUTATION_REQUESTS)" \
 		>"$(PHASE4_ARTIFACT_DIR)/reference-benchmark.json"; \
 	resource_samples="$$phase4_tmp/process-resources.tsv"; \
 	process_threads() { \
@@ -709,6 +749,7 @@ phase4-postgres-scale-smoke:
 		PHASE4_CONSISTENCY_ITERATIONS=8 \
 		PHASE4_SOAK_CLIENTS=16 \
 		PHASE4_SOAK_SECONDS=30 \
+		PHASE4_MAXIMUM_CONCURRENCY=64 \
 		PHASE4_STORAGE_BACKEND=postgres \
 		PHASE4_POSTGRES_MIGRATE=true \
 		PHASE4_SOAK_CONSISTENCY_ARG=--higher-consistency
@@ -730,6 +771,10 @@ phase4-local-postgres-scale-smoke:
 	postgres_started=true; \
 	postgres_url="postgresql://$$(id -un)@127.0.0.1:$(PHASE4_POSTGRES_PORT)/postgres?sslmode=disable"; \
 	$(MAKE) postgres-storage POSTGRES_TEST_URL="$$postgres_url"; \
+	$(MAKE) sqlx-prepare-check POSTGRES_TEST_URL="$$postgres_url"; \
+	$(MAKE) phase2-compatibility \
+		COMPAT_STORAGE_BACKEND=postgres \
+		COMPAT_DATABASE_URL="$$postgres_url"; \
 	$(MAKE) phase4-postgres-scale-smoke \
 		POSTGRES_TEST_URL="$$postgres_url"
 
@@ -785,9 +830,11 @@ fuzz-model:
 
 audit:
 	@$(CARGO) audit
+	@$(CARGO) audit --file fuzz/Cargo.lock
 
 deny:
 	@$(CARGO) deny check
+	@$(CARGO) deny --manifest-path fuzz/Cargo.toml check
 
 $(GITLEAKS_TOOL):
 	@phase5_tmp=$$(mktemp -d); \
@@ -845,7 +892,7 @@ sbom: build-release $(SYFT_TOOL)
 	trap 'rm -rf "$$phase5_tmp"' EXIT; \
 	mkdir -p "$(PHASE5_ARTIFACT_DIR)"; \
 	test -x "$(WORKSPACE_TARGET_DIR)/release/openfga-server"; \
-	cp "$(WORKSPACE_TARGET_DIR)/release/openfga-server" Cargo.lock Cargo.toml LICENSE.md \
+	cp "$(WORKSPACE_TARGET_DIR)/release/openfga-server" Cargo.lock Cargo.toml LICENSE NOTICE \
 		"$$phase5_tmp/"; \
 	$(SYFT_TOOL) scan "dir:$$phase5_tmp" \
 		--source-name openfga-rs --source-version "$$(git rev-parse HEAD)" \
@@ -857,7 +904,13 @@ release-artifacts: build-release sbom
 	artifact="openfga-server-$(PHASE5_PLATFORM).tar.gz"; \
 	test -n "$(WORKSPACE_TARGET_DIR)"; \
 	tar -czf "$(PHASE5_ARTIFACT_DIR)/$$artifact" \
-		-C "$(WORKSPACE_TARGET_DIR)/release" openfga-server; \
+		-C "$(WORKSPACE_TARGET_DIR)/release" openfga-server \
+		-C "$(CURDIR)" LICENSE NOTICE README.md \
+		config/openfga-development.yaml config/openfga-preshared-development.yaml; \
+	for required in openfga-server LICENSE NOTICE README.md \
+		config/openfga-development.yaml config/openfga-preshared-development.yaml; do \
+		tar -tzf "$(PHASE5_ARTIFACT_DIR)/$$artifact" | grep -Fx "$$required" >/dev/null; \
+	done; \
 	cd "$(PHASE5_ARTIFACT_DIR)"; \
 	if command -v shasum >/dev/null 2>&1; then \
 		shasum -a 256 "$$artifact" openfga-rs-$(PHASE5_PLATFORM).cdx.json \
@@ -908,7 +961,7 @@ release:
 update-submodule:
 	@git submodule update --init --recursive --remote
 
-.PHONY: audit build cel-baseline cel-spike check check-agent-sync check-baseline check-corpus-differential check-differential check-docs \
+.PHONY: audit build cel-baseline cel-spike check check-actions check-agent-sync check-baseline check-corpus-differential check-differential check-docs check-fuzz \
 	check-oracle check-proto check-spike \
 	clippy clippy-strict \
 	conformance deny differential-smoke doc enumeration-differential fmt fuzz-condition fuzz-domain fuzz-model go-baseline listobjects-spike model-baseline \

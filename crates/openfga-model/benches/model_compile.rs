@@ -2,16 +2,19 @@
 
 use std::{
     hint::black_box,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
-use criterion::{Criterion, criterion_group, criterion_main};
-use openfga_model::ModelCompiler;
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use openfga_model::{AuthorizationModelSource, ModelCompiler};
+use tokio::{runtime::Runtime, task::JoinSet};
 
 mod support;
 
 const LATENCY_GATE_SAMPLES: usize = 2_000;
 const MODEL_COMPILE_P95_LIMIT: Duration = Duration::from_millis(250);
+const COMPILATION_BURST: usize = 100;
 
 fn benchmark_model_compile(criterion: &mut Criterion) {
     let source = support::maximum_supported_model();
@@ -33,6 +36,48 @@ fn benchmark_model_compile(criterion: &mut Criterion) {
         });
     });
     group.finish();
+
+    let runtime = Runtime::new();
+    assert!(runtime.is_ok(), "benchmark runtime must start");
+    let Ok(runtime) = runtime else {
+        return;
+    };
+    let source = Arc::new(source);
+    let compiler = Arc::new(compiler);
+    let mut group = criterion.benchmark_group("authorization_model_compile_concurrent");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(2));
+    group.throughput(Throughput::Elements(COMPILATION_BURST as u64));
+    group.bench_function("maximum_supported_burst_100", |bencher| {
+        bencher.iter(|| compile_burst(&runtime, Arc::clone(&compiler), Arc::clone(&source)));
+    });
+    group.finish();
+}
+
+fn compile_burst(
+    runtime: &Runtime,
+    compiler: Arc<ModelCompiler>,
+    source: Arc<AuthorizationModelSource>,
+) {
+    let result = runtime.block_on(async move {
+        let mut compilations = JoinSet::new();
+        for _ in 0..COMPILATION_BURST {
+            let compiler = Arc::clone(&compiler);
+            let source = Arc::clone(&source);
+            compilations.spawn(async move {
+                compiler
+                    .compile(&source)
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            });
+        }
+        while let Some(compilation) = compilations.join_next().await {
+            compilation.map_err(|error| error.to_string())??;
+        }
+        Ok::<(), String>(())
+    });
+    assert!(result.is_ok(), "concurrent model compilation must succeed");
 }
 
 fn gate_p95(compiler: &ModelCompiler, source: &openfga_model::AuthorizationModelSource) {

@@ -211,7 +211,7 @@ async fn main() -> Result<()> {
     prost_config.extern_path(".google.protobuf", "::pbjson_types");
     prost_reflect_build::Builder::new()
         .file_descriptor_set_path(&descriptor_path)
-        .file_descriptor_set_bytes("crate::FILE_DESCRIPTOR_SET")
+        .descriptor_pool("crate::DESCRIPTOR_POOL")
         .configure(&mut prost_config, &proto_inputs, &includes)
         .context("failed to configure pinned protobuf reflection")?;
     tokio::fs::remove_dir_all(&reflection_bootstrap)

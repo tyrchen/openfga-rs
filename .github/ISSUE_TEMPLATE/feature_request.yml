@@ -1,0 +1,44 @@
+name: Feature request
+description: Propose a scoped compatibility, operator, or contributor improvement.
+title: "feat: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What concrete user or operator problem needs to be solved?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the API/configuration/operational contract, not only an implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: compatibility
+    attributes:
+      label: OpenFGA compatibility
+      description: Link the relevant upstream API/behavior and identify the pinned or proposed revision.
+  - type: textarea
+    id: constraints
+    attributes:
+      label: Security, consistency, and resource bounds
+      description: Explain trust boundaries, failure behavior, migration, and finite-resource policy.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I searched existing issues, specifications, and the compatibility matrix.
+          required: true

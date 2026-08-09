@@ -188,7 +188,7 @@ macro_rules! unary {
             endpoint_permit.complete("timeout");
             return Err(Status::deadline_exceeded("Request Deadline Exceeded"));
         }
-        if let Err(error) = ApiError::validate_grpc($request.get_ref()) {
+        if let Err(error) = ApiError::validate_grpc_cached(&$self.wire_cache, $request.get_ref()) {
             endpoint_permit.complete("client_error");
             return Err(Status::from(error));
         }
@@ -235,7 +235,7 @@ macro_rules! authzen_unary {
             }
             GrpcDeadline::At(deadline) => deadline,
         };
-        if let Err(error) = ApiError::validate_grpc($request.get_ref()) {
+        if let Err(error) = ApiError::validate_grpc_cached(&$self.wire_cache, $request.get_ref()) {
             endpoint_permit.complete("client_error");
             return Err(Status::from(error));
         }
@@ -698,7 +698,7 @@ fn validate_unimplemented<T: ReflectMessage>(
         permit.complete("timeout");
         return Err(Status::deadline_exceeded("Request Deadline Exceeded"));
     }
-    if let Err(error) = ApiError::validate_grpc(request.get_ref()) {
+    if let Err(error) = ApiError::validate_grpc_cached(&api.wire_cache, request.get_ref()) {
         permit.complete("client_error");
         return Err(Status::from(error));
     }
@@ -735,7 +735,7 @@ fn validate_streaming<T: ReflectMessage>(
         permit.complete("timeout");
         return Err(Status::deadline_exceeded("Request Deadline Exceeded"));
     }
-    if let Err(error) = ApiError::validate_grpc(request.get_ref()) {
+    if let Err(error) = ApiError::validate_grpc_cached(&api.wire_cache, request.get_ref()) {
         permit.complete("client_error");
         return Err(Status::from(error));
     }

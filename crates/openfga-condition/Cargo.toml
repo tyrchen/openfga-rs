@@ -7,10 +7,12 @@ edition.workspace = true
 license.workspace = true
 readme.workspace = true
 rust-version.workspace = true
+publish = false
 
 [dependencies]
 cel-parser.workspace = true
 jiff.workspace = true
+moka.workspace = true
 openfga-domain.workspace = true
 thiserror.workspace = true
 typed-builder.workspace = true

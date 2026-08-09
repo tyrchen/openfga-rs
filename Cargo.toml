@@ -7,13 +7,13 @@ resolver = "3"
 version = "0.1.0"
 authors = ["Tyr Chen"]
 edition = "2024"
-license = "MIT"
+license = "Apache-2.0"
 readme = "README.md"
 rust-version = "1.97.1"
 
 [workspace.dependencies]
 anyhow = { version = "~1.0.104", default-features = false, features = ["std"] }
-async-trait = "~0.1.91"
+async-trait = "~0.1.92"
 axum = { version = "~0.8.9", default-features = false, features = ["http1", "json", "query", "tokio"] }
 axum-server = { version = "~0.8.0", default-features = false, features = ["tls-rustls"] }
 base64 = { version = "~0.23.1", default-features = false, features = ["std"] }
@@ -22,7 +22,7 @@ config = { version = "~0.15.25", default-features = false, features = ["convert-
 criterion = { version = "~0.8.2", default-features = false }
 dhat = { version = "~0.3.3", default-features = false }
 getrandom = { version = "~0.4.3", default-features = false, features = ["std"] }
-clap = { version = "~4.6.5", default-features = false, features = ["derive", "error-context", "help", "std", "usage"] }
+clap = { version = "~4.6.6", default-features = false, features = ["derive", "error-context", "help", "std", "usage"] }
 hmac = { version = "~0.13.0", default-features = false, features = ["zeroize"] }
 jiff = { version = "~0.2.35", default-features = false, features = ["std"] }
 jsonwebtoken = { version = "~11.0.0", default-features = false, features = ["aws_lc_rs"] }
@@ -43,14 +43,14 @@ prost-types = { version = "~0.14.4", default-features = false }
 protoc-bin-vendored = "~3.2.0"
 proptest = { version = "~1.11.0", default-features = false, features = ["std"] }
 reqwest = { version = "~0.13.4", default-features = false, features = ["http2", "json", "rustls"] }
-rustls = { version = "~0.23.35", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+rustls = { version = "~0.23.43", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 secrecy = { version = "~0.10.3", default-features = false }
 serde = { version = "~1.0.229", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "~1.0.151", default-features = false, features = ["std"] }
 sha2 = { version = "~0.11.0", default-features = false }
 sqlx = { version = "~0.9.0", default-features = false, features = ["any", "derive", "macros", "migrate", "mysql", "postgres", "runtime-tokio", "sqlite", "tls-rustls-aws-lc-rs"] }
 subtle = { version = "~2.6.1", default-features = false, features = ["std"] }
-thiserror = { version = "~2.0.19", default-features = false, features = ["std"] }
+thiserror = { version = "~2.0.20", default-features = false, features = ["std"] }
 tokio = { version = "~1.53.1", default-features = false, features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-rustls = { version = "~0.26.4", default-features = false, features = ["aws_lc_rs", "tls12"] }
 tokio-stream = { version = "~0.1.19", default-features = false, features = ["net"] }

@@ -25,7 +25,9 @@ use prost_validate::{
 use serde::Serialize;
 use tonic::Code;
 
+#[cfg(test)]
 use crate::validation::validate_all;
+use crate::validation::{WireCache, validate_all_cached};
 
 const INVALID_TIMESTAMP_PREFIX: &str = "openfga_invalid_timestamp:";
 
@@ -69,19 +71,49 @@ impl ApiError {
     /// # Errors
     ///
     /// Returns the exact public `OpenFGA` structural-validation failure.
+    #[cfg(test)]
     pub(crate) fn validate<T: ReflectMessage>(request: &T) -> Result<(), Self> {
         Self::from_validations(&validate_all(request))
     }
 
+    /// Validates one exact generated request with bounded successful-result memoization.
+    pub(crate) fn validate_cached<T: ReflectMessage>(
+        cache: &WireCache,
+        request: &T,
+    ) -> Result<(), Self> {
+        Self::from_validations(&validate_all_cached(cache, request))
+    }
+
     /// Applies ordered `ValidateAll` with generated gRPC nested-cause formatting.
+    #[cfg(test)]
     pub(crate) fn validate_grpc<T: ReflectMessage>(request: &T) -> Result<(), Self> {
         Self::from_nested_validations(&validate_all(request))
     }
 
+    /// Applies ordered gRPC validation with bounded successful-result memoization.
+    pub(crate) fn validate_grpc_cached<T: ReflectMessage>(
+        cache: &WireCache,
+        request: &T,
+    ) -> Result<(), Self> {
+        Self::from_nested_validations(&validate_all_cached(cache, request))
+    }
+
+    #[cfg(test)]
     pub(crate) fn validate_write_authorization_model(
         request: &pb::WriteAuthorizationModelRequest,
     ) -> Result<(), Self> {
-        let mut violations = validate_all(request)
+        Self::validate_write_authorization_model_errors(&validate_all(request))
+    }
+
+    pub(crate) fn validate_write_authorization_model_cached(
+        cache: &WireCache,
+        request: &pb::WriteAuthorizationModelRequest,
+    ) -> Result<(), Self> {
+        Self::validate_write_authorization_model_errors(&validate_all_cached(cache, request))
+    }
+
+    fn validate_write_authorization_model_errors(errors: &[ValidationError]) -> Result<(), Self> {
+        let mut violations = errors
             .iter()
             .map(ValidationViolation::from_error)
             .collect::<Vec<_>>();
@@ -102,16 +134,12 @@ impl ApiError {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn validate_list_objects(request: &pb::ListObjectsRequest) -> Result<(), Self> {
         Self::validate(request)
     }
 
-    pub(crate) fn validate_streamed_list_objects(
-        request: &pb::StreamedListObjectsRequest,
-    ) -> Result<(), Self> {
-        Self::validate(request)
-    }
-
+    #[cfg(test)]
     pub(crate) fn validate_list_users(request: &pb::ListUsersRequest) -> Result<(), Self> {
         Self::validate(request)
     }

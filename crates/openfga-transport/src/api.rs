@@ -39,6 +39,7 @@ use crate::{
     admission::{AdmissionControl, EndpointClass},
     convert,
     pagination::{self, GLOBAL_SCOPE_STORE},
+    validation::WireCache,
 };
 
 const MAX_AUTHORIZATION_MODEL_BYTES: usize = 262_144;
@@ -62,6 +63,7 @@ pub struct OpenFgaApi {
     pub(crate) services: OpenFgaServices,
     pub(crate) config: TransportConfig,
     pub(crate) admission: AdmissionControl,
+    pub(crate) wire_cache: WireCache,
     endpoint_permits: Arc<Semaphore>,
     transport_metrics: TransportMetrics,
 }
@@ -230,10 +232,12 @@ impl OpenFgaApi {
         config.validate()?;
         let endpoint_permits = Arc::new(Semaphore::new(config.maximum_concurrency));
         let admission = AdmissionControl::new(config.admission_policy)?;
+        let wire_cache = WireCache::new(config.maximum_wire_cache_weight);
         Ok(Self {
             services,
             config,
             admission,
+            wire_cache,
             endpoint_permits,
             transport_metrics: TransportMetrics::new(),
         })
@@ -246,7 +250,7 @@ impl OpenFgaApi {
         request: pb::CreateStoreRequest,
     ) -> Result<pb::CreateStoreResponse, ApiError> {
         self.preauthorize(principal, Action::CreateStore, None)?;
-        ApiError::validate(&request)?;
+        ApiError::validate_cached(&self.wire_cache, &request)?;
         self.authorize_system(principal, Action::CreateStore)?;
         let record = self
             .services
@@ -267,7 +271,7 @@ impl OpenFgaApi {
         request: pb::GetStoreRequest,
     ) -> Result<pb::GetStoreResponse, ApiError> {
         self.preauthorize(principal, Action::GetStore, Some(&request.store_id))?;
-        ApiError::validate(&request)?;
+        ApiError::validate_cached(&self.wire_cache, &request)?;
         self.authorize_store(principal, Action::GetStore, &request.store_id)?;
         let record = self
             .services
@@ -288,7 +292,7 @@ impl OpenFgaApi {
         request: pb::DeleteStoreRequest,
     ) -> Result<pb::DeleteStoreResponse, ApiError> {
         self.preauthorize(principal, Action::DeleteStore, Some(&request.store_id))?;
-        ApiError::validate(&request)?;
+        ApiError::validate_cached(&self.wire_cache, &request)?;
         self.authorize_store(principal, Action::DeleteStore, &request.store_id)?;
         self.services
             .stores
@@ -308,7 +312,7 @@ impl OpenFgaApi {
         request: pb::ListStoresRequest,
     ) -> Result<pb::ListStoresResponse, ApiError> {
         self.preauthorize(principal, Action::ListStores, None)?;
-        ApiError::validate(&request)?;
+        ApiError::validate_cached(&self.wire_cache, &request)?;
         self.authorize_system(principal, Action::ListStores)?;
         let filter = if request.name.is_empty() {
             StoreFilter::all()
@@ -360,7 +364,7 @@ impl OpenFgaApi {
             Action::WriteAuthorizationModel,
             Some(&request.store_id),
         )?;
-        ApiError::validate_write_authorization_model(&request)?;
+        ApiError::validate_write_authorization_model_cached(&self.wire_cache, &request)?;
         if request.type_definitions.len() > 100 {
             return Err(ApiError::authorization_model_type_limit());
         }
@@ -404,7 +408,7 @@ impl OpenFgaApi {
             Action::ReadAuthorizationModels,
             Some(&request.store_id),
         )?;
-        ApiError::validate(&request)?;
+        ApiError::validate_cached(&self.wire_cache, &request)?;
         self.authorize_store(
             principal,
             Action::ReadAuthorizationModels,
@@ -436,7 +440,7 @@ impl OpenFgaApi {
             Action::ReadAuthorizationModels,
             Some(&request.store_id),
         )?;
-        ApiError::validate(&request)?;
+        ApiError::validate_cached(&self.wire_cache, &request)?;
         self.authorize_store(
             principal,
             Action::ReadAuthorizationModels,
@@ -480,7 +484,7 @@ impl OpenFgaApi {
         request: pb::WriteAssertionsRequest,
     ) -> Result<pb::WriteAssertionsResponse, ApiError> {
         self.preauthorize(principal, Action::WriteAssertions, Some(&request.store_id))?;
-        ApiError::validate(&request)?;
+        ApiError::validate_cached(&self.wire_cache, &request)?;
         self.authorize_store(principal, Action::WriteAssertions, &request.store_id)?;
         let assertion_bytes = request
             .assertions
@@ -537,7 +541,7 @@ impl OpenFgaApi {
         request: pb::ReadAssertionsRequest,
     ) -> Result<pb::ReadAssertionsResponse, ApiError> {
         self.preauthorize(principal, Action::ReadAssertions, Some(&request.store_id))?;
-        ApiError::validate(&request)?;
+        ApiError::validate_cached(&self.wire_cache, &request)?;
         self.authorize_store(principal, Action::ReadAssertions, &request.store_id)?;
         let assertions = self
             .services
@@ -566,7 +570,7 @@ impl OpenFgaApi {
         request: pb::ReadRequest,
     ) -> Result<pb::ReadResponse, ApiError> {
         self.preauthorize(principal, Action::Read, Some(&request.store_id))?;
-        ApiError::validate(&request)?;
+        ApiError::validate_cached(&self.wire_cache, &request)?;
         self.authorize_store(principal, Action::Read, &request.store_id)?;
         let store_id = convert::store_id(&request.store_id)?;
         let filter = convert::tuple_read_filter(request.tuple_key.as_ref(), &self.config.limits)?;
@@ -608,7 +612,7 @@ impl OpenFgaApi {
         request: pb::WriteRequest,
     ) -> Result<pb::WriteResponse, ApiError> {
         self.preauthorize(principal, Action::Write, Some(&request.store_id))?;
-        ApiError::validate(&request)?;
+        ApiError::validate_cached(&self.wire_cache, &request)?;
         self.authorize_store(principal, Action::Write, &request.store_id)?;
         let condition_context_sizes = request
             .writes
@@ -699,7 +703,7 @@ impl OpenFgaApi {
         request: pb::ReadChangesRequest,
     ) -> Result<pb::ReadChangesResponse, ApiError> {
         self.preauthorize(principal, Action::ReadChanges, Some(&request.store_id))?;
-        ApiError::validate(&request)?;
+        ApiError::validate_cached(&self.wire_cache, &request)?;
         self.authorize_store(principal, Action::ReadChanges, &request.store_id)?;
         let store_id = convert::store_id(&request.store_id)?;
         let object_type = (!request.r#type.is_empty())
@@ -750,7 +754,7 @@ impl OpenFgaApi {
         request: pb::CheckRequest,
     ) -> Result<pb::CheckResponse, ApiError> {
         self.preauthorize(principal, Action::Check, Some(&request.store_id))?;
-        ApiError::validate(&request)?;
+        ApiError::validate_cached(&self.wire_cache, &request)?;
         self.authorize_store(principal, Action::Check, &request.store_id)?;
         let store_id = convert::store_id(&request.store_id)?;
         let model_selection = convert::model_selection(&request.authorization_model_id)?;
@@ -822,7 +826,7 @@ impl OpenFgaApi {
         request: pb::BatchCheckRequest,
     ) -> Result<pb::BatchCheckResponse, ApiError> {
         self.preauthorize(principal, Action::BatchCheck, Some(&request.store_id))?;
-        ApiError::validate(&request)?;
+        ApiError::validate_cached(&self.wire_cache, &request)?;
         self.authorize_store(principal, Action::BatchCheck, &request.store_id)?;
         let store_id = convert::store_id(&request.store_id)?;
         let model_selection = convert::model_selection(&request.authorization_model_id)?;
@@ -903,7 +907,7 @@ impl OpenFgaApi {
         request: pb::ListObjectsRequest,
     ) -> Result<pb::ListObjectsResponse, ApiError> {
         self.preauthorize(principal, Action::ListObjects, Some(&request.store_id))?;
-        ApiError::validate_list_objects(&request)?;
+        ApiError::validate_cached(&self.wire_cache, &request)?;
         self.authorize_store(principal, Action::ListObjects, &request.store_id)?;
         let store_id = convert::store_id(&request.store_id)?;
         let model_selection = convert::model_selection(&request.authorization_model_id)?;
@@ -956,7 +960,7 @@ impl OpenFgaApi {
             Action::StreamedListObjects,
             Some(&request.store_id),
         )?;
-        ApiError::validate_streamed_list_objects(&request)?;
+        ApiError::validate_cached(&self.wire_cache, &request)?;
         self.authorize_store(principal, Action::StreamedListObjects, &request.store_id)?;
         let store_id = convert::store_id(&request.store_id)?;
         let model_selection = convert::model_selection(&request.authorization_model_id)?;
@@ -1050,7 +1054,7 @@ impl OpenFgaApi {
         request: pb::ExpandRequest,
     ) -> Result<pb::ExpandResponse, ApiError> {
         self.preauthorize(principal, Action::Expand, Some(&request.store_id))?;
-        ApiError::validate(&request)?;
+        ApiError::validate_cached(&self.wire_cache, &request)?;
         self.authorize_store(principal, Action::Expand, &request.store_id)?;
         let store_id = convert::store_id(&request.store_id)?;
         let model_selection = convert::model_selection(&request.authorization_model_id)?;
@@ -1112,7 +1116,7 @@ impl OpenFgaApi {
         request: pb::ListUsersRequest,
     ) -> Result<pb::ListUsersResponse, ApiError> {
         self.preauthorize(principal, Action::ListUsers, Some(&request.store_id))?;
-        ApiError::validate_list_users(&request)?;
+        ApiError::validate_cached(&self.wire_cache, &request)?;
         self.authorize_store(principal, Action::ListUsers, &request.store_id)?;
         let store_id = convert::store_id(&request.store_id)?;
         let model_selection = convert::model_selection(&request.authorization_model_id)?;
@@ -1380,6 +1384,7 @@ impl fmt::Debug for OpenFgaApi {
             .field("services", &self.services)
             .field("config", &self.config)
             .field("admission", &self.admission)
+            .field("wire_cache", &self.wire_cache)
             .finish_non_exhaustive()
     }
 }

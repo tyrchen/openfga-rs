@@ -35,6 +35,10 @@ No test-only unsafe or production panic shortcuts. Deterministic clocks, IDs, ra
 
 Architecture/spec changes update `specs/index.md` and the decision log. Research belongs under `docs/research` and is source-pinned. Public behavior has doc examples and operator docs. Pull requests state upstream baseline, semantic risks, tests run, performance evidence when relevant, and migration/security impact.
 
+Project contributions are Apache-2.0. Source and binary distributions retain `LICENSE`, project and
+upstream `NOTICE` attribution, and all separately vendored license material. Dependency-license
+policy is distinct from the project license and remains enforced over the complete resolved graph.
+
 ## Acceptance criteria
 
 - A clean checkout builds and regenerates documented artifacts with pinned tools.

@@ -151,6 +151,9 @@ enum Command {
         /// Sequential requests issued by each client at each concurrency level.
         #[arg(long, default_value_t = 25)]
         requests_per_client: usize,
+        /// Sequential mutation requests issued by each client at each concurrency level.
+        #[arg(long, default_value_t = 1)]
+        mutation_requests_per_client: usize,
     },
     /// Apply a fixed-concurrency Check soak to the complete Rust server.
     Phase4Soak {
@@ -255,12 +258,14 @@ async fn main() -> Result<()> {
             go_pid,
             rust_pid,
             requests_per_client,
+            mutation_requests_per_client,
         } => phase4_scale::run_reference_benchmark(
             &go_url,
             &rust_url,
             go_pid,
             rust_pid,
             requests_per_client,
+            mutation_requests_per_client,
         )
         .await
         .context("Phase 4 reference benchmark failed"),

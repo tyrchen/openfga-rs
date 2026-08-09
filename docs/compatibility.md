@@ -13,12 +13,13 @@ verified post-GA surface and does not change the OpenFGA v1 GA claim.
 | AuthZEN Authorization API 1.0 source | `f153694bfc20f7be303e33cabe72b668596c5a06` (AuthZEN proto checksum in `proto.lock.json`) |
 | Rust | `1.97.1` (`8bab26f4f`, edition 2024) |
 | SQLx | `0.9.0`, locked by `Cargo.lock` |
-| PostgreSQL CI | `18.4` |
-| MySQL CI | `8.4.10` |
+| PostgreSQL CI | `18.4`, image index `sha256:a02db8cac496f15b094798a38254f14d6e00741f709360e5e00bb6668ea31636` |
+| MySQL CI | `8.4.10`, image index `sha256:8dbcf531a03aade657e181b9cf2f1d1803ce621a1d55610cb44cb531ab7d7db6` |
 | SQLite | bundled SQLite `3.51.3` from `libsqlite3-sys 0.37.0` |
 | JavaScript SDK smoke | `@openfga/sdk 0.9.6`, Node.js 24 |
 | Dependency security tools | `cargo-audit 0.22.2`, `cargo-deny 0.20.2` |
 | Release security tools | `gitleaks 8.30.1`, `syft 1.50.0` |
+| GitHub Actions runtime | Node.js 24 action releases, immutable commit pins in `.github/workflows/build.yml` |
 
 Protocol source integrity, protoc version, imported module commits, licenses, and all input hashes
 are recorded in `crates/openfga-proto/proto.lock.json` and reproduced by `make check-proto`.

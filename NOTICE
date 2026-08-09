@@ -1,0 +1,27 @@
+openfga-rs
+Copyright 2025-2026 Tyr Chen
+
+This product includes generated protocol code derived from the OpenFGA API.
+The upstream NOTICE reads:
+
+  OpenFGA API
+  github.com/openfga/api
+  Copyright 2022 Okta, Inc.
+
+  Licensed under the Apache License, Version 2.0 (the "License"); you may not
+  use this file except in compliance with the License. You may obtain a copy
+  of the License at http://www.apache.org/licenses/LICENSE-2.0
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+
+The complete upstream license and notice are retained in the
+vendors/openfga-api submodule.
+
+The vendored OpenFGA Go implementation is used only as a compatibility oracle.
+Its complete license is retained in the vendors/openfga submodule.

@@ -7,6 +7,7 @@ edition.workspace = true
 license.workspace = true
 readme.workspace = true
 rust-version.workspace = true
+publish = false
 
 [lints]
 workspace = true
@@ -25,4 +26,9 @@ tracing.workspace = true
 ulid.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 openfga-storage-memory.workspace = true
+
+[[bench]]
+name = "identifier_allocation"
+harness = false

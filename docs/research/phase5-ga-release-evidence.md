@@ -38,15 +38,16 @@ The SQLite/API, upstream migration, secret scan and local Darwin arm64 release a
 were executed during implementation. The strengthened MySQL storage/migration suite passed ten
 consecutive runs and the complete secure SDK/gRPC/runtime gate against a temporary Oracle MySQL
 8.4.10 distribution. PostgreSQL storage and the same API gate passed on the final tree against local
-PostgreSQL 17.10; CI independently requires the advertised PostgreSQL 18.4 image. The complete GA
+PostgreSQL 18.4; CI independently requires the digest-pinned PostgreSQL 18.4 image. The complete GA
 evidence target passed with 3,420 Check corpus events and all enumeration cases at zero mismatches,
 then exercised the exact release binary under consistency, load, soak, drain, and resource-bound
 checks. A second independent Phase 5 review reported no remaining actionable findings.
 
 ## Artifact contract
 
-`make release-artifacts` emits a platform-named server archive, CycloneDX JSON, SPDX JSON, and a
-platform-named `SHA256SUMS` manifest under `target/phase5`. Tag builds cannot start the Linux/macOS
+`make release-artifacts` emits a platform-named server archive containing the binary, Apache-2.0
+license, NOTICE attribution, README, and configuration examples, plus CycloneDX JSON, SPDX JSON,
+and a platform-named `SHA256SUMS` manifest under `target/phase5`. Tag builds cannot start the Linux/macOS
 artifact matrix until the dedicated GA job has run the complete differential and enumeration
 suites, security controls, and release binary scale/soak harness. The matrix then attests each
 archive and its SPDX SBOM with `actions/attest`, uploads the complete set, and attaches it to the
