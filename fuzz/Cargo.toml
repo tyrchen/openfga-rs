@@ -11,11 +11,11 @@ rust-version = "1.97.1"
 cargo-fuzz = true
 
 [dependencies]
-libfuzzer-sys = "~0.4.13"
+libfuzzer-sys = "0.4.13"
 openfga-domain = { version = "0.1.0", path = "../crates/openfga-domain" }
 openfga-condition = { version = "0.1.0", path = "../crates/openfga-condition" }
 openfga-model = { version = "0.1.0", path = "../crates/openfga-model" }
-serde_json = { version = "~1.0.151", default-features = false, features = ["std"] }
+serde_json = { version = "1.0.151", default-features = false, features = ["std"] }
 
 [[bin]]
 name = "domain_inputs"

@@ -188,7 +188,7 @@ Two complementary disciplines. **Safety** is about Rust's memory and concurrency
 ## Dependencies
 
 - Minimize dependencies. Each dependency increases compile time, binary size, and attack surface.
-- Pin versions carefully. Use `~` for patch updates (`tokio = "~1.40"`), `^` for minor updates (default).
+- Pin versions carefully. Use `~` for patch updates (`tokio = "1.40"`), `^` for minor updates (default).
 - Prefer pure Rust crates over FFI bindings. They're safer, more portable, and easier to audit.
 - Audit new dependencies before adding. Check maintenance status, security history, and code quality.
 - Use workspace dependencies for shared dependencies across crates: `[workspace.dependencies]`.
