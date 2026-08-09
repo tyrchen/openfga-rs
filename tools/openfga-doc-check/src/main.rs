@@ -130,9 +130,10 @@ fn check_workflow_pins(file: &Path) -> Result<()> {
                     index.saturating_add(1),
                 );
             };
-            if !is_lower_hex(revision, 40) {
+            if !is_lower_hex(revision, 40) && !is_exact_semver_tag(revision) {
                 bail!(
-                    "GitHub Action is not pinned to a lowercase commit SHA at {}:{}",
+                    "GitHub Action is not pinned to a lowercase commit SHA or exact SemVer tag at \
+                     {}:{}",
                     file.display(),
                     index.saturating_add(1),
                 );
@@ -163,6 +164,32 @@ fn is_lower_hex(value: &str, length: usize) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn is_exact_semver_tag(value: &str) -> bool {
+    let Some(version) = value.strip_prefix('v') else {
+        return false;
+    };
+    let mut components = version.split('.');
+    matches!(
+        (
+            components.next(),
+            components.next(),
+            components.next(),
+            components.next(),
+        ),
+        (Some(major), Some(minor), Some(patch), None)
+            if is_decimal_component(major)
+                && is_decimal_component(minor)
+                && is_decimal_component(patch)
+    )
+}
+
+fn is_decimal_component(value: &str) -> bool {
+    value == "0"
+        || value
+            .strip_prefix(|character: char| ('1'..='9').contains(&character))
+            .is_some_and(|remaining| remaining.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 // This finite command-line scan has no async runtime in which synchronous filesystem work blocks.
@@ -228,7 +255,7 @@ fn is_external_or_anchor(target: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{inline_link_targets, is_lower_hex, parse_json};
+    use super::{inline_link_targets, is_exact_semver_tag, is_lower_hex, parse_json};
 
     #[test]
     fn test_should_extract_multiple_inline_markdown_links() {
@@ -250,5 +277,16 @@ mod tests {
         assert!(!is_lower_hex("0123456789ABCDEF", 16));
         assert!(!is_lower_hex("0123456789abcde", 16));
         assert!(!is_lower_hex("0123456789abcdeg", 16));
+    }
+
+    #[test]
+    fn test_should_accept_only_exact_stable_semver_action_tags() {
+        assert!(is_exact_semver_tag("v3.0.0"));
+        assert!(is_exact_semver_tag("v0.12.34"));
+        assert!(!is_exact_semver_tag("v3"));
+        assert!(!is_exact_semver_tag("v3.0"));
+        assert!(!is_exact_semver_tag("3.0.0"));
+        assert!(!is_exact_semver_tag("v03.0.0"));
+        assert!(!is_exact_semver_tag("v3.0.0-beta.1"));
     }
 }

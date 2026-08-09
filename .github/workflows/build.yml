@@ -42,6 +42,11 @@ jobs:
         run: |
           rustup show
           rustup toolchain install nightly-2026-07-29 --component rustfmt
+      - name: Install pinned Protocol Buffers compiler
+        uses: arduino/setup-protoc@v3.0.0
+        with:
+          version: '35.1'
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install cargo-audit
         uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026 # v2.85.11
@@ -75,6 +80,11 @@ jobs:
           submodules: recursive
       - name: Install pinned Rust
         run: rustup show
+      - name: Install pinned Protocol Buffers compiler
+        uses: arduino/setup-protoc@v3.0.0
+        with:
+          version: '35.1'
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -111,6 +121,11 @@ jobs:
           submodules: recursive
       - name: Install pinned Rust
         run: rustup show
+      - name: Install pinned Protocol Buffers compiler
+        uses: arduino/setup-protoc@v3.0.0
+        with:
+          version: '35.1'
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install SQLx CLI
         uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026 # v2.85.11
@@ -152,6 +167,11 @@ jobs:
           submodules: recursive
       - name: Install pinned Rust
         run: rustup show
+      - name: Install pinned Protocol Buffers compiler
+        uses: arduino/setup-protoc@v3.0.0
+        with:
+          version: '35.1'
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -174,6 +194,11 @@ jobs:
           submodules: recursive
       - name: Install pinned Rust
         run: rustup show
+      - name: Install pinned Protocol Buffers compiler
+        uses: arduino/setup-protoc@v3.0.0
+        with:
+          version: '35.1'
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -196,6 +221,11 @@ jobs:
           submodules: recursive
       - name: Install pinned Rust
         run: rustup show
+      - name: Install pinned Protocol Buffers compiler
+        uses: arduino/setup-protoc@v3.0.0
+        with:
+          version: '35.1'
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -235,6 +265,11 @@ jobs:
           submodules: recursive
       - name: Install pinned Rust
         run: rustup show
+      - name: Install pinned Protocol Buffers compiler
+        uses: arduino/setup-protoc@v3.0.0
+        with:
+          version: '35.1'
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Build checksummed artifacts and SBOMs
         run: make release-artifacts

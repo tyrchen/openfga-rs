@@ -59,6 +59,7 @@ const ULID_MAX_TIMESTAMP_MS: u64 = (1_u64 << 48) - 1;
 
 pub(crate) static MYSQL_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations-mysql");
 pub(crate) static SQLITE_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations-sqlite");
+static SQLITE_MIGRATION_PERMIT: Semaphore = Semaphore::const_new(1);
 
 /// Durable `MySQL` or `SQLite` backend using backend-specific migrations and portable queries.
 pub struct PortableSqlStorage {
@@ -180,16 +181,7 @@ impl PortableSqlStorage {
         })?;
         let primary = connect_pool(&config, config.primary_url.expose_secret()).await?;
         if config.migrate_on_connect {
-            migrator(config.dialect)
-                .run(&primary)
-                .await
-                .map_err(|error| {
-                    StorageError::with_source(
-                        StorageErrorKind::Integrity,
-                        "portable_migration_failed",
-                        error,
-                    )
-                })?;
+            run_portable_migrations(&primary, config.dialect).await?;
         }
         verify_schema(&primary).await?;
         let work_permits = Arc::new(Semaphore::new(
@@ -217,16 +209,7 @@ impl PortableSqlStorage {
     ///
     /// Returns an integrity failure for a failed, older, or newer schema.
     pub async fn migrate(&self) -> Result<(), StorageError> {
-        migrator(self.config.dialect)
-            .run(&self.primary)
-            .await
-            .map_err(|error| {
-                StorageError::with_source(
-                    StorageErrorKind::Integrity,
-                    "portable_migration_failed",
-                    error,
-                )
-            })?;
+        run_portable_migrations(&self.primary, self.config.dialect).await?;
         verify_schema(&self.primary).await
     }
 
@@ -1418,6 +1401,30 @@ pub(crate) const fn migrator(dialect: PortableSqlDialect) -> &'static sqlx::migr
         PortableSqlDialect::MySql => &MYSQL_MIGRATOR,
         PortableSqlDialect::Sqlite => &SQLITE_MIGRATOR,
     }
+}
+
+pub(crate) async fn run_portable_migrations(
+    pool: &AnyPool,
+    dialect: PortableSqlDialect,
+) -> Result<(), StorageError> {
+    let _sqlite_permit = match dialect {
+        PortableSqlDialect::MySql => None,
+        PortableSqlDialect::Sqlite => {
+            Some(SQLITE_MIGRATION_PERMIT.acquire().await.map_err(|_| {
+                StorageError::new(
+                    StorageErrorKind::Integrity,
+                    "portable_migration_lock_closed",
+                )
+            })?)
+        }
+    };
+    migrator(dialect).run(pool).await.map_err(|error| {
+        StorageError::with_source(
+            StorageErrorKind::Integrity,
+            "portable_migration_failed",
+            error,
+        )
+    })
 }
 
 const fn assertion_upsert(dialect: PortableSqlDialect) -> &'static str {

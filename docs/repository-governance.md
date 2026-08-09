@@ -18,8 +18,9 @@ audit this checklist before treating a public fork as an official release source
 
 - Keep the default `GITHUB_TOKEN` permission read-only. Grant write, OIDC, attestation, and artifact
   permissions only on the tag jobs that need them, as the checked-in workflow does.
-- Allow only actions pinned to a full commit SHA. `make check-docs check-actions` enforces this in
-  source; Dependabot updates the reviewed SHA and release comment together.
+- Allow only actions pinned to a full commit SHA or an exact stable SemVer tag such as `v3.0.0`.
+  Floating major/minor tags remain prohibited. `make check-docs check-actions` enforces this in
+  source; Dependabot updates reviewed action references.
 - Require approval for workflows first run by outside contributors and do not expose release or
   database secrets to forked pull requests.
 - Protect `v*` tags from mutation and limit release creation to maintainers. Never reuse a version.

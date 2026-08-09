@@ -47,8 +47,8 @@ Do not move or reuse a published version tag. A tag starts these ordered GitHub 
 5. GitHub OIDC/Sigstore build and SBOM attestations;
 6. artifact collection and GitHub Release publication with generated changelog notes.
 
-Every third-party action is pinned to an immutable commit. Release jobs have only the permissions
-needed for attestations or publication.
+Every third-party action is pinned to a commit or exact stable SemVer release tag. Release jobs have
+only the permissions needed for attestations or publication.
 
 ## Artifact contents
 
