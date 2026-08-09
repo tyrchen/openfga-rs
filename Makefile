@@ -42,6 +42,7 @@ PHASE5_ARTIFACT_DIR ?= target/phase5
 PHASE5_PLATFORM := $(shell uname -s | tr '[:upper:]' '[:lower:]')-$(shell uname -m)
 WORKSPACE_TARGET_DIR := $(shell $(CARGO) metadata --no-deps --format-version 1 | \
 	sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
+OPENFGA_SERVER := $(WORKSPACE_TARGET_DIR)/debug/openfga-server
 UPSTREAM_SQLITE_URL_ENV ?= OPENFGA_UPSTREAM_SQLITE_URL
 DESTINATION_SQLITE_URL_ENV ?= OPENFGA_SQLITE_URL
 PROTO_OUTPUT := crates/openfga-proto/src/generated
@@ -183,7 +184,7 @@ differential-smoke: $(GO_BASELINE) build
 	trap cleanup EXIT INT TERM; \
 	$(GO_BASELINE) run --http-addr $(GO_HTTP_ADDR) --grpc-addr $(GO_GRPC_ADDR) \
 		--playground-enabled=false >"$$phase0_tmp/go.log" 2>&1 & go_pid=$$!; \
-	$(CARGO) run --quiet -p openfga-server -- probe-server \
+	"$(OPENFGA_SERVER)" probe-server \
 		--address $(RUST_PROBE_ADDR) >"$$phase0_tmp/rust.log" 2>&1 & rust_pid=$$!; \
 	for endpoint in "http://$(GO_HTTP_ADDR)/healthz" "http://$(RUST_PROBE_ADDR)/healthz"; do \
 		attempt=0; \
@@ -270,7 +271,7 @@ phase2-compatibility: $(GO_BASELINE) build
 	OPENFGA_SQLITE_URL="$$compat_database_url" \
 	OPENFGA_PRESHARED_KEY=phase2-compatibility-preshared-key-material \
 	OPENFGA_TOKEN_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= \
-	$(CARGO) run --quiet -p openfga-server -- run \
+	"$(OPENFGA_SERVER)" run \
 		--config config/openfga-preshared-development.yaml \
 		>"$$phase2_tmp/rust.log" 2>&1 & rust_pid=$$!; \
 	for endpoint in "http://$(GO_HTTP_ADDR)/healthz" "https://$(RUST_HTTP_ADDR)/readyz"; do \
@@ -418,7 +419,7 @@ check-differential: $(GO_BASELINE) build
 	trap cleanup EXIT INT TERM; \
 	$(GO_BASELINE) run --http-addr $(GO_HTTP_ADDR) --grpc-addr $(GO_GRPC_ADDR) \
 		--playground-enabled=false >"$$phase1_tmp/go.log" 2>&1 & go_pid=$$!; \
-	$(CARGO) run --quiet -p openfga-server -- check-probe-server \
+	"$(OPENFGA_SERVER)" check-probe-server \
 		--address $(RUST_PROBE_ADDR) >"$$phase1_tmp/rust.log" 2>&1 & rust_pid=$$!; \
 	for endpoint in "http://$(GO_HTTP_ADDR)/healthz" "http://$(RUST_PROBE_ADDR)/healthz"; do \
 		attempt=0; \
@@ -458,7 +459,7 @@ enumeration-differential: $(GO_BASELINE) build
 	OPENFGA__LISTENERS__HTTP=$(RUST_HTTP_ADDR) \
 	OPENFGA__LISTENERS__GRPC=$(RUST_GRPC_ADDR) \
 	OPENFGA_TOKEN_KEY="$$token_key" \
-	$(CARGO) run --quiet -p openfga-server -- run \
+	"$(OPENFGA_SERVER)" run \
 		--config config/openfga-development.yaml \
 		>"$$phase3_tmp/rust.log" 2>&1 & rust_pid=$$!; \
 	for endpoint in "http://$(GO_HTTP_ADDR)/healthz" "http://$(RUST_HTTP_ADDR)/readyz"; do \
@@ -507,7 +508,7 @@ authzen-differential: $(GO_BASELINE) build
 	OPENFGA__AUTHZEN__ENABLED=true \
 	OPENFGA__AUTHZEN__BASE_URL="http://$(RUST_HTTP_ADDR)" \
 	OPENFGA_TOKEN_KEY="$$token_key" \
-	$(CARGO) run --quiet -p openfga-server -- run \
+	"$(OPENFGA_SERVER)" run \
 		--config config/openfga-development.yaml \
 		>"$$phase6_tmp/rust.log" 2>&1 & rust_pid=$$!; \
 	for endpoint in "http://$(GO_HTTP_ADDR)/healthz" "http://$(RUST_HTTP_ADDR)/readyz"; do \
@@ -554,14 +555,14 @@ authzen-conformance: authzen-baseline build
 	OPENFGA__AUTHZEN__ENABLED=true \
 	OPENFGA__AUTHZEN__BASE_URL="http://openfga.example" \
 	OPENFGA_TOKEN_KEY="$$token_key" \
-	$(CARGO) run --quiet -p openfga-server -- run \
+	"$(OPENFGA_SERVER)" run \
 		--config config/openfga-development.yaml \
 		>"$$phase6_tmp/rust.log" 2>&1 & rust_pid=$$!; \
 	OPENFGA__LISTENERS__HTTP=$(RUST_AUTHZEN_DISABLED_HTTP_ADDR) \
 	OPENFGA__LISTENERS__GRPC=$(RUST_AUTHZEN_DISABLED_GRPC_ADDR) \
 	OPENFGA__AUTHZEN__ENABLED=false \
 	OPENFGA_TOKEN_KEY="$$token_key" \
-	$(CARGO) run --quiet -p openfga-server -- run \
+	"$(OPENFGA_SERVER)" run \
 		--config config/openfga-development.yaml \
 		>"$$phase6_tmp/rust-disabled.log" 2>&1 & disabled_rust_pid=$$!; \
 	for endpoint in "http://$(RUST_HTTP_ADDR)/readyz" "http://$(RUST_AUTHZEN_DISABLED_HTTP_ADDR)/readyz"; do \
