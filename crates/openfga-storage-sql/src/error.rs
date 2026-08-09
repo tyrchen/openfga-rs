@@ -1,5 +1,7 @@
 //! PostgreSQL-to-storage error classification.
 
+use std::borrow::Cow;
+
 use openfga_storage::{StorageError, StorageErrorKind};
 
 pub(crate) fn map_sqlx(error: sqlx::Error, code: &'static str) -> StorageError {
@@ -23,6 +25,41 @@ pub(crate) fn map_sqlx(error: sqlx::Error, code: &'static str) -> StorageError {
         },
         _ => StorageErrorKind::Internal,
     };
+    if matches!(
+        kind,
+        StorageErrorKind::Internal | StorageErrorKind::Unavailable
+    ) {
+        let sqlx_error_kind = match &error {
+            sqlx::Error::Configuration(_) => "configuration",
+            sqlx::Error::Database(_) => "database",
+            sqlx::Error::Io(_) => "io",
+            sqlx::Error::Tls(_) => "tls",
+            sqlx::Error::Protocol(_) => "protocol",
+            sqlx::Error::RowNotFound => "row_not_found",
+            sqlx::Error::TypeNotFound { .. } => "type_not_found",
+            sqlx::Error::ColumnIndexOutOfBounds { .. } => "column_index_out_of_bounds",
+            sqlx::Error::ColumnNotFound(_) => "column_not_found",
+            sqlx::Error::ColumnDecode { .. } => "column_decode",
+            sqlx::Error::Decode(_) => "decode",
+            sqlx::Error::AnyDriverError(_) => "any_driver",
+            sqlx::Error::PoolTimedOut => "pool_timed_out",
+            sqlx::Error::PoolClosed => "pool_closed",
+            sqlx::Error::WorkerCrashed => "worker_crashed",
+            sqlx::Error::Migrate(_) => "migrate",
+            _ => "unknown",
+        };
+        let database_code = match &error {
+            sqlx::Error::Database(database) => database.code().map(Cow::into_owned),
+            _ => None,
+        };
+        tracing::error!(
+            storage.error_kind = ?kind,
+            storage.error_code = code,
+            storage.sqlx_error_kind = sqlx_error_kind,
+            storage.database_code = database_code.as_deref().unwrap_or("none"),
+            "PostgreSQL operation failed",
+        );
+    }
     StorageError::with_source(kind, code, error)
 }
 

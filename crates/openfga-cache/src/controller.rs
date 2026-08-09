@@ -109,14 +109,14 @@ struct DiagnosticsState {
     flushes: AtomicU64,
     overflows: AtomicU64,
     restarts: AtomicU64,
-    current_lag_millis: AtomicU64,
+    current_poll_freshness_age_millis: AtomicU64,
 }
 
 struct ControllerMetrics {
     _running: ObservableGauge<u64>,
     _ready: ObservableGauge<u64>,
     _tracked_stores: ObservableGauge<u64>,
-    _lag: ObservableGauge<u64>,
+    _poll_freshness_age: ObservableGauge<u64>,
     _successful_polls: ObservableCounter<u64>,
     _failed_polls: ObservableCounter<u64>,
     _flushes: ObservableCounter<u64>,
@@ -148,14 +148,19 @@ impl ControllerMetrics {
                     u64::try_from(state.tracked_stores.load(Ordering::Relaxed)).unwrap_or(u64::MAX)
                 },
             ),
-            _lag: meter
-                .u64_observable_gauge("openfga.cache.controller.lag")
-                .with_description("Maximum lag among tracked changelog cursors")
+            _poll_freshness_age: meter
+                .u64_observable_gauge("openfga.cache.controller.poll_freshness_age")
+                .with_description("Maximum elapsed time since a tracked store's successful poll")
                 .with_unit("ms")
                 .with_callback({
                     let state = Arc::clone(&diagnostics.0);
                     move |observer| {
-                        observer.observe(state.current_lag_millis.load(Ordering::Relaxed), &[]);
+                        observer.observe(
+                            state
+                                .current_poll_freshness_age_millis
+                                .load(Ordering::Relaxed),
+                            &[],
+                        );
                     }
                 })
                 .build(),
@@ -414,7 +419,7 @@ impl InvalidationController {
             flushes: AtomicU64::new(0),
             overflows: AtomicU64::new(0),
             restarts: AtomicU64::new(0),
-            current_lag_millis: AtomicU64::new(0),
+            current_poll_freshness_age_millis: AtomicU64::new(0),
         }));
         let metrics = ControllerMetrics::new(&diagnostics);
         flush(&invalidation, &diagnostics);
@@ -777,7 +782,7 @@ impl Actor {
             .tracked_stores
             .store(self.stores.len(), Ordering::Relaxed);
         let now = Instant::now();
-        let current_lag_millis = self
+        let current_poll_freshness_age_millis = self
             .stores
             .values()
             .map(|state| now.duration_since(state.last_success).as_millis())
@@ -785,8 +790,8 @@ impl Actor {
             .map_or(0, |millis| u64::try_from(millis).unwrap_or(u64::MAX));
         self.diagnostics
             .0
-            .current_lag_millis
-            .store(current_lag_millis, Ordering::Relaxed);
+            .current_poll_freshness_age_millis
+            .store(current_poll_freshness_age_millis, Ordering::Relaxed);
         let ready = self.stores.values().all(|state| {
             state.initialized && now.duration_since(state.last_success) <= self.config.maximum_lag
         });

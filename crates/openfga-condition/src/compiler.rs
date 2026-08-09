@@ -1,6 +1,6 @@
 //! Bounded CEL parsing, static checking, and IR construction.
 
-use std::{collections::BTreeMap, fmt, panic::catch_unwind};
+use std::{collections::BTreeMap, fmt, mem::size_of, panic::catch_unwind};
 
 use cel_parser::{
     ParseErrors, Parser,
@@ -60,6 +60,13 @@ impl ConditionCompiler {
         let metadata = CompiledMetadata {
             fingerprint: fingerprint_definition(definition),
         };
+        let estimated_owned_bytes = size_of::<CompiledCondition>()
+            .saturating_add(definition.expression().len().saturating_mul(4))
+            .saturating_add(definition.parameters().len().saturating_mul(
+                size_of::<(ParameterName, ParameterType)>() + 4 * size_of::<usize>(),
+            ))
+            .saturating_add(lowerer.nodes.capacity().saturating_mul(size_of::<Node>()))
+            .saturating_add(lowerer.nodes.len().saturating_mul(128));
         Ok(CompiledCondition {
             name: definition.name().clone(),
             parameters: definition.parameters().clone(),
@@ -70,6 +77,7 @@ impl ConditionCompiler {
             metadata,
             runtime_value_bytes: limits.runtime_value_bytes(),
             runtime_collection_items: limits.runtime_collection_items(),
+            estimated_owned_bytes,
         })
     }
 }
@@ -102,6 +110,7 @@ pub struct CompiledCondition {
     metadata: CompiledMetadata,
     pub(crate) runtime_value_bytes: usize,
     pub(crate) runtime_collection_items: usize,
+    estimated_owned_bytes: usize,
 }
 
 impl CompiledCondition {
@@ -171,6 +180,12 @@ impl CompiledCondition {
     #[must_use]
     pub const fn parameters(&self) -> &BTreeMap<ParameterName, ParameterType> {
         &self.parameters
+    }
+
+    /// Returns a conservative estimate of heap and inline bytes owned by this program.
+    #[must_use]
+    pub const fn estimated_owned_bytes(&self) -> usize {
+        self.estimated_owned_bytes
     }
 }
 

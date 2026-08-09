@@ -5,6 +5,10 @@ exact action and store before storage lookup. HTTP and gRPC share the same polic
 and `/readyz` and the standard gRPC health service are intentionally credential-free for
 orchestration; isolate them at the network boundary.
 
+The development profile additionally exposes credential-free `GET /capacityz` diagnostics on the
+loopback-only listener for the bounded-load harness. Production does not register this route;
+operators use the exported OpenTelemetry metrics instead.
+
 ## Modes
 
 | Mode | Use | Startup behavior |

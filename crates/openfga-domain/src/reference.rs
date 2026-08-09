@@ -1,6 +1,6 @@
 //! Canonical object, subject, tuple, and condition-binding values.
 
-use std::{collections::BTreeSet, fmt, str::FromStr};
+use std::{collections::BTreeSet, fmt, mem::size_of, str::FromStr};
 
 use winnow::{
     Parser,
@@ -702,6 +702,42 @@ impl RelationshipTuple {
     #[must_use]
     pub const fn condition(&self) -> &ConditionReference {
         &self.condition
+    }
+
+    /// Returns a conservative estimate of heap and inline bytes owned by this tuple.
+    #[must_use]
+    pub fn estimated_owned_bytes(&self) -> usize {
+        let key = &self.key;
+        let object_bytes = key
+            .object()
+            .object_type()
+            .as_str()
+            .len()
+            .saturating_add(key.object().object_id().as_str().len());
+        let subject_bytes = key
+            .subject()
+            .subject_type()
+            .as_str()
+            .len()
+            .saturating_add(key.subject().object_id().len())
+            .saturating_add(
+                key.subject()
+                    .relation()
+                    .map_or(0, |relation| relation.as_str().len()),
+            );
+        let condition_bytes = match &self.condition {
+            ConditionReference::Unconditional => 0,
+            ConditionReference::Conditional(binding) => binding
+                .name()
+                .as_str()
+                .len()
+                .saturating_add(binding.context().estimated_owned_bytes()),
+        };
+        size_of::<Self>()
+            .saturating_add(object_bytes)
+            .saturating_add(key.relation().as_str().len())
+            .saturating_add(subject_bytes)
+            .saturating_add(condition_bytes)
     }
 
     fn update_fingerprint(&self, builder: &mut FingerprintBuilder) {

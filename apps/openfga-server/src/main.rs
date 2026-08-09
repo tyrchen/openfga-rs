@@ -114,9 +114,12 @@ enum Command {
     },
     /// Exercise concurrent write/check consistency and cache invalidation.
     Phase4ConsistencyFaults {
-        /// Base URL of the complete Rust server.
+        /// Base URL of the Rust reader server.
         #[arg(long)]
         rust_url: String,
+        /// Optional independent writer server sharing the reader's `PostgreSQL` database.
+        #[arg(long)]
+        writer_url: Option<String>,
         /// Number of concurrent independent mutation sequences.
         #[arg(long, default_value_t = 32)]
         iterations: usize,
@@ -129,6 +132,12 @@ enum Command {
         /// Base URL of the complete Rust server.
         #[arg(long)]
         rust_url: String,
+        /// Operating-system process ID of the vendored Go server.
+        #[arg(long)]
+        go_pid: u32,
+        /// Operating-system process ID of the Rust server.
+        #[arg(long)]
+        rust_pid: u32,
         /// Sequential requests issued by each client at each concurrency level.
         #[arg(long, default_value_t = 25)]
         requests_per_client: usize,
@@ -222,17 +231,26 @@ async fn main() -> Result<()> {
         }
         Command::Phase4ConsistencyFaults {
             rust_url,
+            writer_url,
             iterations,
-        } => phase4_scale::run_consistency_faults(&rust_url, iterations)
+        } => phase4_scale::run_consistency_faults(&rust_url, writer_url.as_deref(), iterations)
             .await
             .context("Phase 4 consistency fault suite failed"),
         Command::Phase4ReferenceBenchmark {
             go_url,
             rust_url,
+            go_pid,
+            rust_pid,
             requests_per_client,
-        } => phase4_scale::run_reference_benchmark(&go_url, &rust_url, requests_per_client)
-            .await
-            .context("Phase 4 reference benchmark failed"),
+        } => phase4_scale::run_reference_benchmark(
+            &go_url,
+            &rust_url,
+            go_pid,
+            rust_pid,
+            requests_per_client,
+        )
+        .await
+        .context("Phase 4 reference benchmark failed"),
         Command::Phase4Soak {
             rust_url,
             seconds,

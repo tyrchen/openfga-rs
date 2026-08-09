@@ -259,6 +259,13 @@ impl PostgresStorage {
         self.replica.as_ref()
     }
 
+    /// Returns immediately available global storage-work permits.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn available_work_permits(&self) -> usize {
+        self.work_permits.available_permits()
+    }
+
     async fn acquire_work(
         &self,
         context: &OperationContext,
@@ -563,9 +570,9 @@ impl TupleReader for PostgresStorage {
             for allowed in filter.allowed() {
                 separated
                     .push("(subject_type = ")
-                    .push_bind(allowed.subject_type().as_str())
-                    .push(" AND subject_relation = ")
-                    .push_bind(allowed.relation().as_str())
+                    .push_bind_unseparated(allowed.subject_type().as_str())
+                    .push_unseparated(" AND subject_relation = ")
+                    .push_bind_unseparated(allowed.relation().as_str())
                     .push_unseparated(")");
             }
             query.push(")");
@@ -1859,13 +1866,13 @@ fn push_subject_allowlist(query: &mut QueryBuilder<Postgres>, subjects: &BTreeSe
         let (kind, ty, id, relation) = subject_parts(subject);
         separated
             .push("(subject_kind = ")
-            .push_bind(kind)
-            .push(" AND subject_type = ")
-            .push_bind(ty.to_owned())
-            .push(" AND subject_id = ")
-            .push_bind(id.to_owned())
-            .push(" AND subject_relation = ")
-            .push_bind(relation.to_owned())
+            .push_bind_unseparated(kind)
+            .push_unseparated(" AND subject_type = ")
+            .push_bind_unseparated(ty.to_owned())
+            .push_unseparated(" AND subject_id = ")
+            .push_bind_unseparated(id.to_owned())
+            .push_unseparated(" AND subject_relation = ")
+            .push_bind_unseparated(relation.to_owned())
             .push_unseparated(")");
     }
     query.push(")");

@@ -26,13 +26,13 @@
           "labels": { "severity": "critical" }
         },
         {
-          "alert": "OpenFgaCacheControllerLagging",
+          "alert": "OpenFgaCacheControllerPollStale",
           "annotations": {
-            "description": "Controller lag has consumed 80% of the default 10-second maximum-lag budget.",
+            "description": "Time since the last successful controller poll has consumed 80% of the default 10-second maximum-lag budget.",
             "runbook": "docs/operations/observability-runbook.md#alert-response",
-            "summary": "OpenFGA cache-controller lag is near its ceiling"
+            "summary": "OpenFGA cache-controller poll freshness is near its ceiling"
           },
-          "expr": "max(openfga_cache_controller_lag_milliseconds) > 8000",
+          "expr": "max(openfga_cache_controller_poll_freshness_age_milliseconds) > 8000",
           "for": "2m",
           "labels": { "severity": "warning" }
         },

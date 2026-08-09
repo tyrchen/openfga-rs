@@ -1174,8 +1174,26 @@ pub(crate) fn go_model_document() -> Value {
                     ]
                 }}}
             },
-            {
-                "type": "document",
+            go_document_type_definition()
+        ],
+        "conditions": {
+            "under_limit": {
+                "name": "under_limit",
+                "expression": "x < 100 && x == 50",
+                "parameters": {"x": {"type_name": "TYPE_NAME_ANY"}}
+            },
+            "at_precision_boundary": {
+                "name": "at_precision_boundary",
+                "expression": "x == 9223372036854775807",
+                "parameters": {"x": {"type_name": "TYPE_NAME_ANY"}}
+            }
+        }
+    })
+}
+
+fn go_document_type_definition() -> Value {
+    json!({
+        "type": "document",
                 "relations": {
                     "owner": {"this": {}},
                     "editor": {"this": {}},
@@ -1183,6 +1201,30 @@ pub(crate) fn go_model_document() -> Value {
                     "conditional": {"this": {}},
                     "boundary": {"this": {}},
                     "parent": {"this": {}},
+                    "reverse_only": {"this": {}},
+                    "residual_base": {"this": {}},
+                    "residual_all": {"difference": {
+                        "base": {"computedUserset": {"relation": "residual_base"}},
+                        "subtract": {"computedUserset": {"relation": "banned"}}
+                    }},
+                    "wide_00": {"this": {}},
+                    "wide_01": {"this": {}},
+                    "wide_02": {"this": {}},
+                    "wide_03": {"this": {}},
+                    "wide_04": {"this": {}},
+                    "wide_05": {"this": {}},
+                    "wide_06": {"this": {}},
+                    "wide_07": {"this": {}},
+                    "wide_union": {"union": {"child": [
+                        {"computedUserset": {"relation": "wide_00"}},
+                        {"computedUserset": {"relation": "wide_01"}},
+                        {"computedUserset": {"relation": "wide_02"}},
+                        {"computedUserset": {"relation": "wide_03"}},
+                        {"computedUserset": {"relation": "wide_04"}},
+                        {"computedUserset": {"relation": "wide_05"}},
+                        {"computedUserset": {"relation": "wide_06"}},
+                        {"computedUserset": {"relation": "wide_07"}}
+                    ]}},
                     "viewer": {"union": {"child": [
                         {"this": {}},
                         {"computedUserset": {"relation": "owner"}},
@@ -1204,7 +1246,7 @@ pub(crate) fn go_model_document() -> Value {
                         "subtract": {"computedUserset": {"relation": "banned"}}
                     }}
                 },
-                "metadata": {"relations": {
+        "metadata": {"relations": {
                     "owner": {"directly_related_user_types": [{"type": "user"}]},
                     "editor": {"directly_related_user_types": [{"type": "user"}]},
                     "banned": {"directly_related_user_types": [{"type": "user"}]},
@@ -1215,6 +1257,18 @@ pub(crate) fn go_model_document() -> Value {
                         {"type": "user", "condition": "at_precision_boundary"}
                     ]},
                     "parent": {"directly_related_user_types": [{"type": "folder"}]},
+                    "reverse_only": {"directly_related_user_types": [{"type": "user"}]},
+                    "residual_base": {"directly_related_user_types": [{"type": "user"}]},
+                    "residual_all": {"directly_related_user_types": []},
+                    "wide_00": {"directly_related_user_types": [{"type": "user"}]},
+                    "wide_01": {"directly_related_user_types": [{"type": "user"}]},
+                    "wide_02": {"directly_related_user_types": [{"type": "user"}]},
+                    "wide_03": {"directly_related_user_types": [{"type": "user"}]},
+                    "wide_04": {"directly_related_user_types": [{"type": "user"}]},
+                    "wide_05": {"directly_related_user_types": [{"type": "user"}]},
+                    "wide_06": {"directly_related_user_types": [{"type": "user"}]},
+                    "wide_07": {"directly_related_user_types": [{"type": "user"}]},
+                    "wide_union": {"directly_related_user_types": []},
                     "viewer": {"directly_related_user_types": [
                         {"type": "user"},
                         {"type": "user", "wildcard": {}},
@@ -1223,21 +1277,7 @@ pub(crate) fn go_model_document() -> Value {
                     "guarded": {"directly_related_user_types": []},
                     "both": {"directly_related_user_types": []},
                     "allowed": {"directly_related_user_types": []}
-                }}
-            }
-        ],
-        "conditions": {
-            "under_limit": {
-                "name": "under_limit",
-                "expression": "x < 100 && x == 50",
-                "parameters": {"x": {"type_name": "TYPE_NAME_ANY"}}
-            },
-            "at_precision_boundary": {
-                "name": "at_precision_boundary",
-                "expression": "x == 9223372036854775807",
-                "parameters": {"x": {"type_name": "TYPE_NAME_ANY"}}
-            }
-        }
+        }}
     })
 }
 
@@ -1250,6 +1290,7 @@ pub(crate) fn go_fixture_tuples() -> Vec<Value> {
         json!({"object": "document:userset", "relation": "viewer", "user": "group:eng#member"}),
         json!({"object": "group:eng", "relation": "member", "user": "user:bob"}),
         json!({"object": "document:computed", "relation": "owner", "user": "user:anne"}),
+        json!({"object": "document:wide", "relation": "wide_07", "user": "user:anne"}),
         json!({"object": "document:ttu", "relation": "parent", "user": "folder:roadmap"}),
         json!({"object": "folder:roadmap", "relation": "viewer", "user": "user:anne"}),
         json!({"object": "document:both", "relation": "owner", "user": "user:anne"}),

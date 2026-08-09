@@ -176,6 +176,13 @@ struct EndpointPermitMetrics {
 pub(crate) struct EndpointPermit {
     _permit: OwnedSemaphorePermit,
     metrics: EndpointPermitMetrics,
+    completion: &'static str,
+}
+
+impl EndpointPermit {
+    pub(crate) const fn complete(&mut self, completion: &'static str) {
+        self.completion = completion;
+    }
 }
 
 impl fmt::Debug for EndpointPermit {
@@ -190,12 +197,12 @@ impl fmt::Debug for EndpointPermit {
 
 impl Drop for EndpointPermit {
     fn drop(&mut self) {
-        let attributes = [KeyValue::new("endpoint.class", self.metrics.class.as_str())];
+        let attributes = class_attributes(self.metrics.class, self.completion);
         self.metrics
             .metrics
             .duration
             .record(self.metrics.started_at.elapsed().as_secs_f64(), &attributes);
-        self.metrics.metrics.in_flight.add(-1, &attributes);
+        self.metrics.metrics.in_flight.add(-1, &attributes[..1]);
         #[cfg(test)]
         self.metrics
             .metrics
@@ -1195,11 +1202,22 @@ impl OpenFgaApi {
             Ok(EndpointPermit {
                 _permit: permit,
                 metrics: self.transport_metrics.admitted(class),
+                completion: "cancelled",
             })
         } else {
             self.transport_metrics.overloaded(class);
             Err(ApiError::overloaded())
         }
+    }
+
+    /// Returns available and configured endpoint permits for bounded operational diagnostics.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn endpoint_capacity(&self) -> (usize, usize) {
+        (
+            self.endpoint_permits.available_permits(),
+            self.config.maximum_concurrency,
+        )
     }
 
     #[cfg(test)]

@@ -7,6 +7,7 @@ edition.workspace = true
 license.workspace = true
 readme.workspace = true
 rust-version.workspace = true
+autobenches = false
 
 [lints]
 workspace = true
@@ -18,4 +19,14 @@ thiserror.workspace = true
 typed-builder.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
+dhat.workspace = true
 proptest.workspace = true
+
+[[bench]]
+name = "model_compile"
+harness = false
+
+[[bench]]
+name = "model_compile_memory"
+harness = false

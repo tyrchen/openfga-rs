@@ -51,8 +51,8 @@
       "id": 3,
       "options": { "legend": { "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
       "targets": [
-        { "expr": "histogram_quantile(0.95, sum by (le, endpoint_class) (rate(openfga_transport_request_duration_seconds_bucket[$__rate_interval])))", "legendFormat": "p95 {{endpoint_class}}", "refId": "A" },
-        { "expr": "histogram_quantile(0.99, sum by (le, endpoint_class) (rate(openfga_transport_request_duration_seconds_bucket[$__rate_interval])))", "legendFormat": "p99 {{endpoint_class}}", "refId": "B" }
+        { "expr": "histogram_quantile(0.95, sum by (le, endpoint_class, result) (rate(openfga_transport_request_duration_seconds_bucket[$__rate_interval])))", "legendFormat": "p95 {{endpoint_class}} {{result}}", "refId": "A" },
+        { "expr": "histogram_quantile(0.99, sum by (le, endpoint_class, result) (rate(openfga_transport_request_duration_seconds_bucket[$__rate_interval])))", "legendFormat": "p99 {{endpoint_class}} {{result}}", "refId": "B" }
       ],
       "title": "Admitted request lifetime",
       "type": "timeseries"
@@ -102,9 +102,9 @@
       "id": 7,
       "options": { "legend": { "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
       "targets": [
-        { "expr": "openfga_cache_controller_lag_milliseconds", "legendFormat": "maximum lag", "refId": "A" }
+        { "expr": "openfga_cache_controller_poll_freshness_age_milliseconds", "legendFormat": "maximum poll age", "refId": "A" }
       ],
-      "title": "Cache-controller lag",
+      "title": "Cache-controller poll freshness",
       "type": "timeseries"
     },
     {

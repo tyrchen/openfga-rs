@@ -1,6 +1,6 @@
 //! Consistency-bypassed, watermark-validated tuple read caches.
 
-use std::{fmt, num::NonZeroU64, sync::Arc, time::Duration};
+use std::{fmt, mem::size_of, num::NonZeroU64, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use moka::future::Cache;
@@ -19,6 +19,8 @@ use crate::{InvalidationControllerHandle, InvalidationWatermark, metrics::CacheM
 
 const MAXIMUM_TUPLE_CACHE_TTL: Duration = Duration::from_hours(24);
 const MAXIMUM_CACHED_RESULTS: usize = 100_000;
+const MAXIMUM_TUPLE_CACHE_BYTES: u64 = 512 * 1024 * 1024;
+const ESTIMATED_CACHE_ENTRY_OVERHEAD_BYTES: usize = 128;
 
 /// Validated bounded tuple-cache policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -32,18 +34,22 @@ pub struct TupleCacheConfig {
 impl TupleCacheConfig {
     /// Creates a finite tuple-cache policy.
     ///
-    /// Weight is approximately the number of owned tuple rows plus cache-entry
-    /// overhead. Result sets larger than `maximum_results` are returned without
-    /// insertion.
+    /// Weight is a conservative estimate of owned bytes, including tuple and
+    /// condition-context payloads. Result sets larger than `maximum_results`
+    /// are returned without insertion.
     ///
     /// # Errors
     ///
-    /// Returns an error for a zero/oversized result ceiling or invalid TTL.
+    /// Returns an error for an oversized byte capacity, a zero/oversized result
+    /// ceiling, or an invalid TTL.
     pub fn new(
         maximum_weight: NonZeroU64,
         maximum_results: usize,
         ttl: Duration,
     ) -> Result<Self, TupleCacheConfigError> {
+        if maximum_weight.get() > MAXIMUM_TUPLE_CACHE_BYTES {
+            return Err(TupleCacheConfigError::MaximumWeight);
+        }
         if !(1..=MAXIMUM_CACHED_RESULTS).contains(&maximum_results) {
             return Err(TupleCacheConfigError::MaximumResults);
         }
@@ -62,6 +68,9 @@ impl TupleCacheConfig {
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 #[non_exhaustive]
 pub enum TupleCacheConfigError {
+    /// The tuple cache exceeds the per-cache process ceiling.
+    #[error("tuple cache byte capacity must not exceed 536870912")]
+    MaximumWeight,
     /// The maximum cached result count is zero or above 100,000.
     #[error("tuple cache result limit must be between 1 and 100000")]
     MaximumResults,
@@ -95,12 +104,32 @@ enum TupleCacheValue {
 
 impl TupleCacheValue {
     fn weight(&self) -> u32 {
-        let rows = match self {
-            Self::Page(page) => page.items().len(),
-            Self::Tuples(tuples) => tuples.len(),
-            Self::Exact(_) | Self::Exists(_) | Self::Count(_) => 1,
+        let estimated_owned_bytes = match self {
+            Self::Page(page) => page.items().iter().fold(
+                size_of::<Self>()
+                    .saturating_add(page.items().len().saturating_mul(size_of::<StoredTuple>()))
+                    .saturating_add(
+                        page.continuation()
+                            .map_or(0, |cursor| cursor.as_bytes().len()),
+                    ),
+                |bytes, tuple| bytes.saturating_add(tuple.tuple().estimated_owned_bytes()),
+            ),
+            Self::Exact(tuple) => {
+                size_of::<Self>().saturating_add(tuple.tuple().estimated_owned_bytes())
+            }
+            Self::Tuples(tuples) => tuples.iter().fold(
+                size_of::<Self>()
+                    .saturating_add(tuples.len().saturating_mul(size_of::<RelationshipTuple>())),
+                |bytes, tuple| bytes.saturating_add(tuple.estimated_owned_bytes()),
+            ),
+            Self::Exists(_) | Self::Count(_) => size_of::<Self>(),
         };
-        u32::try_from(rows.saturating_add(1)).unwrap_or(u32::MAX)
+        u32::try_from(
+            estimated_owned_bytes
+                .saturating_add(ESTIMATED_CACHE_ENTRY_OVERHEAD_BYTES)
+                .max(1),
+        )
+        .unwrap_or(u32::MAX)
     }
 }
 
@@ -658,15 +687,20 @@ mod tests {
     };
 
     use openfga_domain::{
-        ConsistencyPreference, Deadline, RelationshipTuple, RequestTimeout, StoreId, TupleKey,
+        ConditionBinding, ConditionContext, ConditionName, ConditionReference,
+        ConsistencyPreference, Deadline, InputLimits, RelationshipTuple, RequestTimeout, StoreId,
+        TupleKey,
     };
     use openfga_storage::{
         OperationContext, StorageCancellationToken, StorageErrorKind, TupleReader,
         TupleWriteOptions, TupleWriter,
     };
     use openfga_storage_memory::{MemoryStorage, MemoryStorageConfig};
+    use serde_json::json;
 
-    use super::{CachedTupleStorage, TupleCacheConfig};
+    use super::{
+        CachedTupleStorage, TupleCacheConfig, TupleCacheEntry, TupleCacheValue, exact_key,
+    };
     use crate::InvalidationWatermark;
 
     #[tokio::test]
@@ -781,12 +815,82 @@ mod tests {
         stop_storage(storage).await
     }
 
+    #[tokio::test]
+    async fn test_should_evict_large_payloads_by_owned_byte_weight()
+    -> Result<(), Box<dyn Error + Send + Sync>> {
+        let storage = Arc::new(MemoryStorage::start(MemoryStorageConfig::default())?);
+        let store_id = store_id()?;
+        let limits = InputLimits::default();
+        let context =
+            ConditionContext::try_from_json(json!({"payload": "x".repeat(2_048)}), &limits)?;
+        let first_key = tuple_key()?;
+        let second_key = "document:second#viewer@user:anne".parse::<TupleKey>()?;
+        let condition_name = "large_payload".parse::<ConditionName>()?;
+        let tuple = |key| {
+            RelationshipTuple::new(
+                key,
+                ConditionReference::Conditional(ConditionBinding::new(
+                    condition_name.clone(),
+                    context.clone(),
+                )),
+            )
+        };
+        let first_value = TupleCacheValue::Tuples(vec![tuple(first_key.clone())].into());
+        let second_value = TupleCacheValue::Tuples(vec![tuple(second_key.clone())].into());
+        let capacity = u64::from(first_value.weight().max(second_value.weight()))
+            .checked_add(64)
+            .ok_or("test cache capacity overflowed")?;
+        let config = TupleCacheConfig::new(
+            std::num::NonZeroU64::new(capacity).ok_or("invalid test capacity")?,
+            100,
+            Duration::from_mins(1),
+        )?;
+        let cached = CachedTupleStorage::new(
+            storage.clone(),
+            storage.clone(),
+            InvalidationWatermark::new(),
+            config,
+        );
+        let first_cache_key = exact_key("large", store_id, &first_key);
+        let second_cache_key = exact_key("large", store_id, &second_key);
+        cached
+            .entries
+            .insert(
+                first_cache_key.clone(),
+                Arc::new(TupleCacheEntry {
+                    value: first_value,
+                    watermark: 0,
+                }),
+            )
+            .await;
+        cached
+            .entries
+            .insert(
+                second_cache_key.clone(),
+                Arc::new(TupleCacheEntry {
+                    value: second_value,
+                    watermark: 0,
+                }),
+            )
+            .await;
+        cached.entries.run_pending_tasks().await;
+
+        assert!(cached.entries.weighted_size() <= capacity);
+        assert!(
+            cached.entries.get(&first_cache_key).await.is_none()
+                || cached.entries.get(&second_cache_key).await.is_none()
+        );
+
+        drop(cached);
+        stop_storage(storage).await
+    }
+
     fn cached_storage(
         storage: Arc<MemoryStorage>,
         watermark: InvalidationWatermark,
     ) -> Result<CachedTupleStorage, Box<dyn Error + Send + Sync>> {
         let config = TupleCacheConfig::new(
-            std::num::NonZeroU64::new(100).ok_or("invalid test capacity")?,
+            std::num::NonZeroU64::new(1_048_576).ok_or("invalid test capacity")?,
             100,
             Duration::from_mins(1),
         )?;

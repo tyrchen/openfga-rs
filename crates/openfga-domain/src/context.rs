@@ -1,6 +1,6 @@
 //! Bounded, typed condition-context trees with deterministic fingerprints.
 
-use std::{collections::BTreeMap, fmt};
+use std::{collections::BTreeMap, fmt, mem::size_of};
 
 use serde_json::Value;
 
@@ -562,6 +562,7 @@ fn validate_context_value(
 pub struct ConditionContext {
     values: BTreeMap<ParameterName, ContextValue>,
     fingerprint: Fingerprint,
+    estimated_owned_bytes: usize,
 }
 
 impl ConditionContext {
@@ -595,9 +596,16 @@ impl ConditionContext {
             validate_context_value(value, 1, limits, &mut stats, enforce_value_byte_limit)?;
         }
         let fingerprint = fingerprint_context(&values);
+        let estimated_owned_bytes =
+            size_of::<Self>()
+                .saturating_add(stats.bytes)
+                .saturating_add(stats.values.saturating_mul(
+                    size_of::<ContextValue>().saturating_add(4 * size_of::<usize>()),
+                ));
         Ok(Self {
             values,
             fingerprint,
+            estimated_owned_bytes,
         })
     }
 
@@ -675,6 +683,7 @@ impl ConditionContext {
         Self {
             values: BTreeMap::new(),
             fingerprint: fingerprint_context(&BTreeMap::new()),
+            estimated_owned_bytes: size_of::<Self>(),
         }
     }
 
@@ -699,6 +708,12 @@ impl ConditionContext {
     #[must_use]
     pub const fn fingerprint(&self) -> Fingerprint {
         self.fingerprint
+    }
+
+    /// Returns a conservative estimate of heap and inline bytes owned by this context.
+    #[must_use]
+    pub const fn estimated_owned_bytes(&self) -> usize {
+        self.estimated_owned_bytes
     }
 
     /// Merges a tuple context over a request context by parameter name.

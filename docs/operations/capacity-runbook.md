@@ -75,6 +75,13 @@ removes its temporary data. Operators with an existing isolated database use
 `make phase4-postgres-scale-smoke POSTGRES_TEST_URL=...`; never point a destructive test at a shared
 or production database.
 
+During these loopback development gates, `GET /capacityz` samples Tokio task count, endpoint and
+storage permit availability, and PostgreSQL pool open/idle counts once per second. The route is not
+registered in the production profile. Each soak records baseline, high-water, and post-drain values
+and fails unless permits return to capacity, every open pool connection is idle, and task count
+returns within the declared tolerance. A separate one-second process sampler records RSS and OS
+thread baseline, peak, and post-drain values.
+
 The release target lifts authentication-attempt and Check rate ceilings to their validated maximum
 only for this loopback harness, isolating endpoint and storage capacity. It does not alter the
 checked-in deployment defaults. `PHASE4_SOAK_SECONDS`, `PHASE4_SOAK_CLIENTS`, and the other

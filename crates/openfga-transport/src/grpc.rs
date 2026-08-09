@@ -18,7 +18,7 @@ use openfga_proto::openfga::v1::{
 use openfga_service::ServiceError;
 use prost_reflect::ReflectMessage;
 use tokio_stream::Stream;
-use tonic::{Request, Response, Status, codegen::InterceptedService, service::Interceptor};
+use tonic::{Code, Request, Response, Status, codegen::InterceptedService, service::Interceptor};
 
 use crate::{
     ApiError, EndpointClass, OpenFgaApi,
@@ -30,14 +30,14 @@ use crate::{
 #[non_exhaustive]
 pub struct GrpcListObjectsStream {
     inner: ListObjectsStream,
-    _permit: EndpointPermit,
+    permit: EndpointPermit,
 }
 
 impl Stream for GrpcListObjectsStream {
     type Item = Result<pb::StreamedListObjectsResponse, Status>;
 
     fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.inner).poll_next(context).map(|item| {
+        let result = Pin::new(&mut self.inner).poll_next(context).map(|item| {
             item.map(|result| {
                 result
                     .map(|object| pb::StreamedListObjectsResponse {
@@ -45,7 +45,15 @@ impl Stream for GrpcListObjectsStream {
                     })
                     .map_err(|error| Status::from(ApiError::from(ServiceError::from(error))))
             })
-        })
+        });
+        match &result {
+            Poll::Ready(None) => self.permit.complete("success"),
+            Poll::Ready(Some(Err(status))) => {
+                self.permit.complete(grpc_completion(status.code()));
+            }
+            Poll::Pending | Poll::Ready(Some(Ok(_))) => {}
+        }
+        result
     }
 }
 
@@ -135,19 +143,24 @@ macro_rules! unary {
             .admission
             .admit_principal(&principal, $class)
             .map_err(Status::from)?;
-        let endpoint_permit = $self
+        let mut endpoint_permit = $self
             .acquire_endpoint_permit($class)
             .map_err(Status::from)?;
         let request_deadline = match request_deadline {
             GrpcDeadline::Elapsed => {
+                endpoint_permit.complete("timeout");
                 return Err(Status::deadline_exceeded("Request Deadline Exceeded"));
             }
             GrpcDeadline::At(deadline) => deadline,
         };
         if request_deadline.is_elapsed(Instant::now()) {
+            endpoint_permit.complete("timeout");
             return Err(Status::deadline_exceeded("Request Deadline Exceeded"));
         }
-        ApiError::validate_grpc($request.get_ref()).map_err(Status::from)?;
+        if let Err(error) = ApiError::validate_grpc($request.get_ref()) {
+            endpoint_permit.complete("client_error");
+            return Err(Status::from(error));
+        }
         let response = with_request_deadline(
             request_deadline,
             $self.$method(&principal, $request.into_inner()),
@@ -155,6 +168,10 @@ macro_rules! unary {
         .await
         .map(Response::new)
         .map_err(Status::from);
+        endpoint_permit.complete(match &response {
+            Ok(_) => "success",
+            Err(status) => grpc_completion(status.code()),
+        });
         drop(endpoint_permit);
         response
     }};
@@ -377,13 +394,14 @@ impl OpenFgaService for OpenFgaApi {
         &self,
         request: Request<pb::UpdateStoreRequest>,
     ) -> Result<Response<pb::UpdateStoreResponse>, Status> {
-        let _permit = validate_unimplemented(
+        let mut permit = validate_unimplemented(
             self,
             &request,
             Action::UpdateStore,
             &request.get_ref().store_id,
             EndpointClass::Administration,
         )?;
+        permit.complete("unimplemented");
         Err(Status::unimplemented("method UpdateStore not implemented"))
     }
 
@@ -435,23 +453,27 @@ impl OpenFgaService for OpenFgaApi {
         &self,
         request: Request<pb::StreamedListObjectsRequest>,
     ) -> Result<Response<Self::StreamedListObjectsStream>, Status> {
-        let (principal, deadline, permit) = validate_streaming(
+        let (principal, deadline, mut permit) = validate_streaming(
             self,
             &request,
             Action::StreamedListObjects,
             &request.get_ref().store_id,
             EndpointClass::Enumeration,
         )?;
-        let inner = with_request_deadline(
+        let inner = match with_request_deadline(
             deadline,
             self.streamed_list_objects(&principal, request.into_inner()),
         )
         .await
-        .map_err(Status::from)?;
-        Ok(Response::new(GrpcListObjectsStream {
-            inner,
-            _permit: permit,
-        }))
+        {
+            Ok(inner) => inner,
+            Err(error) => {
+                let status = Status::from(error);
+                permit.complete(grpc_completion(status.code()));
+                return Err(status);
+            }
+        };
+        Ok(Response::new(GrpcListObjectsStream { inner, permit }))
     }
 
     async fn list_objects(
@@ -500,17 +522,22 @@ fn validate_unimplemented<T: ReflectMessage>(
     api.admission
         .admit_principal(principal, class)
         .map_err(Status::from)?;
-    let permit = api.acquire_endpoint_permit(class).map_err(Status::from)?;
+    let mut permit = api.acquire_endpoint_permit(class).map_err(Status::from)?;
     let deadline = match deadline {
         GrpcDeadline::Elapsed => {
+            permit.complete("timeout");
             return Err(Status::deadline_exceeded("Request Deadline Exceeded"));
         }
         GrpcDeadline::At(deadline) => deadline,
     };
     if deadline.is_elapsed(Instant::now()) {
+        permit.complete("timeout");
         return Err(Status::deadline_exceeded("Request Deadline Exceeded"));
     }
-    ApiError::validate_grpc(request.get_ref()).map_err(Status::from)?;
+    if let Err(error) = ApiError::validate_grpc(request.get_ref()) {
+        permit.complete("client_error");
+        return Err(Status::from(error));
+    }
     Ok(permit)
 }
 
@@ -532,30 +559,66 @@ fn validate_streaming<T: ReflectMessage>(
     api.admission
         .admit_principal(&principal, class)
         .map_err(Status::from)?;
-    let permit = api.acquire_endpoint_permit(class).map_err(Status::from)?;
+    let mut permit = api.acquire_endpoint_permit(class).map_err(Status::from)?;
     let deadline = match deadline {
         GrpcDeadline::Elapsed => {
+            permit.complete("timeout");
             return Err(Status::deadline_exceeded("Request Deadline Exceeded"));
         }
         GrpcDeadline::At(deadline) => deadline,
     };
     if deadline.is_elapsed(Instant::now()) {
+        permit.complete("timeout");
         return Err(Status::deadline_exceeded("Request Deadline Exceeded"));
     }
-    ApiError::validate_grpc(request.get_ref()).map_err(Status::from)?;
+    if let Err(error) = ApiError::validate_grpc(request.get_ref()) {
+        permit.complete("client_error");
+        return Err(Status::from(error));
+    }
     Ok((principal, deadline, permit))
+}
+
+const fn grpc_completion(code: Code) -> &'static str {
+    match code {
+        Code::Ok => "success",
+        Code::DeadlineExceeded => "timeout",
+        Code::Cancelled => "cancelled",
+        Code::ResourceExhausted => "overloaded",
+        Code::InvalidArgument
+        | Code::NotFound
+        | Code::AlreadyExists
+        | Code::PermissionDenied
+        | Code::Unauthenticated
+        | Code::FailedPrecondition
+        | Code::OutOfRange => "client_error",
+        Code::Unimplemented => "unimplemented",
+        Code::Unknown | Code::Aborted | Code::Internal | Code::Unavailable | Code::DataLoss => {
+            "server_error"
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use openfga_auth::{AuthenticationService, PresharedKey};
     use secrecy::SecretString;
-    use tonic::{Request, service::Interceptor};
+    use tonic::{Code, Request, service::Interceptor};
 
-    use super::GrpcAuthenticationInterceptor;
+    use super::{GrpcAuthenticationInterceptor, grpc_completion};
     use crate::{AdmissionPolicy, admission::AdmissionControl};
 
     const KEY: &str = "grpc-test-preshared-key-material-with-32-bytes";
+
+    #[test]
+    fn test_should_classify_grpc_completions_with_bounded_labels() {
+        assert_eq!(grpc_completion(Code::Ok), "success");
+        assert_eq!(grpc_completion(Code::InvalidArgument), "client_error");
+        assert_eq!(grpc_completion(Code::DeadlineExceeded), "timeout");
+        assert_eq!(grpc_completion(Code::Cancelled), "cancelled");
+        assert_eq!(grpc_completion(Code::ResourceExhausted), "overloaded");
+        assert_eq!(grpc_completion(Code::Internal), "server_error");
+        assert_eq!(grpc_completion(Code::Unimplemented), "unimplemented");
+    }
 
     #[test]
     fn test_should_authenticate_grpc_metadata_before_message_dispatch()

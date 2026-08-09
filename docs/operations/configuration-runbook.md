@@ -56,16 +56,16 @@ storage:
     migrateOnStart: false
 cache:
   model:
-    sourceWeight: 100000
-    compiledWeight: 200000
+    sourceWeight: 67108864
+    compiledWeight: 134217728
     latestAliases: 10000
     immutableTtlSeconds: 604800
     latestAliasTtlSeconds: 10
   decision:
-    weight: 100000
+    weight: 16777216
     ttlSeconds: 10
   tuple:
-    weight: 1000000
+    weight: 134217728
     maximumResults: 10000
     ttlSeconds: 10
   controller:
@@ -158,8 +158,9 @@ configuration, logs, tickets, or shell history.
 | Area | Important constraints |
 | --- | --- |
 | PostgreSQL | `maxConnections` is 1–65,536; `minConnections` cannot exceed it; acquisition and statement timeouts are 1 ms–5 minutes; tuple mutations are 1–5,000 |
-| Model cache | source/compiled weights and latest-alias capacity are positive; immutable TTL is at most 30 days; the mutable latest alias is at most 5 minutes and is bypassed by higher-consistency reads |
-| Mutable caches | decision/tuple weights are positive; TTL is at most 24 hours; tuple entries hold at most 100,000 rows; higher-consistency reads bypass and do not populate either cache |
+| Model cache | source/compiled byte weights are positive and each at most 512 MiB; immutable TTL is at most 30 days; the mutable latest alias is at most 5 minutes and is bypassed by higher-consistency reads |
+| Mutable caches | decision/tuple byte weights are positive and each at most 512 MiB; TTL is at most 24 hours; tuple entries hold at most 100,000 rows; higher-consistency reads bypass and do not populate either cache |
+| Aggregate cache | configured source, compiled, decision, tuple, and estimated latest-alias capacity is at most 1 GiB per process |
 | Cache controller | channel capacity also bounds tracked stores; page size is positive and ≤1,000; poll/read/lag are ≤5 minutes; maximum lag bounds four sequential changelog reads and cannot exceed shutdown drain timeout; overflow, detectable gap/order fault, timeout, lag, failure, and restart conservatively flush and disable mutable entries until a healthy poll |
 | TLS | reload interval is 1–3,600 seconds; each complete pair is bounded and validated before one atomic publication to HTTP and gRPC |
 | Transport | page size is 1–100; timeout is 1 ms–5 minutes; token TTL is 1 second–720 hours; message size is 1–16 MiB; concurrency is 1–65,536 and, for PostgreSQL, ≤4× pool size; admission rates are 1–1,000,000 per 1–3,600-second window |

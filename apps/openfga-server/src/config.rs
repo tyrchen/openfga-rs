@@ -33,6 +33,8 @@ const MAXIMUM_PAGE_SIZE: u32 = 100;
 const MAXIMUM_POLICY_BINDINGS: usize = 1_024;
 const POSTGRES_CONTROL_PLANE_HEADROOM: u32 = 2;
 const POSTGRES_IN_FLIGHT_MULTIPLIER: u32 = 4;
+const ESTIMATED_MODEL_ALIAS_BYTES: u64 = 256;
+const MAXIMUM_AGGREGATE_CACHE_BYTES: u64 = 1024 * 1024 * 1024;
 pub(crate) const DEVELOPMENT_PRINCIPAL_ID: &str = "openfga-development-runtime";
 
 /// Fully validated server configuration. No secret values are retained here.
@@ -690,6 +692,7 @@ impl ServerConfig {
         self.model_cache_config()?;
         self.decision_cache_config()?;
         self.tuple_cache_config()?;
+        self.validate_cache_capacity()?;
         self.cache_controller_config()?;
         self.validate_transport()?;
         self.validate_evaluator()?;
@@ -799,6 +802,29 @@ impl ServerConfig {
             Duration::from_millis(self.cache.controller.maximum_lag_ms),
         )
         .context("cache controller configuration is invalid")
+    }
+
+    fn validate_cache_capacity(&self) -> Result<()> {
+        let alias_bytes = self
+            .cache
+            .model
+            .latest_aliases
+            .checked_mul(ESTIMATED_MODEL_ALIAS_BYTES)
+            .context("latest model alias byte capacity overflow")?;
+        let aggregate = [
+            self.cache.model.source_weight,
+            self.cache.model.compiled_weight,
+            self.cache.decision.weight,
+            self.cache.tuple.weight,
+            alias_bytes,
+        ]
+        .into_iter()
+        .try_fold(0_u64, u64::checked_add)
+        .context("aggregate cache byte capacity overflow")?;
+        if aggregate > MAXIMUM_AGGREGATE_CACHE_BYTES {
+            bail!("aggregate cache byte capacity must not exceed 1073741824");
+        }
+        Ok(())
     }
 
     pub(crate) fn oidc_config(&self) -> OidcConfig {
@@ -1454,11 +1480,11 @@ const fn default_health_interval_ms() -> u64 {
 }
 
 const fn default_model_source_weight() -> u64 {
-    100_000
+    64 * 1024 * 1024
 }
 
 const fn default_model_compiled_weight() -> u64 {
-    200_000
+    128 * 1024 * 1024
 }
 
 const fn default_model_aliases() -> u64 {
@@ -1474,11 +1500,11 @@ const fn default_model_alias_ttl_seconds() -> u64 {
 }
 
 const fn default_decision_weight() -> u64 {
-    100_000
+    16 * 1024 * 1024
 }
 
 const fn default_tuple_weight() -> u64 {
-    1_000_000
+    128 * 1024 * 1024
 }
 
 const fn default_tuple_cache_results() -> usize {
@@ -1679,6 +1705,16 @@ evaluator: {}
         assert!(config.validate().is_err());
 
         config.cache.model.source_weight = 1;
+        config.cache.model.compiled_weight = 512 * 1024 * 1024 + 1;
+        assert!(config.validate().is_err());
+
+        config.cache.model.compiled_weight = 128 * 1024 * 1024;
+        config.cache.model.source_weight = 512 * 1024 * 1024;
+        config.cache.tuple.weight = 512 * 1024 * 1024;
+        assert!(config.validate().is_err());
+
+        config.cache.model.source_weight = 64 * 1024 * 1024;
+        config.cache.tuple.weight = 128 * 1024 * 1024;
         config.cache.model.latest_alias_ttl_seconds = 301;
         assert!(config.validate().is_err());
 

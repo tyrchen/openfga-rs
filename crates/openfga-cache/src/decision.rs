@@ -1,6 +1,6 @@
 //! Complete semantic decision identities and bounded decision storage.
 
-use std::{fmt, num::NonZeroU64, sync::Arc, time::Duration};
+use std::{fmt, mem::size_of, num::NonZeroU64, sync::Arc, time::Duration};
 
 use getrandom::fill;
 use hmac::{Hmac, KeyInit, Mac};
@@ -13,6 +13,8 @@ use thiserror::Error;
 use crate::{InvalidationControllerHandle, InvalidationWatermark, metrics::CacheMetrics};
 
 const MAXIMUM_DECISION_TTL: Duration = Duration::from_hours(24);
+const MAXIMUM_DECISION_CACHE_BYTES: u64 = 512 * 1024 * 1024;
+const ESTIMATED_CACHE_ENTRY_OVERHEAD_BYTES: usize = 128;
 type HmacSha256 = Hmac<Sha256>;
 
 /// Validated bounded decision-cache policy.
@@ -24,15 +26,18 @@ pub struct DecisionCacheConfig {
 }
 
 impl DecisionCacheConfig {
-    /// Creates a finite fixed-size-decision policy.
+    /// Creates a finite fixed-size decision policy measured in estimated bytes.
     ///
     /// # Errors
     ///
-    /// Returns an error when the TTL is zero or longer than 24 hours.
+    /// Returns an error when the byte capacity is too large or the TTL is invalid.
     pub fn new(
         maximum_weight: NonZeroU64,
         ttl: Duration,
     ) -> Result<Self, DecisionCacheConfigError> {
+        if maximum_weight.get() > MAXIMUM_DECISION_CACHE_BYTES {
+            return Err(DecisionCacheConfigError::MaximumWeight);
+        }
         if ttl.is_zero() || ttl > MAXIMUM_DECISION_TTL {
             return Err(DecisionCacheConfigError::Ttl);
         }
@@ -47,6 +52,9 @@ impl DecisionCacheConfig {
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 #[non_exhaustive]
 pub enum DecisionCacheConfigError {
+    /// The decision cache exceeds the per-cache process ceiling.
+    #[error("decision cache byte capacity must not exceed 536870912")]
+    MaximumWeight,
     /// The entry TTL is zero or longer than 24 hours.
     #[error("decision cache TTL must be between one nanosecond and 24 hours")]
     Ttl,
@@ -172,7 +180,15 @@ where
         let entries = Cache::builder()
             .max_capacity(config.maximum_weight.get())
             .time_to_live(config.ttl)
-            .weigher(|_key: &DecisionKey, _entry: &Arc<DecisionEntry<V>>| 1)
+            .weigher(|_key: &DecisionKey, _entry: &Arc<DecisionEntry<V>>| {
+                u32::try_from(
+                    size_of::<DecisionKey>()
+                        .saturating_add(size_of::<DecisionEntry<V>>())
+                        .saturating_add(ESTIMATED_CACHE_ENTRY_OVERHEAD_BYTES)
+                        .max(1),
+                )
+                .unwrap_or(u32::MAX)
+            })
             .build();
         Self {
             entries,
@@ -310,8 +326,11 @@ mod tests {
     #[tokio::test]
     async fn test_should_reject_entries_crossing_an_invalidation() -> Result<(), &'static str> {
         let watermark = InvalidationWatermark::new();
-        let config = DecisionCacheConfig::new(NonZeroU64::MIN, Duration::from_secs(1))
-            .map_err(|_| "invalid test config")?;
+        let config = DecisionCacheConfig::new(
+            NonZeroU64::new(4_096).ok_or("invalid test capacity")?,
+            Duration::from_secs(1),
+        )
+        .map_err(|_| "invalid test config")?;
         let cache = DecisionCache::new(config, watermark.clone());
         let started = cache.begin_computation();
         let _advanced = watermark.advance();
@@ -338,7 +357,10 @@ mod tests {
             )?,
         )?;
         let mut cache = DecisionCache::new(
-            DecisionCacheConfig::new(NonZeroU64::MIN, Duration::from_secs(1))?,
+            DecisionCacheConfig::new(
+                NonZeroU64::new(4_096).ok_or("invalid test capacity")?,
+                Duration::from_secs(1),
+            )?,
             watermark,
         );
         let key = test_key().map_err(str::to_owned)?;

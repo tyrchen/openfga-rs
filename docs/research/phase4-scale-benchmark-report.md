@@ -4,106 +4,176 @@ Status: Passing on 2026-08-08
 
 ## Scope and reproducibility
 
-This report records the Phase 4 cache-consistency and production-scale gate. The Go comparison is
-the vendored OpenFGA commit `4e4f79ed841513dfd61746a75ef473f6198299f7`; the Rust runtime is the
-release build containing this report, built with `rustc 1.97.1 (8bab26f4f 2026-07-14)`. Both servers
-receive the same schema 1.1 model, tuple corpus, and direct-allow Check request over loopback HTTP.
-Store and model identifiers differ because each server creates its own isolated store.
+This report records the Phase 4 cache-consistency and production-scale gate. The pinned comparison
+is the vendored OpenFGA commit `4e4f79ed841513dfd61746a75ef473f6198299f7`; the Rust runtime is the
+release build containing this report. Both servers receive the same schema 1.1 models, tuple
+corpora, and requests over loopback HTTP. IDs differ only because each process owns an isolated
+store.
 
-Run the exact release gate with:
+Run the release evidence with:
 
 ```text
 make phase4-scale
 make phase4-local-postgres-scale-smoke
 ```
 
-The first command writes machine-readable artifacts to `target/phase4`; the second writes
-PostgreSQL artifacts to `target/phase4-postgres`. `make phase4-scale-smoke` is the short developer
-gate. The harness starts exact binaries directly, restricts targets to IP-literal loopback origins,
-bounds all client/request/duration inputs and response bodies, and removes temporary PostgreSQL data
-after shutdown.
+The first command writes machine-readable artifacts to `target/phase4`; the second creates a
+temporary local PostgreSQL cluster, runs its storage contract/fault/migration/plan gate, writes
+artifacts to `target/phase4-postgres`, and removes the cluster after shutdown. The shorter developer
+gate is `make phase4-scale-smoke`. The harness starts exact binaries directly, permits only
+IP-literal loopback origins, and bounds clients, requests, durations, response bodies, and readiness
+waits.
 
-## Declared environment
+## Declared environment and limits
 
 | Dimension | Value |
 | --- | --- |
 | Host | Apple M5 Pro, 18 logical CPUs, 64 GiB RAM |
-| OS | macOS 26.5.2 (Darwin 25.5.0, arm64) |
+| OS | macOS 26.5.2, Darwin 25.5.0, arm64 |
 | Rust | 1.97.1, LLVM 22.1.6, optimized `release` profile |
-| Go | 1.26.5 darwin/arm64 |
+| Go | 1.26.5, darwin/arm64 |
 | Network | Loopback HTTP; no TLS or proxy |
 | Primary scale backend | Actor-owned in-memory storage |
-| PostgreSQL smoke | Temporary local PostgreSQL, 16-connection pool, migrations on startup |
-| Rust bounds | 64 endpoint permits; eight Check reads; eight BatchCheck/residual roots |
-| Cache policy | Checked-in model, decision, tuple, and controller defaults |
-| Harness rate policy | Authentication-attempt and Check ceilings raised to 1,000,000/window to isolate concurrency; deployment defaults unchanged |
+| PostgreSQL smoke | Temporary local PostgreSQL; 16-connection pool; startup migrations |
+| Server bounds | 64 endpoint permits; 16 PostgreSQL work permits; eight Check reads; eight BatchCheck/residual roots |
+| Dataset | Deterministic checked-in shallow, eight-way wide, deep, recursive, conditioned, contextual, dense, and sparse fixtures; no random generator seed |
+| Harness policy | Per-class admission rate ceilings raised only inside the harness to isolate concurrency; endpoint/pool/evaluator concurrency bounds and deployment defaults are unchanged |
 
-## Correctness and fault results
+Default cache byte budgets are 64 MiB for model source, 128 MiB for compiled models, 16 MiB for
+decisions, and 128 MiB for tuples. The 10,000-entry latest-model alias cache is budgeted at 256 bytes
+per entry, making the default aggregate approximately 338.4 MiB. Each byte-weighted cache rejects a
+configuration above 512 MiB and server configuration rejects an aggregate above 1 GiB. Weights are
+conservative owned-byte estimates that include retained payload capacity and explicit entry
+overhead; tuple result sets also have a 10,000-result default limit.
 
-The full run executed 32 concurrent independent deny/write/read/delete/read sequences. All 64
-post-mutation `HIGHER_CONSISTENCY` Checks observed the completed write or delete; stale outcomes were
-zero. The PostgreSQL smoke repeated eight sequences and 16 higher-consistency observations with zero
-stale outcomes.
+## Correctness, invalidation, and fault results
 
-The cache suite separately passed timeout, lag/backlog, duplicate/order fault, registration overflow,
-conservative flush, coalescing, higher-consistency bypass, local write invalidation, actor restart,
-and bounded stop/join cases. The rolling-drain gate admitted a deliberately nonterminating request,
-marked the listener for graceful shutdown, enforced the drain deadline, released the client, and
-joined every owned listener task.
+| Backend and mutation path | Concurrent sequences | Higher-consistency observations | Minimize-latency observations | Stale results |
+| --- | ---: | ---: | ---: | ---: |
+| In-memory, mutation through the reader process | 32 | 64 | 64 | 0 |
+| PostgreSQL, independent writer process through the shared changelog | 8 | 16 | 1,890 | 0 |
 
-## Pinned Go reference
+Each sequence checked deny, committed a write, observed allow, committed a delete, and observed deny.
+PostgreSQL `MINIMIZE_LATENCY` reads additionally had to converge through changelog polling; the
+independent writer shared no process-local invalidation state with the reader.
 
-Each client issued 25 sequential requests after warmup. Latency is reported only for successful
-allows; shed responses are counted separately. These small same-host samples are orientation data,
-not a portable service-level objective or a noise-aware regression threshold.
+The cache suite passed timeout, lag/backlog, duplicate/order, registration-overflow, conservative
+flush, cold-latest publication races, coalescing, higher-consistency bypass, local-write
+invalidation, actor restart, and bounded stop/join cases. Transport metrics classify only a bounded
+completion result, and the dashboard/alerts expose controller poll freshness rather than implying
+that a poll timestamp is an applied watermark. The rolling-drain test admitted a deliberately
+nonterminating request, initiated graceful shutdown, enforced the drain deadline, released the
+client, and joined every owned listener task.
 
-| Clients | Implementation | Requests | Allowed / overloaded | Requests/s | p50 | p95 | p99 |
-| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | Go | 25 | 25 / 0 | 2,515 | 327 µs | 755 µs | 1,383 µs |
-| 1 | Rust | 25 | 25 / 0 | 581 | 1,695 µs | 1,973 µs | 2,314 µs |
-| 10 | Go | 250 | 250 / 0 | 19,508 | 392 µs | 1,067 µs | 1,475 µs |
-| 10 | Rust | 250 | 250 / 0 | 4,724 | 1,936 µs | 2,504 µs | 3,985 µs |
-| 100 | Go | 2,500 | 2,500 / 0 | 34,925 | 2,428 µs | 4,691 µs | 10,566 µs |
-| 100 | Rust | 2,500 | 2,500 / 0 | 7,295 | 11,820 µs | 24,050 µs | 32,156 µs |
+## Pinned Go reference matrix
 
-There were no authorization mismatches. The Go server was 4.1–4.8 times faster by observed
-throughput in this narrow workload, and Rust allowed-result p95 was 2.3–5.1 times higher. This is an
-explicit optimization opportunity, not a reason to weaken consistency, admission, or resource
-bounds. The deterministic transport test proves protocol-compatible shedding by holding all 64
-endpoint permits; the reference sample did not keep 64 requests simultaneously in service long
-enough to shed.
+The matrix contains 132 rows across 18 workload names: 16 matrix workloads plus a post-tuple-
+invalidation check and a distinct cold-store Check. Warm rows use 1, 10, and 100 clients; initial
+rows isolate the first operation. Check, BatchCheck, and explicit model load use up to 25 requests
+per client, enumeration uses five, and mutation workloads use one. Model publication populates the
+immutable model caches by design, so its first explicit HTTP load is honestly labeled
+`post-publish`; a separate engine benchmark below measures a genuinely cold storage-backed load.
+The two ListObjects profiles record exact 0% and 100% residual-Check ratios. The complete artifact
+contains p50/p95/p99 for successful responses and never folds overload into latency.
 
-## Thirty-minute release soak
+Across the full in-memory matrix, all 64,860 requests produced the expected successful result with
+zero semantic mismatches or overload responses. Every successful response was parsed into a typed
+operation-specific result; each loaded row was checked against the successfully matched Go/Rust
+warm semantic oracle. Representative warm 100-client rows are:
 
-The 100 clients were paced to a combined ceiling of 10,000 attempts/s. The optimized Rust server ran
-for 1,800.015 seconds and completed 11,587,169 allowed Checks at 6,437 requests/s with zero denials,
-unexpected errors, or overload responses. The maximum individual request time was 68.362 ms.
-Readiness remained `SERVING` at sampled checkpoints throughout the run.
+| Workload | Go allowed / overload | Go p95 | Rust allowed / overload | Rust p95 |
+| --- | ---: | ---: | ---: | ---: |
+| Direct exact Check | 2,500 / 0 | 4,353 µs | 2,500 / 0 | 22,939 µs |
+| Recursive userset Check | 2,500 / 0 | 233,494 µs | 2,500 / 0 | 24,084 µs |
+| Deep recursive userset Check | 2,500 / 0 | 541,830 µs | 2,500 / 0 | 23,399 µs |
+| Eight-way union Check | 2,500 / 0 | 5,200 µs | 2,500 / 0 | 24,629 µs |
+| ListUsers set algebra | 500 / 0 | 6,497 µs | 500 / 0 | 19,004 µs |
+| ListObjects, 0% residual | 500 / 0 | 3,996 µs | 500 / 0 | 10,376 µs |
+| ListObjects, 100% residual | 500 / 0 | 5,685 µs | 500 / 0 | 9,655 µs |
+| Explicit model load, post-publish | 2,500 / 0 | 6,804 µs | 2,500 / 0 | 1,915 µs |
+| Model compile and publish | 100 / 0 | 9,597 µs | 100 / 0 | 161,445 µs |
+| Tuple write and changelog | 100 / 0 | 4,194 µs | 100 / 0 | 6,245 µs |
 
-Post-warm RSS rose from 87,568 KiB to 106,560 KiB: 18,992 KiB growth against a 65,536 KiB gate. RSS
-reached its plateau early and remained stable through the end. The workload uses one hot semantic
-key, so bounded cache cardinality is additionally covered by cache capacity tests rather than
-inferred from this memory result.
+These are small, same-host, end-to-end HTTP orientation samples. They are not engine-latency
+evidence, a portable service-level objective, or a noise-aware regression threshold. They show that
+the relative result depends strongly on the operation: Rust is materially faster on recursive
+fixtures and post-publication explicit model reads, while Go is faster on direct/wide checks,
+enumeration, and mutations. Each row records ending RSS for its process. CPU is computed from
+before/after process-time deltas and is `null` for intervals shorter than 100 ms or samples exceeding
+the host logical-CPU ceiling, because centisecond process accounting cannot attribute those rows
+reliably; 14 longer rows produced attributable CPU values.
+
+## Engine latency and allocation budgets
+
+Fixed-sample checks measure individual operations and fail the gate at the Phase 4 engineering
+budgets. Criterion supplies a separate statistically sampled estimate:
+
+| Operation | Fixed-sample p95 | Budget | Criterion estimate | Result |
+| --- | ---: | ---: | ---: | --- |
+| Cold explicit model load and compile | 17.750 µs | Informational | 44.865–45.543 µs | Pass |
+| Warm explicit model-cache hit | 0.834 µs | Informational | 0.675–0.677 µs | Pass |
+| Direct in-memory Check | 13.375 µs | ≤ 1 ms | 8.787–8.830 µs | Pass |
+| Warm decision-cache hit | 0.792 µs | ≤ 250 µs | 0.708–0.710 µs | Pass |
+| Maximum supported model compile | 952.042 µs | ≤ 250 ms | 850.740–861.240 µs | Pass |
+
+The maximum-model compile retained its output while `dhat` measured a 610,855-byte peak heap,
+against the 64 MiB temporary-memory budget. `dhat` is a release-benchmark-only development
+dependency; it is not linked into the server. The compile fixture exercises the maximum supported
+100 types, 100 relations, 10,000 rewrite nodes, and 100 conditions simultaneously. The cold model-
+load benchmark pre-populates the underlying actor-owned store before constructing the cache, so its
+first explicit read performs a real source load and compilation. These direct measurements, rather
+than HTTP scheduling and serialization, are the evidence for the engine budgets.
+
+## Thirty-minute in-memory release soak
+
+One hundred clients were paced to a combined ceiling of 10,000 attempts/s. The server ran for
+1,800.016 seconds and completed 10,760,241 expected allows at 5,977 requests/s with zero overload.
+The maximum individual request time was 212.500 ms, and all 1,801 sampled readiness probes returned
+`SERVING`.
+
+| Resource | Baseline | High-water | Post-drain | Bound/result |
+| --- | ---: | ---: | ---: | --- |
+| Runtime tasks | 7 | 109 | 7 | Post-drain tolerance: 8; pass |
+| Endpoint permits | 64 available | 18 in flight | 64 available | Capacity: 64; pass |
+| RSS | 109,584 KiB | 115,712 KiB | 115,712 KiB | Growth: 6,128 KiB ≤ 65,536 KiB; pass |
+| Threads | 19 | 19 | 19 | No growth; pass |
+
+The harness recorded 1,802 resource samples. In-memory storage has no SQL pool or storage-work
+semaphore, so those artifact fields are explicitly `null`/zero rather than inferred.
 
 ## PostgreSQL authoritative-read smoke
 
-An isolated temporary PostgreSQL cluster exercised `HIGHER_CONSISTENCY` for every soak Check, so
-model and tuple reads bypassed mutable caches and passed through the global storage work semaphore
-and 16-connection pool. Sixteen clients ran for 30.005 seconds: 40,400 allows, zero overload or
-semantic failures, 1,346 requests/s, and 18.613 ms maximum request time. All 31 readiness probes
-passed. RSS grew 28,256 KiB, below the same 65,536 KiB gate. Pool and work cardinality cannot exceed
-the configured 16 permits/connections; the load produced no acquire deadline, cancellation, or
-availability failure. The same temporary cluster passed the complete PostgreSQL storage contract,
-transaction fault-injection, migration, concurrency, and query-plan gate before the load run.
+The fresh local PostgreSQL run used `HIGHER_CONSISTENCY`, bypassing mutable caches and routing reads
+through the global storage-work semaphore and 16-connection pool. Sixteen clients ran for 30.002
+seconds: 40,431 expected allows, zero overload, 1,347 requests/s, 11.910 ms maximum request time, and
+31 successful readiness probes.
+
+| Resource | Baseline | High-water | Post-drain | Result |
+| --- | ---: | ---: | ---: | --- |
+| Runtime tasks | 7 | 45 | 7 | Returned to baseline; pass |
+| Endpoint permits | 64 available | 16 in flight | 64 available | Fully returned; pass |
+| Storage-work permits | 16 available | 16 in flight | 16 available | Fully returned; pass |
+| Pool connections | 16 open / 16 idle | 16 in use | 16 open / 16 idle | Fully returned; pass |
+| RSS | 118,000 KiB | 127,808 KiB | 127,808 KiB | Growth: 9,808 KiB ≤ 65,536 KiB; pass |
+| Threads | 20 | 20 | 19 | No growth; pass |
+
+The direct PostgreSQL Check reference p95 was 1.778 ms at one client and 6.186 ms at ten clients,
+both within the 10 ms local-network budget. At 100 clients, finite admission shed 246 of 500
+requests and allowed-result p95 was 22.897 ms; that deliberate overload point is outside the budget's
+stated scope. Before load, the same disposable cluster passed the complete PostgreSQL storage
+contract, transaction fault-injection, migration, concurrency, and query-plan gate.
 
 ## Interpretation and limits
 
-- The Phase 4 correctness, finite-resource, release-soak, live PostgreSQL, and rolling-drain gates
-  pass on the declared host.
-- The comparison covers one hot direct-allow HTTP Check. It does not characterize every reference
-  workload in the performance design, remote-database latency, TLS, authentication, OTLP export, or
-  multi-node behavior.
-- The measured Rust/Go gap is retained honestly. No performance optimization graduates from these
-  data, and no numerical service objective is recalibrated here.
-- PostgreSQL data was disposable and local. Production capacity must repeat the worksheet in the
-  [capacity runbook](../operations/capacity-runbook.md) against its real model mix and network RTT.
+- Phase 4's consistency, conservative-failure, finite-resource, release-soak, live-PostgreSQL, and
+  rolling-drain exit gates pass on the declared host.
+- Loopback results do not characterize remote database latency, TLS, authentication, OTLP export,
+  multi-node invalidation, or production traffic distributions.
+- The HTTP comparison is intentionally retained without hiding slower Rust rows or overload. No
+  optimization is graduated from this evidence alone.
+- RSS is process-level evidence for this workload, not proof that every possible cache key mix
+  reaches the configured byte ceiling safely; owned-byte estimators and capacity/eviction tests
+  provide the complementary cardinality bound.
+- Production deployments must repeat the worksheet in the
+  [capacity runbook](../operations/capacity-runbook.md) with their actual model mix, database, and
+  network RTT.

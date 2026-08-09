@@ -20,16 +20,16 @@ storage:
     migrateOnStart: false
 cache:
   model:
-    sourceWeight: 100000
-    compiledWeight: 200000
+    sourceWeight: 67108864
+    compiledWeight: 134217728
     latestAliases: 10000
     immutableTtlSeconds: 604800
     latestAliasTtlSeconds: 10
   decision:
-    weight: 100000
+    weight: 16777216
     ttlSeconds: 10
   tuple:
-    weight: 1000000
+    weight: 134217728
     maximumResults: 10000
     ttlSeconds: 10
   controller:

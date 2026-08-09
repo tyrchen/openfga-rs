@@ -3,6 +3,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
+    mem::size_of,
     sync::Arc,
 };
 
@@ -116,6 +117,92 @@ impl CompiledModel {
     #[must_use]
     pub const fn fingerprint(&self) -> Fingerprint {
         self.fingerprint
+    }
+
+    /// Returns a conservative estimate of heap and inline bytes owned by this compiled model.
+    #[must_use]
+    pub fn estimated_owned_bytes(&self) -> usize {
+        let map_node_overhead = 4_usize.saturating_mul(size_of::<usize>());
+        let mut bytes =
+            size_of::<Self>()
+                .saturating_add(self.schema_version.len())
+                .saturating_add(self.types.len().saturating_mul(size_of::<CompiledType>()))
+                .saturating_add(
+                    self.relations
+                        .len()
+                        .saturating_mul(size_of::<CompiledRelation>()),
+                )
+                .saturating_add(self.nodes.len().saturating_mul(size_of::<RewriteNode>()))
+                .saturating_add(
+                    self.conditions
+                        .len()
+                        .saturating_mul(size_of::<CompiledConditionEntry>()),
+                )
+                .saturating_add(self.type_lookup.len().saturating_mul(
+                    size_of::<(TypeName, TypeId)>().saturating_add(map_node_overhead),
+                ))
+                .saturating_add(
+                    self.relation_lookup.len().saturating_mul(
+                        size_of::<((TypeName, RelationName), RelationId)>()
+                            .saturating_add(map_node_overhead),
+                    ),
+                )
+                .saturating_add(self.condition_lookup.len().saturating_mul(
+                    size_of::<(ConditionName, ConditionId)>().saturating_add(map_node_overhead),
+                ));
+        for compiled_type in &self.types {
+            bytes = bytes
+                .saturating_add(compiled_type.name.as_str().len())
+                .saturating_add(
+                    compiled_type
+                        .relations
+                        .len()
+                        .saturating_mul(size_of::<RelationId>()),
+                );
+        }
+        for relation in &self.relations {
+            bytes = bytes
+                .saturating_add(relation.name.as_str().len())
+                .saturating_add(
+                    relation
+                        .restrictions
+                        .len()
+                        .saturating_mul(size_of::<DirectRestriction>()),
+                );
+        }
+        for node in &self.nodes {
+            bytes = bytes.saturating_add(match node {
+                RewriteNode::TupleToUserset {
+                    computed, targets, ..
+                } => computed
+                    .as_str()
+                    .len()
+                    .saturating_add(targets.len().saturating_mul(size_of::<RelationId>())),
+                RewriteNode::Union(children) | RewriteNode::Intersection(children) => {
+                    children.len().saturating_mul(size_of::<NodeId>())
+                }
+                RewriteNode::Direct(_)
+                | RewriteNode::Computed(_)
+                | RewriteNode::Difference { .. } => 0,
+            });
+        }
+        for condition in &self.conditions {
+            bytes = bytes
+                .saturating_add(condition.name.as_str().len())
+                .saturating_add(condition.condition.estimated_owned_bytes());
+        }
+        for name in self.type_lookup.keys() {
+            bytes = bytes.saturating_add(name.as_str().len());
+        }
+        for (object_type, relation) in self.relation_lookup.keys() {
+            bytes = bytes
+                .saturating_add(object_type.as_str().len())
+                .saturating_add(relation.as_str().len());
+        }
+        for name in self.condition_lookup.keys() {
+            bytes = bytes.saturating_add(name.as_str().len());
+        }
+        bytes.saturating_add(graph_owned_bytes(&self.graph, map_node_overhead))
     }
 
     /// Resolves a declared object type.
@@ -275,6 +362,39 @@ impl CompiledModel {
             .copied()
             .flatten()
     }
+}
+
+fn graph_owned_bytes(graph: &GraphMetadata, map_node_overhead: usize) -> usize {
+    let relation_id_bytes = |relations: &[Box<[RelationId]>]| {
+        relations.iter().fold(
+            relations
+                .len()
+                .saturating_mul(size_of::<Box<[RelationId]>>()),
+            |total, row| total.saturating_add(row.len().saturating_mul(size_of::<RelationId>())),
+        )
+    };
+    let set_bytes = |sets: &[BTreeSet<TypeId>]| {
+        sets.iter().fold(
+            sets.len().saturating_mul(size_of::<BTreeSet<TypeId>>()),
+            |total, set| {
+                total.saturating_add(
+                    set.len()
+                        .saturating_mul(size_of::<TypeId>().saturating_add(map_node_overhead)),
+                )
+            },
+        )
+    };
+    size_of::<GraphMetadata>()
+        .saturating_add(relation_id_bytes(&graph.forward))
+        .saturating_add(relation_id_bytes(&graph.reverse))
+        .saturating_add(set_bytes(&graph.reachable_types))
+        .saturating_add(set_bytes(&graph.reachable_wildcards))
+        .saturating_add(
+            graph
+                .recursion_groups
+                .capacity()
+                .saturating_mul(size_of::<Option<u32>>()),
+        )
 }
 
 impl fmt::Debug for CompiledModel {

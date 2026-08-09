@@ -59,7 +59,7 @@ use tonic_health::{ServingStatus, server::HealthReporter};
 use tower::limit::ConcurrencyLimitLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 
-use crate::config::{AuthMode, DEVELOPMENT_PRINCIPAL_ID, ServerConfig, StorageBackend};
+use crate::config::{AuthMode, DEVELOPMENT_PRINCIPAL_ID, Profile, ServerConfig, StorageBackend};
 
 const MAXIMUM_SECRET_ENV_BYTES: usize = 8_192;
 const MAXIMUM_TLS_FILE_BYTES: u64 = 2 * 1_024 * 1_024;
@@ -70,6 +70,24 @@ const MAXIMUM_HEALTH_CONCURRENCY: usize = 64;
 #[serde(rename_all = "camelCase")]
 struct HealthResponse {
     status: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CapacityResponse {
+    runtime_tasks: usize,
+    endpoint_permits_available: usize,
+    endpoint_permits_capacity: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    storage_work_permits_available: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    storage_work_permits_capacity: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    primary_pool_open: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    primary_pool_idle: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    primary_pool_capacity: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -112,9 +130,19 @@ impl fmt::Debug for TlsMaterial {
     }
 }
 
+#[derive(Clone)]
 enum StorageOwner {
     Memory(Arc<MemoryStorage>),
     Postgres(Arc<PostgresStorage>),
+}
+
+#[derive(Clone)]
+struct HealthRouterState {
+    health: Arc<HealthState>,
+    api: OpenFgaApi,
+    storage: StorageOwner,
+    storage_work_capacity: Option<usize>,
+    primary_pool_capacity: Option<u32>,
 }
 
 impl fmt::Debug for StorageOwner {
@@ -207,6 +235,14 @@ pub(crate) async fn run(config: ServerConfig) -> Result<()> {
     let http_listener = bind(config.listeners.http, "HTTP").await?;
     let grpc_listener = bind(config.listeners.grpc, "gRPC").await?;
     let health_state = Arc::new(HealthState::new());
+    let (storage_work_capacity, primary_pool_capacity) = storage_capacities(&config)?;
+    let health_router_state = HealthRouterState {
+        health: Arc::clone(&health_state),
+        api: api.clone(),
+        storage: storage.clone(),
+        storage_work_capacity,
+        primary_pool_capacity,
+    };
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
     health_reporter
@@ -225,11 +261,14 @@ pub(crate) async fn run(config: ServerConfig) -> Result<()> {
         let actor_shutdown = shutdown_rx.clone();
         tasks.spawn(async move { material.run_reloader(actor_shutdown).await });
     }
+    let health_router = health_router(
+        health_router_state,
+        should_expose_capacity(config.profile, config.listeners.http),
+    );
     spawn_http(
         &mut tasks,
         http_listener,
-        http_router(api.clone(), authentication.clone())
-            .merge(health_router(Arc::clone(&health_state))),
+        http_router(api.clone(), authentication.clone()).merge(health_router),
         tls.as_ref(),
         shutdown_rx.clone(),
         config.drain_timeout() / 2,
@@ -282,6 +321,16 @@ pub(crate) async fn run(config: ServerConfig) -> Result<()> {
     shutdown_resources(storage, identifiers, &mut cache_controller).await?;
     first_failure?;
     drain_result
+}
+
+fn storage_capacities(config: &ServerConfig) -> Result<(Option<usize>, Option<u32>)> {
+    let is_postgres = config.storage.backend == StorageBackend::Postgres;
+    let work = is_postgres
+        .then(|| usize::try_from(config.storage.postgres.max_connections))
+        .transpose()
+        .context("PostgreSQL work capacity is out of range")?;
+    let pool = is_postgres.then_some(config.storage.postgres.max_connections);
+    Ok((work, pool))
 }
 
 pub(crate) fn postgres_config(
@@ -805,25 +854,62 @@ async fn bind(address: SocketAddr, protocol: &str) -> Result<tokio::net::TcpList
         .with_context(|| format!("failed to bind {protocol} listener at {address}"))
 }
 
-fn health_router(state: Arc<HealthState>) -> Router {
-    Router::new()
+fn health_router(state: HealthRouterState, expose_capacity: bool) -> Router {
+    let router = Router::new()
         .route("/healthz", get(liveness))
-        .route("/readyz", get(readiness))
+        .route("/readyz", get(readiness));
+    let router = if expose_capacity {
+        router.route("/capacityz", get(capacity))
+    } else {
+        router
+    };
+    router
         .layer(RequestBodyLimitLayer::new(MAXIMUM_HEALTH_BODY_BYTES))
         .layer(ConcurrencyLimitLayer::new(MAXIMUM_HEALTH_CONCURRENCY))
         .with_state(state)
 }
 
+fn should_expose_capacity(profile: Profile, http_address: SocketAddr) -> bool {
+    profile == Profile::Development && http_address.ip().is_loopback()
+}
+
 async fn liveness(
-    axum::extract::State(state): axum::extract::State<Arc<HealthState>>,
+    axum::extract::State(state): axum::extract::State<HealthRouterState>,
 ) -> (StatusCode, Json<HealthResponse>) {
-    health_response(state.live.load(Ordering::Acquire))
+    health_response(state.health.live.load(Ordering::Acquire))
 }
 
 async fn readiness(
-    axum::extract::State(state): axum::extract::State<Arc<HealthState>>,
+    axum::extract::State(state): axum::extract::State<HealthRouterState>,
 ) -> (StatusCode, Json<HealthResponse>) {
-    health_response(state.ready.load(Ordering::Acquire))
+    health_response(state.health.ready.load(Ordering::Acquire))
+}
+
+async fn capacity(
+    axum::extract::State(state): axum::extract::State<HealthRouterState>,
+) -> Json<CapacityResponse> {
+    let (endpoint_permits_available, endpoint_permits_capacity) = state.api.endpoint_capacity();
+    let (storage_work_permits_available, primary_pool_open, primary_pool_idle) =
+        match &state.storage {
+            StorageOwner::Memory(_) => (None, None, None),
+            StorageOwner::Postgres(storage) => (
+                Some(storage.available_work_permits()),
+                Some(storage.primary_pool().size()),
+                Some(storage.primary_pool().num_idle()),
+            ),
+        };
+    Json(CapacityResponse {
+        runtime_tasks: tokio::runtime::Handle::current()
+            .metrics()
+            .num_alive_tasks(),
+        endpoint_permits_available,
+        endpoint_permits_capacity,
+        storage_work_permits_available,
+        storage_work_permits_capacity: state.storage_work_capacity,
+        primary_pool_open,
+        primary_pool_idle,
+        primary_pool_capacity: state.primary_pool_capacity,
+    })
 }
 
 const fn health_response(healthy: bool) -> (StatusCode, Json<HealthResponse>) {
@@ -1159,6 +1245,7 @@ async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {
 #[cfg(test)]
 mod tests {
     use std::{
+        net::SocketAddr,
         path::PathBuf,
         sync::{
             Arc,
@@ -1169,11 +1256,7 @@ mod tests {
 
     use anyhow::Context as _;
     use async_trait::async_trait;
-    use axum::{
-        body::Body,
-        http::{Request, StatusCode},
-        routing::get,
-    };
+    use axum::{http::StatusCode, routing::get};
     use openfga_auth::{AuthenticationService, AuthorizationPolicy};
     use openfga_check::CheckBudget;
     use openfga_domain::{
@@ -1207,15 +1290,27 @@ mod tests {
         task::JoinSet,
         time::timeout,
     };
-    use tower::ServiceExt;
 
     use super::{
-        HealthState, TlsMaterial, TransportRuntime, drain_tasks, health_router, spawn_grpc,
-        spawn_http,
+        HealthState, TlsMaterial, TransportRuntime, drain_tasks, health_response,
+        should_expose_capacity, spawn_grpc, spawn_http,
     };
+    use crate::config::Profile;
 
     const STORE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
     const MODEL_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAW";
+    const CANCELLATION_DISPATCH_BOUND: Duration = Duration::from_millis(10);
+
+    #[test]
+    fn test_should_expose_capacity_only_on_loopback_development_listener() -> anyhow::Result<()> {
+        let loopback = "127.0.0.1:8080".parse::<SocketAddr>()?;
+        let public = "0.0.0.0:8080".parse::<SocketAddr>()?;
+
+        assert!(should_expose_capacity(Profile::Development, loopback));
+        assert!(!should_expose_capacity(Profile::Development, public));
+        assert!(!should_expose_capacity(Profile::Production, loopback));
+        Ok(())
+    }
 
     #[derive(Debug)]
     struct FixedIdentifiers {
@@ -1588,14 +1683,21 @@ mod tests {
     async fn wait_for_request_cancellation(
         cancellation: StorageCancellationToken,
         active: &AtomicUsize,
-    ) -> anyhow::Result<()> {
-        timeout(Duration::from_secs(1), async {
+    ) -> anyhow::Result<Duration> {
+        let started_at = std::time::Instant::now();
+        timeout(CANCELLATION_DISPATCH_BOUND, async {
             while !cancellation.is_cancelled() || active.load(Ordering::Acquire) != 0 {
                 tokio::task::yield_now().await;
             }
         })
         .await?;
-        Ok(())
+        let elapsed = started_at.elapsed();
+        if elapsed > CANCELLATION_DISPATCH_BOUND {
+            anyhow::bail!(
+                "storage cancellation took {elapsed:?}, above {CANCELLATION_DISPATCH_BOUND:?}",
+            );
+        }
+        Ok(elapsed)
     }
 
     async fn assert_http_disconnect_cancels_storage(
@@ -1618,9 +1720,10 @@ mod tests {
             .await?
             .with_context(|| format!("HTTP {operation} did not reach storage"))?;
         drop(client);
-        wait_for_request_cancellation(cancellation, active)
+        let _elapsed = wait_for_request_cancellation(cancellation, active)
             .await
-            .with_context(|| format!("HTTP {operation} storage work remained active"))
+            .with_context(|| format!("HTTP {operation} storage work remained active"))?;
+        Ok(())
     }
 
     fn streamed_list_objects_request() -> pb::StreamedListObjectsRequest {
@@ -1678,28 +1781,24 @@ mod tests {
             .with_context(|| format!("gRPC {operation} did not reach storage"))?;
         task.abort();
         assert!(task.await.is_err_and(|error| error.is_cancelled()));
-        wait_for_request_cancellation(cancellation, active)
+        let _elapsed = wait_for_request_cancellation(cancellation, active)
             .await
-            .with_context(|| format!("gRPC {operation} storage work remained active"))
+            .with_context(|| format!("gRPC {operation} storage work remained active"))?;
+        Ok(())
     }
 
     #[tokio::test]
     async fn test_should_report_readiness_transitions() -> anyhow::Result<()> {
         let state = Arc::new(HealthState::new());
-        let router = health_router(Arc::clone(&state));
-        let unavailable = router
-            .clone()
-            .oneshot(Request::get("/readyz").body(Body::empty())?)
-            .await?;
         assert_eq!(
-            unavailable.status(),
-            axum::http::StatusCode::SERVICE_UNAVAILABLE
+            health_response(state.ready.load(Ordering::Acquire)).0,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
         );
         let _previous_readiness = state.set_ready(true);
-        let ready = router
-            .oneshot(Request::get("/readyz").body(Body::empty())?)
-            .await?;
-        assert_eq!(ready.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            health_response(state.ready.load(Ordering::Acquire)).0,
+            axum::http::StatusCode::OK,
+        );
         tokio::time::timeout(Duration::from_secs(1), async {}).await?;
         Ok(())
     }

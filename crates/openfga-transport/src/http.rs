@@ -8,7 +8,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, OnceLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     task::{Context, Poll},
 };
@@ -48,6 +48,7 @@ use tower_http::{
 
 use crate::{
     ApiError, EndpointClass, OpenFgaApi, admission::AdmissionControl, api::EndpointPermit,
+    error::HttpCompletionClass,
 };
 
 const REQUEST_ID_HEADER: HeaderName = HeaderName::from_static("x-request-id");
@@ -128,11 +129,12 @@ async fn limit_endpoint_concurrency(
 ) -> Response {
     let class = endpoint_class(request.method(), request.uri().path());
     match api.acquire_endpoint_permit(class) {
-        Ok(permit) => {
+        Ok(mut permit) => {
             let response = next.run(request).await;
             if is_streamed_list_objects(response.extensions()) {
                 retain_permit_for_body(response, permit)
             } else {
+                permit.complete(http_completion(&response));
                 drop(permit);
                 response
             }
@@ -141,8 +143,10 @@ async fn limit_endpoint_concurrency(
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-struct StreamedListObjectsResponseMarker;
+#[derive(Clone, Debug, Default)]
+struct StreamedListObjectsResponseMarker {
+    failed: Arc<AtomicBool>,
+}
 
 fn is_streamed_list_objects(extensions: &axum::http::Extensions) -> bool {
     extensions
@@ -152,11 +156,16 @@ fn is_streamed_list_objects(extensions: &axum::http::Extensions) -> bool {
 
 fn retain_permit_for_body(response: Response, permit: EndpointPermit) -> Response {
     let (parts, body) = response.into_parts();
+    let stream_marker = parts
+        .extensions
+        .get::<StreamedListObjectsResponseMarker>()
+        .cloned();
     Response::from_parts(
         parts,
         Body::from_stream(PermittedBodyStream {
             inner: body.into_data_stream(),
-            _permit: permit,
+            permit,
+            stream_marker,
         }),
     )
 }
@@ -164,14 +173,46 @@ fn retain_permit_for_body(response: Response, permit: EndpointPermit) -> Respons
 #[derive(Debug)]
 struct PermittedBodyStream {
     inner: BodyDataStream,
-    _permit: EndpointPermit,
+    permit: EndpointPermit,
+    stream_marker: Option<StreamedListObjectsResponseMarker>,
 }
 
 impl Stream for PermittedBodyStream {
     type Item = Result<Bytes, axum::Error>;
 
     fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.inner).poll_next(context)
+        let result = Pin::new(&mut self.inner).poll_next(context);
+        match &result {
+            Poll::Ready(None) => {
+                let completion = streamed_completion(self.stream_marker.as_ref());
+                self.permit.complete(completion);
+            }
+            Poll::Ready(Some(Err(_))) => self.permit.complete("stream_error"),
+            Poll::Pending | Poll::Ready(Some(Ok(_))) => {}
+        }
+        result
+    }
+}
+
+fn streamed_completion(marker: Option<&StreamedListObjectsResponseMarker>) -> &'static str {
+    if marker.is_some_and(|marker| marker.failed.load(Ordering::Acquire)) {
+        "stream_error"
+    } else {
+        "success"
+    }
+}
+
+fn http_completion(response: &Response) -> &'static str {
+    if let Some(class) = response.extensions().get::<HttpCompletionClass>() {
+        return class.value();
+    }
+    let status = response.status();
+    match status.as_u16() {
+        200..=399 => "success",
+        408 | 504 => "timeout",
+        429 => "overloaded",
+        400..=499 => "client_error",
+        _ => "server_error",
     }
 }
 
@@ -969,30 +1010,35 @@ async fn streamed_list_objects(
     request.store_id.clone_from(&store_id);
     match api.streamed_list_objects(&principal, request).await {
         Ok(stream) => {
-            let body = Body::from_stream(
-                stream.map(|item| Ok::<_, Infallible>(streamed_item_bytes(item))),
-            );
+            let marker = StreamedListObjectsResponseMarker::default();
+            let stream_marker = marker.clone();
+            let body =
+                Body::from_stream(stream.map(move |item| {
+                    Ok::<_, Infallible>(streamed_item_bytes(item, &stream_marker))
+                }));
             let mut response = (
                 StatusCode::OK,
                 [(axum::http::header::CONTENT_TYPE, "application/json")],
                 body,
             )
                 .into_response();
-            response
-                .extensions_mut()
-                .insert(StreamedListObjectsResponseMarker);
+            response.extensions_mut().insert(marker);
             response
         }
         Err(error) => streamed_error_response(error),
     }
 }
 
-fn streamed_item_bytes(item: Result<ObjectRef, ListError>) -> Bytes {
+fn streamed_item_bytes(
+    item: Result<ObjectRef, ListError>,
+    marker: &StreamedListObjectsResponseMarker,
+) -> Bytes {
     let encoded = match item {
         Ok(object) => serde_json::to_vec(&pb::StreamedListObjectsResponse {
             object: object.to_string(),
         }),
         Err(error) => {
+            marker.failed.store(true, Ordering::Release);
             let error = ApiError::from(ServiceError::from(error));
             let status = Status::from(error);
             serde_json::to_vec(&StreamErrorResponse {
@@ -1027,8 +1073,9 @@ struct StreamError {
 }
 
 fn streamed_error_response(error: ApiError) -> Response {
+    let completion = error.http_completion_class();
     let status = Status::from(error);
-    (
+    let mut response = (
         StatusCode::BAD_REQUEST,
         Json(StreamErrorResponse {
             error: StreamError {
@@ -1038,7 +1085,9 @@ fn streamed_error_response(error: ApiError) -> Response {
             },
         }),
     )
-        .into_response()
+        .into_response();
+    response.extensions_mut().insert(completion);
+    response
 }
 
 async fn list_users(
@@ -1157,10 +1206,19 @@ mod trace_tests {
         },
     };
 
-    use axum::http::Request;
+    use axum::{
+        http::{Request, StatusCode},
+        response::IntoResponse,
+    };
+    use openfga_list::ListError;
+    use openfga_storage::{StorageError, StorageErrorKind};
     use tracing_subscriber::fmt::{self, format::FmtSpan};
 
-    use super::request_span;
+    use super::{
+        StreamedListObjectsResponseMarker, http_completion, request_span, streamed_completion,
+        streamed_item_bytes,
+    };
+    use crate::ApiError;
 
     #[derive(Clone, Debug)]
     struct CanaryWriter {
@@ -1189,6 +1247,52 @@ mod trace_tests {
         fn make_writer(&'writer self) -> Self::Writer {
             self.clone()
         }
+    }
+
+    #[test]
+    fn test_should_classify_http_completions_with_bounded_labels() {
+        assert_eq!(http_completion(&StatusCode::OK.into_response()), "success");
+        assert_eq!(
+            http_completion(&StatusCode::BAD_REQUEST.into_response()),
+            "client_error",
+        );
+        assert_eq!(
+            http_completion(&StatusCode::REQUEST_TIMEOUT.into_response()),
+            "timeout",
+        );
+        assert_eq!(
+            http_completion(&ApiError::overloaded().into_response()),
+            "overloaded",
+        );
+        assert_eq!(
+            http_completion(&ApiError::deadline_exceeded().into_response()),
+            "timeout",
+        );
+        assert_eq!(
+            http_completion(&ApiError::cancelled().into_response()),
+            "cancelled",
+        );
+        assert_eq!(
+            http_completion(&StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+            "server_error",
+        );
+    }
+
+    #[test]
+    fn test_should_classify_encoded_domain_stream_errors() {
+        let marker = StreamedListObjectsResponseMarker::default();
+        assert_eq!(streamed_completion(Some(&marker)), "success");
+
+        let encoded = streamed_item_bytes(
+            Err(ListError::from(StorageError::new(
+                StorageErrorKind::Unavailable,
+                "injected_stream_failure",
+            ))),
+            &marker,
+        );
+
+        assert_eq!(streamed_completion(Some(&marker)), "stream_error");
+        assert!(encoded.starts_with(b"{\"error\":"));
     }
 
     #[test]

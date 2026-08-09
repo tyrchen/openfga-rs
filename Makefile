@@ -9,6 +9,8 @@ GO_GRPC_ADDR ?= 127.0.0.1:18082
 RUST_PROBE_ADDR ?= 127.0.0.1:18081
 RUST_HTTP_ADDR ?= 127.0.0.1:18083
 RUST_GRPC_ADDR ?= 127.0.0.1:18084
+RUST_WRITER_HTTP_ADDR ?= 127.0.0.1:18085
+RUST_WRITER_GRPC_ADDR ?= 127.0.0.1:18086
 FUZZ_TIME ?= 15
 POSTGRES_TEST_URL ?=
 CONFIG ?= config/openfga-development.yaml
@@ -29,6 +31,12 @@ build:
 
 build-release:
 	@$(CARGO) build --release -p openfga-server
+
+phase4-criterion:
+	@$(CARGO) bench -p openfga-cache --bench model_load
+	@$(CARGO) bench -p openfga-check --bench check_latency
+	@$(CARGO) bench -p openfga-model --bench model_compile
+	@$(CARGO) bench -p openfga-model --bench model_compile_memory
 
 test:
 	@$(CARGO) test --workspace --all-targets
@@ -368,13 +376,22 @@ enumeration-differential: $(GO_BASELINE) build
 phase4-scale: $(GO_BASELINE) build-release
 	@set -eu; \
 	phase4_tmp=$$(mktemp -d); \
-	go_pid=""; rust_pid=""; \
+	go_pid=""; rust_pid=""; writer_pid=""; sampler_pid=""; \
 	cleanup() { \
+		phase4_status=$$?; \
+		test -z "$$sampler_pid" || kill "$$sampler_pid" 2>/dev/null || true; \
+		test -z "$$sampler_pid" || wait "$$sampler_pid" 2>/dev/null || true; \
 		test -z "$$go_pid" || kill "$$go_pid" 2>/dev/null || true; \
 		test -z "$$rust_pid" || kill "$$rust_pid" 2>/dev/null || true; \
+		test -z "$$writer_pid" || kill "$$writer_pid" 2>/dev/null || true; \
 		test -z "$$go_pid" || wait "$$go_pid" 2>/dev/null || true; \
 		test -z "$$rust_pid" || wait "$$rust_pid" 2>/dev/null || true; \
+		test -z "$$writer_pid" || wait "$$writer_pid" 2>/dev/null || true; \
+		if test "$$phase4_status" -ne 0; then \
+			tail -100 "$$phase4_tmp/go.log" "$$phase4_tmp/rust.log" "$$phase4_tmp/writer.log" 2>/dev/null || true; \
+		fi; \
 		rm -rf "$$phase4_tmp"; \
+		return "$$phase4_status"; \
 	}; \
 	trap cleanup EXIT INT TERM; \
 	target_dir=$$($(CARGO) metadata --no-deps --format-version 1 | \
@@ -390,7 +407,11 @@ phase4-scale: $(GO_BASELINE) build-release
 	OPENFGA__STORAGE__POSTGRES__MIGRATE_ON_START=$(PHASE4_POSTGRES_MIGRATE) \
 	OPENFGA__TRANSPORT__ADMISSION__AUTHENTICATION_ATTEMPTS=1000000 \
 	OPENFGA__TRANSPORT__ADMISSION__GLOBAL_AUTHENTICATION_ATTEMPTS=1000000 \
+	OPENFGA__TRANSPORT__ADMISSION__ADMINISTRATION=1000000 \
+	OPENFGA__TRANSPORT__ADMISSION__READS=1000000 \
+	OPENFGA__TRANSPORT__ADMISSION__WRITES=1000000 \
 	OPENFGA__TRANSPORT__ADMISSION__CHECKS=1000000 \
+	OPENFGA__TRANSPORT__ADMISSION__ENUMERATION=1000000 \
 	OPENFGA_DATABASE_URL="$(POSTGRES_TEST_URL)" \
 	OPENFGA_TOKEN_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= \
 	"$$server_binary" run --config config/openfga-development.yaml \
@@ -408,32 +429,98 @@ phase4-scale: $(GO_BASELINE) build-release
 			sleep 0.1; \
 		done; \
 	done; \
+	writer_arg=""; \
+	if test "$(PHASE4_STORAGE_BACKEND)" = postgres; then \
+		OPENFGA__LISTENERS__HTTP=$(RUST_WRITER_HTTP_ADDR) \
+		OPENFGA__LISTENERS__GRPC=$(RUST_WRITER_GRPC_ADDR) \
+		OPENFGA__STORAGE__BACKEND=postgres \
+		OPENFGA__STORAGE__POSTGRES__MIGRATE_ON_START=false \
+		OPENFGA__TRANSPORT__ADMISSION__AUTHENTICATION_ATTEMPTS=1000000 \
+		OPENFGA__TRANSPORT__ADMISSION__GLOBAL_AUTHENTICATION_ATTEMPTS=1000000 \
+		OPENFGA__TRANSPORT__ADMISSION__ADMINISTRATION=1000000 \
+		OPENFGA__TRANSPORT__ADMISSION__READS=1000000 \
+		OPENFGA__TRANSPORT__ADMISSION__WRITES=1000000 \
+		OPENFGA__TRANSPORT__ADMISSION__CHECKS=1000000 \
+		OPENFGA__TRANSPORT__ADMISSION__ENUMERATION=1000000 \
+		OPENFGA_DATABASE_URL="$(POSTGRES_TEST_URL)" \
+		OPENFGA_TOKEN_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= \
+		"$$server_binary" run --config config/openfga-development.yaml \
+			>"$$phase4_tmp/writer.log" 2>&1 & writer_pid=$$!; \
+		attempt=0; \
+		until curl --fail --silent "http://$(RUST_WRITER_HTTP_ADDR)/readyz" >/dev/null; do \
+			if ! kill -0 "$$writer_pid" 2>/dev/null; then \
+				echo "the Phase 4 writer server exited before readiness" >&2; \
+				tail -100 "$$phase4_tmp/writer.log" >&2; \
+				exit 1; \
+			fi; \
+			attempt=$$((attempt + 1)); \
+			test "$$attempt" -lt 150 || { echo "Phase 4 writer did not become ready" >&2; exit 1; }; \
+			sleep 0.1; \
+		done; \
+		writer_arg="--writer-url http://$(RUST_WRITER_HTTP_ADDR)/"; \
+	fi; \
 	mkdir -p "$(PHASE4_ARTIFACT_DIR)"; \
 	"$$server_binary" phase4-consistency-faults \
 		--rust-url "http://$(RUST_HTTP_ADDR)/" \
-		--iterations "$(PHASE4_CONSISTENCY_ITERATIONS)" \
+		--iterations "$(PHASE4_CONSISTENCY_ITERATIONS)" $$writer_arg \
 		>"$(PHASE4_ARTIFACT_DIR)/consistency.json"; \
 	"$$server_binary" phase4-reference-benchmark \
 		--go-url "http://$(GO_HTTP_ADDR)/" \
 		--rust-url "http://$(RUST_HTTP_ADDR)/" \
+		--go-pid "$$go_pid" \
+		--rust-pid "$$rust_pid" \
 		--requests-per-client "$(PHASE4_BENCH_REQUESTS)" \
 		>"$(PHASE4_ARTIFACT_DIR)/reference-benchmark.json"; \
-	rss_before=$$(ps -o rss= -p "$$rust_pid" | tr -d ' '); \
-	test -n "$$rss_before"; \
+	resource_samples="$$phase4_tmp/process-resources.tsv"; \
+	process_threads() { \
+		if test "$$(uname -s)" = Darwin; then \
+			ps -M -p "$$rust_pid" | awk 'NR > 1 { count += 1 } END { print count }'; \
+		else \
+			ps -o nlwp= -p "$$rust_pid" | tr -d ' '; \
+		fi; \
+	}; \
+	sample_once() { \
+		rss=$$(ps -o rss= -p "$$rust_pid" | tr -d ' '); \
+		threads=$$(process_threads); \
+		test -n "$$rss" && test -n "$$threads"; \
+		printf '%s %s\n' "$$rss" "$$threads"; \
+	}; \
+	sample_process() { \
+		while kill -0 "$$rust_pid" 2>/dev/null; do \
+			sample_once >>"$$resource_samples"; \
+			sleep 1; \
+			done; \
+	}; \
+	sample_once >"$$resource_samples"; \
+	sample_process & sampler_pid=$$!; \
+	read rss_before threads_before <"$$resource_samples"; \
 	"$$server_binary" phase4-soak \
 		--rust-url "http://$(RUST_HTTP_ADDR)/" \
 		--seconds "$(PHASE4_SOAK_SECONDS)" \
 		--clients "$(PHASE4_SOAK_CLIENTS)" $(PHASE4_SOAK_CONSISTENCY_ARG) \
 		>"$(PHASE4_ARTIFACT_DIR)/soak.json"; \
-	rss_after=$$(ps -o rss= -p "$$rust_pid" | tr -d ' '); \
-	test -n "$$rss_after"; \
-	rss_growth=$$((rss_after > rss_before ? rss_after - rss_before : 0)); \
-	test "$$rss_growth" -le "$(PHASE4_RSS_GROWTH_KIB)" || { \
-		echo "Rust RSS grew by $$rss_growth KiB, above $(PHASE4_RSS_GROWTH_KIB) KiB" >&2; \
+	sample_once >>"$$resource_samples"; \
+	kill "$$sampler_pid" 2>/dev/null || true; \
+	wait "$$sampler_pid" 2>/dev/null || true; \
+	sampler_pid=""; \
+	rss_peak=$$(awk 'BEGIN { peak = 0 } { if ($$1 > peak) peak = $$1 } END { print peak }' "$$resource_samples"); \
+	threads_peak=$$(awk 'BEGIN { peak = 0 } { if ($$2 > peak) peak = $$2 } END { print peak }' "$$resource_samples"); \
+	set -- $$(tail -1 "$$resource_samples"); \
+	rss_post_drain=$$1; threads_post_drain=$$2; \
+	rss_peak_growth=$$((rss_peak > rss_before ? rss_peak - rss_before : 0)); \
+	rss_post_drain_growth=$$((rss_post_drain > rss_before ? rss_post_drain - rss_before : 0)); \
+	test "$$rss_peak_growth" -le "$(PHASE4_RSS_GROWTH_KIB)" || { \
+		echo "Rust peak RSS grew by $$rss_peak_growth KiB, above $(PHASE4_RSS_GROWTH_KIB) KiB" >&2; \
 		exit 1; \
 	}; \
-	printf '{"rssBeforeKiB":%s,"rssAfterKiB":%s,"rssGrowthKiB":%s,"maximumGrowthKiB":%s}\n' \
-		"$$rss_before" "$$rss_after" "$$rss_growth" "$(PHASE4_RSS_GROWTH_KIB)" \
+	test "$$rss_post_drain_growth" -le "$(PHASE4_RSS_GROWTH_KIB)" || { \
+		echo "Rust post-drain RSS grew by $$rss_post_drain_growth KiB, above $(PHASE4_RSS_GROWTH_KIB) KiB" >&2; \
+		exit 1; \
+	}; \
+	printf '{"sampleIntervalSeconds":1,"rssBaselineKiB":%s,"rssPeakKiB":%s,"rssPostDrainKiB":%s,"rssPeakGrowthKiB":%s,"rssPostDrainGrowthKiB":%s,"maximumGrowthKiB":%s,"threadsBaseline":%s,"threadsPeak":%s,"threadsPostDrain":%s}\n' \
+		"$$rss_before" "$$rss_peak" "$$rss_post_drain" "$$rss_peak_growth" \
+		"$$rss_post_drain_growth" "$(PHASE4_RSS_GROWTH_KIB)" "$$threads_before" \
+		"$$threads_peak" "$$threads_post_drain" \
 		>"$(PHASE4_ARTIFACT_DIR)/memory.json"; \
 	kill -TERM "$$rust_pid"; \
 	wait "$$rust_pid"; \
@@ -441,10 +528,12 @@ phase4-scale: $(GO_BASELINE) build-release
 	$(CARGO) test -p openfga-cache --all-targets; \
 	$(CARGO) test -p openfga-server \
 		'runtime::tests::test_should_bound_shutdown_with_an_in_flight_client'; \
+	$(MAKE) phase4-criterion; \
 	echo "Phase 4 artifacts: $(PHASE4_ARTIFACT_DIR)"
 
 phase4-scale-smoke:
 	@$(MAKE) phase4-scale \
+		PHASE4_ARTIFACT_DIR=target/phase4-smoke \
 		PHASE4_BENCH_REQUESTS=5 \
 		PHASE4_CONSISTENCY_ITERATIONS=8 \
 		PHASE4_SOAK_CLIENTS=16 \
@@ -569,4 +658,4 @@ update-submodule:
 	check-oracle check-proto check-spike \
 	clippy clippy-strict \
 	conformance deny differential-smoke doc enumeration-differential fmt fuzz-condition fuzz-domain fuzz-model go-baseline listobjects-spike model-baseline \
-	model-spike phase2-compatibility postgres-storage proto release sqlx-prepare-check storage-contract test update-submodule verify-go-pin verify-go-tool
+	model-spike phase2-compatibility phase4-criterion postgres-storage proto release sqlx-prepare-check storage-contract test update-submodule verify-go-pin verify-go-tool

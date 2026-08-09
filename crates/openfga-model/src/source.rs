@@ -2,7 +2,7 @@
 
 use std::{fmt, mem};
 
-use openfga_condition::ConditionDefinition;
+use openfga_condition::{ConditionDefinition, ParameterTypeRef};
 use openfga_domain::{
     AuthorizationModelId, ConditionName, Fingerprint, FingerprintBuilder, RelationName, StoreId,
     TypeName,
@@ -125,6 +125,124 @@ impl AuthorizationModelSource {
     pub fn fingerprint(&self) -> Fingerprint {
         source_fingerprint(self)
     }
+
+    /// Returns a conservative estimate of heap and inline bytes owned by this source model.
+    #[must_use]
+    pub fn estimated_owned_bytes(&self) -> usize {
+        let map_node_overhead = 4_usize.saturating_mul(mem::size_of::<usize>());
+        let mut bytes = mem::size_of::<Self>()
+            .saturating_add(self.schema_version.capacity())
+            .saturating_add(
+                self.type_definitions
+                    .capacity()
+                    .saturating_mul(mem::size_of::<TypeDefinitionSource>()),
+            )
+            .saturating_add(
+                self.conditions
+                    .capacity()
+                    .saturating_mul(mem::size_of::<ConditionSource>()),
+            );
+        for definition in &self.type_definitions {
+            bytes = bytes
+                .saturating_add(definition.name.as_str().len())
+                .saturating_add(
+                    definition
+                        .relations
+                        .capacity()
+                        .saturating_mul(mem::size_of::<RelationSource>()),
+                );
+            for relation in &definition.relations {
+                bytes = bytes
+                    .saturating_add(relation.name.as_str().len())
+                    .saturating_add(rewrite_owned_bytes(&relation.rewrite))
+                    .saturating_add(
+                        relation
+                            .restrictions
+                            .capacity()
+                            .saturating_mul(mem::size_of::<DirectRestrictionSource>()),
+                    );
+                for restriction in &relation.restrictions {
+                    bytes = bytes
+                        .saturating_add(restriction.subject_type.as_str().len())
+                        .saturating_add(match &restriction.kind {
+                            RestrictionKindSource::Userset(relation) => relation.as_str().len(),
+                            RestrictionKindSource::Object | RestrictionKindSource::Wildcard => 0,
+                        })
+                        .saturating_add(
+                            restriction
+                                .condition
+                                .as_ref()
+                                .map_or(0, |condition| condition.as_str().len()),
+                        );
+                }
+            }
+        }
+        for condition in &self.conditions {
+            bytes = bytes
+                .saturating_add(condition.key.as_str().len())
+                .saturating_add(condition.definition.name().as_str().len())
+                .saturating_add(condition.definition.expression().len())
+                .saturating_add(
+                    condition
+                        .parameter_type_errors
+                        .capacity()
+                        .saturating_mul(mem::size_of::<(u32, ConditionParameterTypeError)>()),
+                );
+            for (name, parameter_type) in condition.definition.parameters() {
+                bytes = bytes
+                    .saturating_add(
+                        mem::size_of_val(name)
+                            .saturating_add(mem::size_of_val(parameter_type))
+                            .saturating_add(map_node_overhead),
+                    )
+                    .saturating_add(name.as_str().len())
+                    .saturating_add(parameter_type_owned_bytes(parameter_type.as_ref()));
+            }
+        }
+        bytes
+    }
+}
+
+fn rewrite_owned_bytes(root: &RewriteSource) -> usize {
+    let mut bytes = 0_usize;
+    let mut pending = vec![root];
+    while let Some(rewrite) = pending.pop() {
+        match rewrite {
+            RewriteSource::Direct => {}
+            RewriteSource::Computed(relation) => {
+                bytes = bytes.saturating_add(relation.as_str().len());
+            }
+            RewriteSource::TupleToUserset { tupleset, computed } => {
+                bytes = bytes
+                    .saturating_add(tupleset.as_str().len())
+                    .saturating_add(computed.as_str().len());
+            }
+            RewriteSource::Union(children) | RewriteSource::Intersection(children) => {
+                bytes = bytes.saturating_add(
+                    children
+                        .capacity()
+                        .saturating_mul(mem::size_of::<RewriteSource>()),
+                );
+                pending.extend(children);
+            }
+            RewriteSource::Difference { base, subtract } => {
+                bytes =
+                    bytes.saturating_add(2_usize.saturating_mul(mem::size_of::<RewriteSource>()));
+                pending.extend([base.as_ref(), subtract.as_ref()]);
+            }
+        }
+    }
+    bytes
+}
+
+fn parameter_type_owned_bytes(root: ParameterTypeRef<'_>) -> usize {
+    let mut bytes = mem::size_of_val(&root);
+    let mut current = root;
+    while let ParameterTypeRef::List(child) | ParameterTypeRef::Map(child) = current {
+        bytes = bytes.saturating_add(mem::size_of_val(child));
+        current = child.as_ref();
+    }
+    bytes
 }
 
 impl fmt::Debug for AuthorizationModelSource {

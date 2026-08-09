@@ -19,9 +19,10 @@ use openfga_model::{
 use openfga_storage::{
     Assertion, AssertionReader, AssertionWriter, ChangeFilter, ChangeReader, ConditionFilter,
     HealthCheck, ModelReader, ModelWriter, ObjectRelationFilter, OperationContext, PageOptions,
-    ReadOptions, StorageCancellationToken, StorageError, StorageErrorKind, StoreFilter, StoreName,
-    StoreReader, StoreWriter, StoredAuthorizationModel, TupleReadFilter, TupleReader,
-    TupleWriteOptions, TupleWriter, WriteConflictPolicy,
+    ReadOptions, ReverseTupleFilter, StorageCancellationToken, StorageError, StorageErrorKind,
+    StoreFilter, StoreName, StoreReader, StoreWriter, StoredAuthorizationModel, TupleReadFilter,
+    TupleReader, TupleWriteOptions, TupleWriter, UsersetRestrictionFilter, UsersetTupleFilter,
+    WriteConflictPolicy,
     contract::{TupleContractFixture, verify_tuple_contract},
 };
 use openfga_storage_sql::{
@@ -47,6 +48,7 @@ async fn test_should_satisfy_postgres_contract_fault_and_plan_gates() -> Result<
     let context = operation_context(ConsistencyPreference::HigherConsistency)?;
 
     verify_management_and_shared_contract(&storage, &context).await?;
+    verify_indexed_reverse_filters(&storage, &context).await?;
     verify_request_ordered_conflicts(&storage, &context).await?;
     verify_primary_replica_policy(&url, &context).await?;
     verify_atomic_faults(&url, &context).await?;
@@ -56,6 +58,68 @@ async fn test_should_satisfy_postgres_contract_fault_and_plan_gates() -> Result<
     verify_schema_health(&storage, &context).await?;
 
     storage.close().await;
+    Ok(())
+}
+
+async fn verify_indexed_reverse_filters(
+    storage: &PostgresStorage,
+    context: &OperationContext,
+) -> Result<(), Box<dyn Error>> {
+    let store_id = store_id(950);
+    storage
+        .create_store(
+            context,
+            store_id,
+            StoreName::new("Reverse Filter Store".to_owned())?,
+        )
+        .await?;
+    let direct = tuple("document:roadmap#viewer@user:anne")?;
+    let userset = tuple("document:roadmap#viewer@group:engineering#member")?;
+    storage
+        .write_tuples(
+            context,
+            store_id,
+            Vec::new(),
+            vec![direct.clone(), userset.clone()],
+            TupleWriteOptions::default(),
+        )
+        .await?;
+
+    let reverse_filter = ReverseTupleFilter::new(
+        "document".parse()?,
+        "viewer".parse()?,
+        vec![direct.key().subject().clone()],
+        Vec::new(),
+        ConditionFilter::any(),
+        &InputLimits::default(),
+    )?;
+    let mut reverse = storage
+        .read_reverse_tuples(context, store_id, &reverse_filter, read_options(10)?)
+        .await?;
+    let reverse_tuple = reverse
+        .next_item()
+        .transpose()?
+        .ok_or("reverse subject allowlist returned no tuple")?;
+    assert_eq!(reverse_tuple.key(), direct.key());
+
+    let userset_filter = UsersetTupleFilter::new(
+        "document:roadmap".parse()?,
+        "viewer".parse()?,
+        vec![UsersetRestrictionFilter::new(
+            "group".parse()?,
+            "member".parse()?,
+        )],
+        ConditionFilter::any(),
+        &InputLimits::default(),
+    )?;
+    let mut usersets = storage
+        .read_userset_tuples(context, store_id, &userset_filter, read_options(10)?)
+        .await?;
+    let userset_tuple = usersets
+        .next_item()
+        .transpose()?
+        .ok_or("userset restriction allowlist returned no tuple")?;
+    assert_eq!(userset_tuple.key(), userset.key());
     Ok(())
 }
 

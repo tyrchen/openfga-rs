@@ -24,6 +24,6 @@
 | [Phase 0 differential report](./research/phase0-differential-report.md) | Vendored Go/Rust probe lifecycle, normalization contract, and SDK smoke | Passing |
 | [Phase 1 Check differential report](./research/phase1-check-differential-report.md) | Complete vendored corpus plus live Go/Rust Check and BatchCheck parity | Passing |
 | [Phase 3 enumeration differential report](./research/phase3-enumeration-differential-report.md) | Generated-set equivalence, live Go/Rust list/Expand parity, disconnect cleanup, and query-plan controls | Passing |
-| [Phase 4 scale and benchmark report](./research/phase4-scale-benchmark-report.md) | Consistency faults, Go reference measurements, 30-minute soak, PostgreSQL pool smoke, and rolling drain | Passing |
+| [Phase 4 scale and benchmark report](./research/phase4-scale-benchmark-report.md) | Cross-process consistency, full Go reference matrix, p95/heap budgets, 30-minute soak, PostgreSQL pool smoke, and rolling drain | Passing |
 
 The OpenFGA study is pinned to `vendors/openfga` commit `4e4f79ed841513dfd61746a75ef473f6198299f7`. The Rust survey was checked on 2026-08-05 and must be refreshed before dependency changes.

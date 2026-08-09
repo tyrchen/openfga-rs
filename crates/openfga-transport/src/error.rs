@@ -46,6 +46,17 @@ struct ErrorBody {
     message: String,
 }
 
+/// Bounded HTTP completion label carried out-of-band from compatible wire status codes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct HttpCompletionClass(&'static str);
+
+impl HttpCompletionClass {
+    #[must_use]
+    pub(crate) const fn value(self) -> &'static str {
+        self.0
+    }
+}
+
 impl ApiError {
     /// Creates a request validation failure without retaining hostile input.
     #[must_use]
@@ -379,6 +390,15 @@ impl ApiError {
         )
     }
 
+    pub(crate) const fn cancelled() -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            Code::Cancelled,
+            "cancelled",
+            "Request Cancelled",
+        )
+    }
+
     pub(crate) const fn unauthenticated() -> Self {
         Self::new(
             StatusCode::UNAUTHORIZED,
@@ -454,6 +474,18 @@ impl ApiError {
     pub const fn http_status(&self) -> StatusCode {
         self.http_status
     }
+
+    #[must_use]
+    pub(crate) fn http_completion_class(&self) -> HttpCompletionClass {
+        let class = match self.grpc_code {
+            Code::DeadlineExceeded => "timeout",
+            Code::Cancelled => "cancelled",
+            Code::ResourceExhausted if self.code == "throttled_timeout_error" => "overloaded",
+            _ if self.http_status.is_client_error() => "client_error",
+            _ => "server_error",
+        };
+        HttpCompletionClass(class)
+    }
 }
 
 impl From<AuthenticationError> for ApiError {
@@ -470,6 +502,16 @@ impl From<AuthenticationError> for ApiError {
 
 impl From<ServiceError> for ApiError {
     fn from(error: ServiceError) -> Self {
+        if matches!(
+            error.kind(),
+            ServiceErrorKind::Internal | ServiceErrorKind::Unavailable
+        ) {
+            tracing::error!(
+                service.error_kind = ?error.kind(),
+                service.error_code = error.code(),
+                "authorization service request failed",
+            );
+        }
         match error.kind() {
             ServiceErrorKind::StoreNotFound => Self::new(
                 StatusCode::NOT_FOUND,
@@ -534,12 +576,7 @@ impl From<ServiceError> for ApiError {
                 "deadline_exceeded",
                 "Request Deadline Exceeded",
             ),
-            ServiceErrorKind::Cancelled => Self::new(
-                StatusCode::BAD_REQUEST,
-                Code::Cancelled,
-                "cancelled",
-                "Request Cancelled",
-            ),
+            ServiceErrorKind::Cancelled => Self::cancelled(),
             ServiceErrorKind::Internal => Self::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Code::Internal,
@@ -1371,6 +1408,7 @@ impl From<ApiError> for tonic::Status {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let unauthenticated = self.http_status == StatusCode::UNAUTHORIZED;
+        let completion = self.http_completion_class();
         let mut response = (
             self.http_status,
             Json(ErrorBody {
@@ -1379,6 +1417,7 @@ impl IntoResponse for ApiError {
             }),
         )
             .into_response();
+        response.extensions_mut().insert(completion);
         if unauthenticated {
             response
                 .headers_mut()
