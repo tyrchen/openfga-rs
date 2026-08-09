@@ -231,9 +231,22 @@ phase2-compatibility: $(GO_BASELINE) build
 			openssl x509 -noout -fingerprint -sha256; \
 	}; \
 	trap cleanup EXIT INT TERM; \
+	printf '%s\n' \
+		'basicConstraints=critical,CA:FALSE' \
+		'keyUsage=critical,digitalSignature,keyEncipherment' \
+		'extendedKeyUsage=serverAuth' \
+		'subjectAltName=DNS:localhost,IP:127.0.0.1' >"$$phase2_tmp/tls.ext"; \
 	openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 1 \
-		-subj /CN=localhost -addext subjectAltName=DNS:localhost,IP:127.0.0.1 \
-		-keyout "$$phase2_tmp/tls.key" -out "$$phase2_tmp/tls.crt" >/dev/null 2>&1; \
+		-subj /CN=openfga-ci-ca \
+		-addext basicConstraints=critical,CA:TRUE \
+		-addext keyUsage=critical,keyCertSign,cRLSign \
+		-keyout "$$phase2_tmp/ca.key" -out "$$phase2_tmp/ca.crt" >/dev/null 2>&1; \
+	openssl req -new -newkey rsa:2048 -nodes -sha256 -subj /CN=localhost \
+		-keyout "$$phase2_tmp/tls.key" -out "$$phase2_tmp/tls.csr" >/dev/null 2>&1; \
+	openssl x509 -req -sha256 -days 1 -in "$$phase2_tmp/tls.csr" \
+		-CA "$$phase2_tmp/ca.crt" -CAkey "$$phase2_tmp/ca.key" -set_serial 1 \
+		-extfile "$$phase2_tmp/tls.ext" -out "$$phase2_tmp/tls.crt" >/dev/null 2>&1; \
+	chmod 600 "$$phase2_tmp/ca.key"; \
 	chmod 600 "$$phase2_tmp/tls.key"; \
 	$(GO_BASELINE) run --http-addr $(GO_HTTP_ADDR) --grpc-addr $(GO_GRPC_ADDR) \
 		--playground-enabled=false >"$$phase2_tmp/go.log" 2>&1 & go_pid=$$!; \
@@ -290,9 +303,12 @@ phase2-compatibility: $(GO_BASELINE) build
 		sleep 0.1; \
 	done; \
 	test "$$(fingerprint "$(RUST_HTTP_ADDR)")" = "$$before_http"; \
-	openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 1 \
-		-subj /CN=localhost -addext subjectAltName=DNS:localhost,IP:127.0.0.1 \
-		-keyout "$$phase2_tmp/tls.next.key" -out "$$phase2_tmp/tls.next.crt" >/dev/null 2>&1; \
+	openssl req -new -newkey rsa:2048 -nodes -sha256 -subj /CN=localhost \
+		-keyout "$$phase2_tmp/tls.next.key" -out "$$phase2_tmp/tls.next.csr" >/dev/null 2>&1; \
+	openssl x509 -req -sha256 -days 1 -in "$$phase2_tmp/tls.next.csr" \
+		-CA "$$phase2_tmp/ca.crt" -CAkey "$$phase2_tmp/ca.key" -set_serial 2 \
+		-extfile "$$phase2_tmp/tls.ext" \
+		-out "$$phase2_tmp/tls.next.crt" >/dev/null 2>&1; \
 	chmod 600 "$$phase2_tmp/tls.next.key"; \
 	mv "$$phase2_tmp/tls.next.key" "$$phase2_tmp/tls.key"; \
 	mv "$$phase2_tmp/tls.next.crt" "$$phase2_tmp/tls.crt"; \
@@ -308,7 +324,7 @@ phase2-compatibility: $(GO_BASELINE) build
 	npm ci --prefix tests/sdk-smoke-js --ignore-scripts --no-audit --no-fund; \
 	FGA_API_URL="http://$(GO_HTTP_ADDR)" node tests/sdk-smoke-js/smoke.mjs \
 		>"$$phase2_tmp/go-sdk.json"; \
-	NODE_EXTRA_CA_CERTS="$$phase2_tmp/tls.crt" \
+	NODE_EXTRA_CA_CERTS="$$phase2_tmp/ca.crt" \
 	FGA_API_URL="https://$(RUST_HTTP_ADDR)" \
 	FGA_API_TOKEN=phase2-compatibility-preshared-key-material \
 		node tests/sdk-smoke-js/smoke.mjs >"$$phase2_tmp/rust-sdk.json"; \
@@ -316,7 +332,7 @@ phase2-compatibility: $(GO_BASELINE) build
 	$(CARGO) run --quiet -p phase2-grpc-smoke -- \
 		--go-url "http://$(GO_GRPC_ADDR)" \
 		--rust-url "https://$(RUST_GRPC_ADDR)" \
-		--rust-ca "$$phase2_tmp/tls.crt" \
+		--rust-ca "$$phase2_tmp/ca.crt" \
 		--rust-token phase2-compatibility-preshared-key-material; \
 	test "$$(curl --insecure --silent --output /dev/null --write-out '%{http_code}' \
 		"https://$(RUST_HTTP_ADDR)/stores")" = 401; \
