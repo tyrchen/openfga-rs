@@ -7,7 +7,10 @@ use sqlx::Row;
 use crate::{
     PortableSqlDialect, PortableSqlStorageConfig, PostgresStorageConfig,
     backend::{MIGRATOR, SCHEMA_VERSION, connect_pool},
-    portable::{PORTABLE_SCHEMA_VERSION, connect_pool as connect_portable_pool, migrator},
+    portable::{
+        PORTABLE_SCHEMA_VERSION, connect_pool as connect_portable_pool, migrator,
+        run_portable_migrations,
+    },
 };
 
 /// Schema relationship between a database and this binary.
@@ -113,6 +116,10 @@ pub async fn migration_status(
 
 /// Applies the selected `MySQL` or `SQLite` embedded migration set.
 ///
+/// `MySQL` uses the database migration lock supplied by `SQLx`. `SQLite` migration calls are
+/// serialized within the supported embedded process because `SQLx` does not provide a `SQLite`
+/// migration lock.
+///
 /// # Errors
 ///
 /// Returns a redacted configuration, connection, checksum, migration, or schema failure.
@@ -122,13 +129,7 @@ pub async fn apply_portable_migrations(
     validate_portable_config(config)?;
     let pool = connect_portable_pool(config, config.primary_url.expose_secret()).await?;
     let result = async {
-        migrator(config.dialect).run(&pool).await.map_err(|error| {
-            StorageError::with_source(
-                StorageErrorKind::Integrity,
-                "portable_migration_failed",
-                error,
-            )
-        })?;
+        run_portable_migrations(&pool, config.dialect).await?;
         portable_status_from_pool(&pool, config.dialect).await
     }
     .await;

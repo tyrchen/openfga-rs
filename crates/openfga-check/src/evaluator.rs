@@ -2074,7 +2074,10 @@ mod tests {
     use std::{
         collections::BTreeMap,
         error::Error,
-        sync::atomic::{AtomicUsize, Ordering},
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::{Duration, Instant},
     };
 
@@ -2188,7 +2191,8 @@ mod tests {
         ))
     }
 
-    fn compiled_poll_condition() -> Result<openfga_condition::CompiledCondition, Box<dyn Error>> {
+    fn compiled_poll_condition() -> Result<Arc<openfga_condition::CompiledCondition>, Box<dyn Error>>
+    {
         Ok(ConditionCompiler::default().compile(
             &ConditionDefinition::new(
                 "poll_root".parse()?,

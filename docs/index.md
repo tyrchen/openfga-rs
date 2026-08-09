@@ -1,5 +1,16 @@
 # Documentation Index
 
+## Project guides
+
+| Guide | Purpose |
+| --- | --- |
+| [Architecture](./architecture.md) | Crate boundaries, request lifecycle, consistency, concurrency, security, performance, and extension points |
+| [Dependency policy](./dependencies.md) | Current direct-dependency audit, load-bearing choices, update policy, and required gates |
+| [Release process](./releasing.md) | Release preparation, tag workflow, artifact contents, verification, and rollback |
+| [GitHub governance](./repository-governance.md) | Branch protection, Actions/release policy, security features, maintainers, and periodic audit |
+| [Contributing](../CONTRIBUTING.md) | Development workflow, change-specific evidence, pull requests, and attribution |
+| [Security policy](../SECURITY.md) | Supported versions, private vulnerability reporting, and disclosure expectations |
+
 ## Operations
 
 | Runbook | Purpose |

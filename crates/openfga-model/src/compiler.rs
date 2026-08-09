@@ -4,6 +4,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
     mem::size_of,
+    num::NonZeroU64,
     sync::Arc,
 };
 
@@ -36,17 +37,36 @@ const SUPPORTED_SCHEMA_VERSION: &str = "1.1";
 pub const MODEL_COMPILER_FORMAT_VERSION: u32 = 1;
 
 /// Deterministic compiler configured with finite model and condition limits.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct ModelCompiler {
     limits: ModelLimits,
+    conditions: ConditionCompiler,
+}
+
+impl Default for ModelCompiler {
+    fn default() -> Self {
+        Self::new(ModelLimits::default())
+    }
 }
 
 impl ModelCompiler {
     /// Creates a compiler with an explicit bounded policy.
     #[must_use]
-    pub const fn new(limits: ModelLimits) -> Self {
-        Self { limits }
+    pub fn new(limits: ModelLimits) -> Self {
+        Self {
+            limits,
+            conditions: ConditionCompiler::default(),
+        }
+    }
+
+    /// Creates a compiler with explicit model limits and a bounded semantic condition cache.
+    #[must_use]
+    pub fn with_condition_cache(limits: ModelLimits, maximum_condition_weight: NonZeroU64) -> Self {
+        Self {
+            limits,
+            conditions: ConditionCompiler::new(maximum_condition_weight),
+        }
     }
 
     /// Validates and compiles one model into immutable cacheable state.
@@ -59,7 +79,7 @@ impl ModelCompiler {
         &self,
         source: &AuthorizationModelSource,
     ) -> Result<Arc<CompiledModel>, ModelErrors> {
-        Compiler::new(source, &self.limits).compile()
+        Compiler::new(source, &self.limits, &self.conditions).compile()
     }
 }
 
@@ -435,14 +455,20 @@ struct Symbols<'a> {
 struct Compiler<'a> {
     source: &'a AuthorizationModelSource,
     limits: &'a ModelLimits,
+    conditions: &'a ConditionCompiler,
     errors: ErrorCollector,
 }
 
 impl<'a> Compiler<'a> {
-    fn new(source: &'a AuthorizationModelSource, limits: &'a ModelLimits) -> Self {
+    fn new(
+        source: &'a AuthorizationModelSource,
+        limits: &'a ModelLimits,
+        conditions: &'a ConditionCompiler,
+    ) -> Self {
         Self {
             source,
             limits,
+            conditions,
             errors: ErrorCollector::new(limits.model_errors()),
         }
     }
@@ -647,7 +673,6 @@ impl<'a> Compiler<'a> {
         Vec<CompiledConditionEntry>,
         BTreeMap<ConditionName, ConditionId>,
     ) {
-        let compiler = ConditionCompiler::default();
         let mut conditions = Vec::with_capacity(self.source.conditions.len());
         let mut lookup = BTreeMap::new();
         for (index, source) in self.source.conditions.iter().enumerate() {
@@ -660,13 +685,16 @@ impl<'a> Compiler<'a> {
                 );
                 continue;
             };
-            match compiler.compile(&source.definition, self.limits.conditions()) {
+            match self
+                .conditions
+                .compile(&source.definition, self.limits.conditions())
+            {
                 Ok(condition) => {
                     lookup.insert(source.key.clone(), id);
                     conditions.push(CompiledConditionEntry {
                         id,
                         name: source.key.clone(),
-                        condition: Arc::new(condition),
+                        condition,
                     });
                 }
                 Err(error) => self.errors.push_detail(

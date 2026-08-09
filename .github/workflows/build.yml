@@ -1,6 +1,7 @@
-name: build
+name: CI
 
 on:
+  workflow_dispatch:
   push:
     branches: [master]
     tags: ['v*']
@@ -10,11 +11,29 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
+  dependency-review:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: Review dependency changes
+        uses: actions/dependency-review-action@v5.0.0
+        with:
+          fail-on-severity: moderate
+
   rust:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -23,13 +42,18 @@ jobs:
         run: |
           rustup show
           rustup toolchain install nightly-2026-07-29 --component rustfmt
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Install pinned Protocol Buffers compiler
+        uses: arduino/setup-protoc@v3.0.0
+        with:
+          version: '35.1'
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: Swatinem/rust-cache@v2.9.2
       - name: Install cargo-audit
-        uses: taiki-e/install-action@cb33e69fad06166ca28a42b2575e4dadabf62ee8 # v2.85.8
+        uses: taiki-e/install-action@v2.85.11
         with:
           tool: cargo-audit@0.22.2
       - name: Install cargo-deny
-        uses: taiki-e/install-action@cb33e69fad06166ca28a42b2575e4dadabf62ee8 # v2.85.8
+        uses: taiki-e/install-action@v2.85.11
         with:
           tool: cargo-deny@0.20.2
       - name: Verify workspace
@@ -42,21 +66,27 @@ jobs:
         run: make deny
       - name: Scan committed history for secrets
         run: make secret-scan
-      - name: Generate release SBOMs
-        run: make sbom
+      - name: Validate release archive, notices, SBOMs, and checksums
+        run: make release-artifacts
 
   phase0-compatibility:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
           submodules: recursive
       - name: Install pinned Rust
         run: rustup show
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - name: Install pinned Protocol Buffers compiler
+        uses: arduino/setup-protoc@v3.0.0
+        with:
+          version: '35.1'
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: actions/setup-node@v7.0.0
         with:
           node-version: 24
           cache: npm
@@ -68,9 +98,10 @@ jobs:
 
   postgres-storage:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     services:
       postgres:
-        image: postgres:18.4
+        image: postgres:18.4@sha256:a02db8cac496f15b094798a38254f14d6e00741f709360e5e00bb6668ea31636
         env:
           POSTGRES_DB: openfga
           POSTGRES_PASSWORD: openfga
@@ -83,21 +114,26 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
           submodules: recursive
       - name: Install pinned Rust
         run: rustup show
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Install pinned Protocol Buffers compiler
+        uses: arduino/setup-protoc@v3.0.0
+        with:
+          version: '35.1'
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: Swatinem/rust-cache@v2.9.2
       - name: Install SQLx CLI
-        uses: taiki-e/install-action@cb33e69fad06166ca28a42b2575e4dadabf62ee8 # v2.85.8
+        uses: taiki-e/install-action@v2.85.11
         with:
           tool: sqlx-cli@0.9.0
       - name: Verify PostgreSQL storage contracts and plans
         run: make postgres-storage sqlx-prepare-check POSTGRES_TEST_URL=postgres://openfga:openfga@127.0.0.1:5432/openfga
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@v7.0.0
         with:
           node-version: 24
           cache: npm
@@ -107,9 +143,10 @@ jobs:
 
   mysql-storage:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     services:
       mysql:
-        image: mysql:8.4.10
+        image: mysql:8.4.10@sha256:8dbcf531a03aade657e181b9cf2f1d1803ce621a1d55610cb44cb531ab7d7db6
         env:
           MYSQL_DATABASE: openfga
           MYSQL_PASSWORD: openfga
@@ -123,15 +160,20 @@ jobs:
           --health-timeout 5s
           --health-retries 20
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
           submodules: recursive
       - name: Install pinned Rust
         run: rustup show
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - name: Install pinned Protocol Buffers compiler
+        uses: arduino/setup-protoc@v3.0.0
+        with:
+          version: '35.1'
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: actions/setup-node@v7.0.0
         with:
           node-version: 24
           cache: npm
@@ -143,16 +185,22 @@ jobs:
 
   sqlite-storage:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
           submodules: recursive
       - name: Install pinned Rust
         run: rustup show
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - name: Install pinned Protocol Buffers compiler
+        uses: arduino/setup-protoc@v3.0.0
+        with:
+          version: '35.1'
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: actions/setup-node@v7.0.0
         with:
           node-version: 24
           cache: npm
@@ -164,26 +212,32 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     needs: [rust, phase0-compatibility, postgres-storage, mysql-storage, sqlite-storage]
     runs-on: ubuntu-latest
+    timeout-minutes: 180
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
           submodules: recursive
       - name: Install pinned Rust
         run: rustup show
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - name: Install pinned Protocol Buffers compiler
+        uses: arduino/setup-protoc@v3.0.0
+        with:
+          version: '35.1'
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: actions/setup-node@v7.0.0
         with:
           node-version: 24
           cache: npm
           cache-dependency-path: tests/sdk-smoke-js/package-lock.json
       - name: Install cargo-audit
-        uses: taiki-e/install-action@cb33e69fad06166ca28a42b2575e4dadabf62ee8 # v2.85.8
+        uses: taiki-e/install-action@v2.85.11
         with:
           tool: cargo-audit@0.22.2
       - name: Install cargo-deny
-        uses: taiki-e/install-action@cb33e69fad06166ca28a42b2575e4dadabf62ee8 # v2.85.8
+        uses: taiki-e/install-action@v2.85.11
         with:
           tool: cargo-deny@0.20.2
       - name: Verify GA semantics, supply chain, and the exact release binary under load
@@ -197,20 +251,26 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     permissions:
       contents: read
       id-token: write
       attestations: write
       artifact-metadata: write
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
           submodules: recursive
       - name: Install pinned Rust
         run: rustup show
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Install pinned Protocol Buffers compiler
+        uses: arduino/setup-protoc@v3.0.0
+        with:
+          version: '35.1'
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: Swatinem/rust-cache@v2.9.2
       - name: Build checksummed artifacts and SBOMs
         run: make release-artifacts
       - name: Resolve attestation subjects
@@ -220,16 +280,16 @@ jobs:
           echo "archive=$(find target/phase5 -maxdepth 1 -name '*.tar.gz' -print -quit)" >> "$GITHUB_OUTPUT"
           echo "spdx=$(find target/phase5 -maxdepth 1 -name '*.spdx.json' -print -quit)" >> "$GITHUB_OUTPUT"
       - name: Attest build provenance
-        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        uses: actions/attest@v4.2.2
         with:
           subject-path: ${{ steps.subjects.outputs.archive }}
       - name: Attest the SPDX SBOM
-        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        uses: actions/attest@v4.2.2
         with:
           subject-path: ${{ steps.subjects.outputs.archive }}
           sbom-path: ${{ steps.subjects.outputs.spdx }}
       - name: Upload release matrix artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: openfga-rs-${{ matrix.os }}
           path: target/phase5/*
@@ -239,27 +299,28 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     needs: [release-artifacts]
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
       - name: Download release artifacts
-        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        uses: actions/download-artifact@v8.0.1
         with:
           pattern: openfga-rs-*
           path: target/release-assets
           merge-multiple: true
       - name: Generate changelog
-        uses: orhun/git-cliff-action@f50e11560dce63f7c33227798f90b924471a88b5 # v4.8.0
+        uses: orhun/git-cliff-action@v4.8.0
         id: git-cliff
         with:
           config: cliff.toml
           args: -vv --latest --strip header
       - name: Publish GitHub release
-        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        uses: softprops/action-gh-release@v3.0.2
         with:
           body: ${{ steps.git-cliff.outputs.content }}
           files: target/release-assets/*

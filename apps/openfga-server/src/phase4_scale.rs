@@ -89,6 +89,7 @@ struct ProcessSnapshot {
 struct BenchmarkReport {
     baseline_commit: &'static str,
     maximum_requests_per_client: usize,
+    mutation_requests_per_client: usize,
     measurements: Vec<BenchmarkMeasurement>,
 }
 
@@ -276,10 +277,16 @@ pub(crate) async fn run_reference_benchmark(
     go_pid: u32,
     rust_pid: u32,
     requests_per_client: usize,
+    mutation_requests_per_client: usize,
 ) -> Result<()> {
     validate_count(
         "requests per client",
         requests_per_client,
+        MAXIMUM_ITERATIONS,
+    )?;
+    validate_count(
+        "mutation requests per client",
+        mutation_requests_per_client,
         MAXIMUM_ITERATIONS,
     )?;
     let client = build_client()?;
@@ -321,7 +328,7 @@ pub(crate) async fn run_reference_benchmark(
         compare_reference_semantics(workload.name, Some(&go_warm), Some(&rust_warm))?;
         let workload_requests = match workload.operation {
             ReferenceOperation::ModelCompileAndPublish
-            | ReferenceOperation::TupleWriteAndChangelog => 1,
+            | ReferenceOperation::TupleWriteAndChangelog => mutation_requests_per_client,
             ReferenceOperation::ListObjects { .. } | ReferenceOperation::ListUsers => {
                 requests_per_client.min(ENUMERATION_REQUESTS_PER_CLIENT)
             }
@@ -363,6 +370,7 @@ pub(crate) async fn run_reference_benchmark(
     write_value(&BenchmarkReport {
         baseline_commit: GO_BASELINE_COMMIT,
         maximum_requests_per_client: requests_per_client,
+        mutation_requests_per_client,
         measurements,
     })
 }

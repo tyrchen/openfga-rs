@@ -3,7 +3,7 @@
 use std::{
     env, fmt,
     net::SocketAddr,
-    num::{NonZeroU32, NonZeroUsize},
+    num::{NonZeroU32, NonZeroU64, NonZeroUsize},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -31,7 +31,7 @@ use openfga_domain::{
 use openfga_list::{
     CandidateBudget, DirectListObjectsEngine, ExpandBudget, ListObjectsBudget, ListUsersBudget,
 };
-use openfga_model::ModelCompiler;
+use openfga_model::{ModelCompiler, ModelLimits};
 use openfga_service::{
     AssertionService, ChangeService, CheckService, ExpandService, IdentifierSource,
     ListObjectsService, ListUsersService, ModelPublication, ModelService, StoreService,
@@ -203,6 +203,7 @@ struct ServiceBudgets {
 #[derive(Clone, Copy, Debug)]
 struct ServiceCachePolicy {
     models: ModelCacheConfig,
+    condition_compiled_weight: NonZeroU64,
     decisions: DecisionCacheConfig,
     tuples: TupleCacheConfig,
     controller: InvalidationControllerConfig,
@@ -449,6 +450,10 @@ async fn assemble(config: &ServerConfig) -> Result<RuntimeAssembly> {
         .token_ttl(Duration::from_secs(config.transport.token_ttl_seconds))
         .maximum_message_bytes(config.transport.maximum_message_bytes)
         .maximum_concurrency(config.transport.maximum_concurrency)
+        .maximum_wire_cache_weight(
+            NonZeroU64::new(config.transport.maximum_wire_cache_bytes)
+                .context("maximum wire cache bytes must be nonzero")?,
+        )
         .admission_policy(config.admission_policy()?)
         .authzen(config.authzen_config()?)
         .build();
@@ -563,6 +568,8 @@ fn service_policy(config: &ServerConfig) -> Result<(ServiceBudgets, ServiceCache
     };
     let cache = ServiceCachePolicy {
         models: config.model_cache_config()?,
+        condition_compiled_weight: NonZeroU64::new(config.cache.model.condition_compiled_weight)
+            .context("compiled condition cache weight must be nonzero")?,
         decisions: config.decision_cache_config()?,
         tuples: config.tuple_cache_config()?,
         controller: config.cache_controller_config()?,
@@ -636,10 +643,11 @@ where
     let store_writes: Arc<dyn StoreWriter> = storage.clone();
     let storage_models: Arc<dyn ModelReader> = storage.clone();
     let storage_model_writes: Arc<dyn ModelWriter> = storage.clone();
+    let model_compiler = model_compiler(&cache_policy);
     let cached_models = Arc::new(CachedModelStorage::new(
         storage_models,
         storage_model_writes,
-        ModelCompiler::default(),
+        model_compiler.clone(),
         cache_policy.models,
     ));
     let models: Arc<dyn ModelReader> = cached_models.clone();
@@ -686,7 +694,7 @@ where
             ModelPublication::new(
                 identifiers,
                 Arc::new(SystemServiceClock::default()),
-                ModelCompiler::default(),
+                model_compiler,
             ),
         ))
         .assertions(AssertionService::new(
@@ -730,6 +738,13 @@ where
         ))
         .build();
     Ok((services, cache_controller))
+}
+
+fn model_compiler(cache_policy: &ServiceCachePolicy) -> ModelCompiler {
+    ModelCompiler::with_condition_cache(
+        ModelLimits::default(),
+        cache_policy.condition_compiled_weight,
+    )
 }
 
 fn check_evaluator(

@@ -1,6 +1,6 @@
 # Key decisions
 
-Status: Accepted through Phase 6 · Last decision date: 2026-08-08
+Status: Accepted through Phase 6 · Last decision date: 2026-08-09
 
 Each decision may be revisited only when its trigger occurs and the replacement preserves the PRD and verification gates.
 
@@ -33,6 +33,7 @@ Each decision may be revisited only when its trigger occurs and the replacement 
 | KD-025 | Release checksummed per-platform archives with CycloneDX/SPDX SBOMs and GitHub OIDC/Sigstore provenance after advisory, license, secret, backend and compatibility gates. | Unsigned binary attachment; source-only SBOM; mutable unpinned scanners/actions. | [security](70-security-design.md), [Phase 5 evidence](../docs/research/phase5-ga-release-evidence.md) | Release platform changes while preserving or strengthening provenance and SBOM verification. |
 | KD-026 | Implement AuthZEN Authorization API 1.0 from the pinned API commit, map it onto the existing service core, and publish discovery only from a configured canonical URL. | Independent authorization engine; Host-derived discovery URLs; floating AuthZEN schema. | [transport](20-api-transport-design.md), [Phase 6 evidence](../docs/research/phase6-authzen-coalescing-report.md) | Pinned OpenFGA/API baseline changes or AuthZEN publishes a new final version. |
 | KD-027 | Coalesce only simultaneous identical Check roots behind bounded disabled/shadow/enabled rollout; bypass higher consistency/work meters, retry shared failures, and atomically kill on mismatch. | Unbounded singleflight; leader-coupled cancellation; replacing the oracle; sharing errors. | [Check](14-check-engine-design.md), [performance](71-performance-design.md), [Phase 6 evidence](../docs/research/phase6-authzen-coalescing-report.md) | Deployment shadow evidence regresses or a strategy proves a larger safe win. |
+| KD-028 | License project contributions and release artifacts under Apache-2.0, retain upstream NOTICE attribution, and include license/notice files in every binary archive and SBOM input. | Continue MIT; dual license; ship a binary without license material. | [developer experience](60-developer-experience-design.md), [dependency policy](../docs/dependencies.md), [release process](../docs/releasing.md) | Project ownership deliberately adopts a compatible replacement license and completes attribution/legal review. |
 
 ## Rejected alternatives
 

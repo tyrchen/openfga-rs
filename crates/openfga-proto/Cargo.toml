@@ -7,6 +7,7 @@ edition.workspace = true
 license.workspace = true
 readme.workspace = true
 rust-version.workspace = true
+publish = false
 
 [dependencies]
 pbjson.workspace = true

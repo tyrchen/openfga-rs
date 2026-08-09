@@ -1,0 +1,64 @@
+name: Bug report
+description: Report reproducible incorrect behavior without sensitive data.
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not disclose vulnerabilities, credentials, private authorization models, or production
+        data here. Follow SECURITY.md for a private security report.
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      description: Include the exact release, commit, and whether the tree was modified.
+    validations:
+      required: true
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Storage backend
+      options:
+        - Memory
+        - PostgreSQL
+        - MySQL
+        - SQLite
+        - Not storage-related
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Observed and expected behavior
+      description: Use synthetic identifiers and explain the semantic difference.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Include bounded steps, configuration with secrets removed, and a minimal model/tuple set.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, architecture, Rust/server version, database version, protocol, and client SDK.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Redacted diagnostics
+      description: Include only relevant logs or traces after removing tokens, secrets, tenant data, and query values.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Safety checks
+      options:
+        - label: I searched existing issues and the compatibility matrix.
+          required: true
+        - label: This report contains no vulnerability details, credentials, or production data.
+          required: true

@@ -1,7 +1,16 @@
 //! Ordered exhaustive validation over reflected PGV rules.
 
-use std::{collections::HashSet, time::SystemTime};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    future::Future,
+    num::NonZeroU64,
+    sync::{Arc, LazyLock},
+    time::SystemTime,
+};
 
+use axum::body::Bytes;
+use moka::sync::Cache;
 use prost_reflect::{
     DynamicMessage, EnumDescriptor, FieldDescriptor, Kind, MapKey, MessageDescriptor,
     ReflectMessage, Value,
@@ -19,9 +28,245 @@ use regex::Regex;
 const INVALID_TIMESTAMP_PREFIX: &str = "openfga_invalid_timestamp:";
 const MIN_TIMESTAMP_SECONDS: i64 = -62_135_596_800;
 const MAX_TIMESTAMP_SECONDS: i64 = 253_402_300_799;
+const ESTIMATED_CACHE_ENTRY_OVERHEAD_BYTES: usize = 128;
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct WireCacheKey {
+    message: Arc<str>,
+    scope: Arc<str>,
+    payload: Bytes,
+}
+
+impl WireCacheKey {
+    fn new(message: &str, scope: &str, payload: Bytes) -> Self {
+        Self {
+            message: Arc::from(message),
+            scope: Arc::from(scope),
+            payload,
+        }
+    }
+
+    fn estimated_weight(&self) -> usize {
+        self.message
+            .len()
+            .saturating_add(self.scope.len())
+            .saturating_add(self.payload.len())
+            .saturating_add(ESTIMATED_CACHE_ENTRY_OVERHEAD_BYTES)
+    }
+}
+
+/// Exact HTTP request identity carried from JSON normalization to typed PGV validation.
+#[derive(Clone, Debug)]
+pub(crate) struct HttpValidationKey(WireCacheKey);
+
+tokio::task_local! {
+    static HTTP_VALIDATION_KEY: HttpValidationKey;
+}
+
+pub(crate) async fn with_http_validation_key<F>(key: HttpValidationKey, future: F) -> F::Output
+where
+    F: Future,
+{
+    HTTP_VALIDATION_KEY.scope(key, future).await
+}
+
+/// Bounded exact-byte memoization for successful wire normalization and validation.
+#[derive(Clone)]
+pub(crate) struct WireCache {
+    normalized_json: Cache<WireCacheKey, Bytes>,
+    validated_messages: Cache<WireCacheKey, ()>,
+}
+
+impl WireCache {
+    pub(crate) fn new(maximum_weight: NonZeroU64) -> Self {
+        let validation_weight = maximum_weight.get() / 2;
+        let normalization_weight = maximum_weight.get().saturating_sub(validation_weight);
+        Self {
+            normalized_json: Cache::builder()
+                .max_capacity(normalization_weight)
+                .weigher(|key: &WireCacheKey, normalized: &Bytes| {
+                    cache_weight(key.estimated_weight().saturating_add(normalized.len()))
+                })
+                .build(),
+            validated_messages: Cache::builder()
+                .max_capacity(validation_weight)
+                .weigher(|key: &WireCacheKey, (): &()| cache_weight(key.estimated_weight()))
+                .build(),
+        }
+    }
+
+    pub(crate) fn normalized_json(
+        &self,
+        descriptor: &MessageDescriptor,
+        payload: &Bytes,
+    ) -> Option<Bytes> {
+        self.normalized_json.get(&WireCacheKey::new(
+            descriptor.full_name(),
+            "",
+            payload.clone(),
+        ))
+    }
+
+    pub(crate) fn cache_normalized_json(
+        &self,
+        descriptor: &MessageDescriptor,
+        payload: Bytes,
+        normalized: Bytes,
+    ) {
+        self.normalized_json.insert(
+            WireCacheKey::new(descriptor.full_name(), "", payload),
+            normalized,
+        );
+    }
+
+    pub(crate) fn http_validation_key(
+        descriptor: &MessageDescriptor,
+        path: &str,
+        payload: Bytes,
+    ) -> HttpValidationKey {
+        HttpValidationKey(WireCacheKey::new(descriptor.full_name(), path, payload))
+    }
+
+    fn validated(&self, key: &WireCacheKey) -> bool {
+        self.validated_messages.get(key).is_some()
+    }
+
+    fn cache_validated(&self, key: WireCacheKey) {
+        self.validated_messages.insert(key, ());
+    }
+
+    #[cfg(test)]
+    fn validated_message_count(&self) -> u64 {
+        self.validated_messages.run_pending_tasks();
+        self.validated_messages.entry_count()
+    }
+}
+
+impl fmt::Debug for WireCache {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WireCache")
+            .field(
+                "normalized_json_entries",
+                &self.normalized_json.entry_count(),
+            )
+            .field(
+                "validated_message_entries",
+                &self.validated_messages.entry_count(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+fn cache_weight(bytes: usize) -> u32 {
+    u32::try_from(bytes).unwrap_or(u32::MAX)
+}
+
+#[derive(Debug)]
+struct ValidationSchema {
+    rules: HashMap<String, FieldRules>,
+    regexes: HashMap<String, Regex>,
+    time_dependent_messages: HashSet<String>,
+}
+
+static VALIDATION_SCHEMA: LazyLock<ValidationSchema> = LazyLock::new(|| {
+    let mut rules = HashMap::new();
+    let mut regexes = HashMap::new();
+    let messages = openfga_proto::DESCRIPTOR_POOL
+        .all_messages()
+        .collect::<Vec<_>>();
+    let mut time_dependent_messages = HashSet::new();
+    for field in messages
+        .iter()
+        .flat_map(|message| message.fields().collect::<Vec<_>>())
+    {
+        let Ok(Some(field_rules)) = field.validation_rules() else {
+            continue;
+        };
+        if let Some(RuleType::String(string_rules)) = &field_rules.r#type
+            && let Some(pattern) = &string_rules.pattern
+            && let Some(regex) = compile_go_regex(pattern)
+        {
+            regexes.insert(pattern.clone(), regex);
+        }
+        if matches!(
+            &field_rules.r#type,
+            Some(RuleType::Timestamp(timestamp_rules)) if timestamp_rules.lt_now()
+        ) {
+            time_dependent_messages.insert(field.parent_message().full_name().to_owned());
+        }
+        rules.insert(field.full_name().to_owned(), field_rules);
+    }
+    loop {
+        let mut changed = false;
+        for message in &messages {
+            if time_dependent_messages.contains(message.full_name()) {
+                continue;
+            }
+            let contains_time_dependent_message = message.fields().any(|field| {
+                matches!(
+                    field.kind(),
+                    Kind::Message(nested)
+                        if time_dependent_messages.contains(nested.full_name())
+                )
+            });
+            if contains_time_dependent_message {
+                changed |= time_dependent_messages.insert(message.full_name().to_owned());
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    ValidationSchema {
+        rules,
+        regexes,
+        time_dependent_messages,
+    }
+});
 
 /// Collects every PGV failure in the same field/rule/item order as generated `ValidateAll`.
+#[cfg(test)]
 pub(crate) fn validate_all<T: ReflectMessage>(request: &T) -> Vec<ValidationError> {
+    validate_reflected(request)
+}
+
+/// Collects every PGV failure while memoizing only successful exact messages.
+pub(crate) fn validate_all_cached<T: ReflectMessage>(
+    cache: &WireCache,
+    request: &T,
+) -> Vec<ValidationError> {
+    let descriptor = request.descriptor();
+    if VALIDATION_SCHEMA
+        .time_dependent_messages
+        .contains(descriptor.full_name())
+    {
+        return validate_reflected(request);
+    }
+    let http_key = HTTP_VALIDATION_KEY
+        .try_with(Clone::clone)
+        .ok()
+        .filter(|key| key.0.message.as_ref() == descriptor.full_name());
+    let key = if let Some(key) = http_key {
+        key.0
+    } else {
+        WireCacheKey::new(
+            descriptor.full_name(),
+            "",
+            Bytes::from(request.encode_to_vec()),
+        )
+    };
+    if cache.validated(&key) {
+        return Vec::new();
+    }
+    let errors = validate_reflected(request);
+    if errors.is_empty() {
+        cache.cache_validated(key);
+    }
+    errors
+}
+
+fn validate_reflected<T: ReflectMessage>(request: &T) -> Vec<ValidationError> {
     let message = request.transcode_to_dynamic();
     let mut errors = Vec::new();
     validate_message(&message, &mut errors);
@@ -30,9 +275,10 @@ pub(crate) fn validate_all<T: ReflectMessage>(request: &T) -> Vec<ValidationErro
 
 fn validate_message(candidate: &DynamicMessage, errors: &mut Vec<ValidationError>) {
     for field in candidate.descriptor().fields() {
-        match field.validation_rules() {
-            Ok(Some(rules)) => validate_field(candidate, &field, &rules, errors),
-            Ok(None) | Err(_) => validate_unruled_field(candidate, &field, errors),
+        if let Some(rules) = VALIDATION_SCHEMA.rules.get(field.full_name()) {
+            validate_field(candidate, &field, rules, errors);
+        } else {
+            validate_unruled_field(candidate, &field, errors);
         }
     }
 }
@@ -210,7 +456,7 @@ fn validate_string(
         _ => {}
     }
     if let Some(pattern) = &rules.pattern
-        && go_regex(pattern).is_some_and(|regex| !regex.is_match(value))
+        && validation_regex(pattern).is_some_and(|regex| !regex.is_match(value))
     {
         push_string(errors, field, string::Error::Pattern(pattern.clone()));
     }
@@ -246,7 +492,11 @@ fn validate_string(
     }
 }
 
-fn go_regex(pattern: &str) -> Option<Regex> {
+fn validation_regex(pattern: &str) -> Option<&'static Regex> {
+    VALIDATION_SCHEMA.regexes.get(pattern)
+}
+
+fn compile_go_regex(pattern: &str) -> Option<Regex> {
     let ascii_classes = pattern
         .replace(r"\s", r"\x09\x0A\x0C\x0D\x20")
         .replace(r"\w", "A-Za-z0-9_")
@@ -734,4 +984,129 @@ fn protobuf_timestamp_fields(seconds: i64, nanos: i32) -> String {
 
 fn to_usize(value: u64) -> usize {
     usize::try_from(value).unwrap_or(usize::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroU64;
+
+    use axum::body::Bytes;
+    use openfga_proto::openfga::v1 as pb;
+    use prost_reflect::ReflectMessage;
+
+    use super::{WireCache, validate_all_cached, with_http_validation_key};
+
+    #[test]
+    fn test_should_cache_only_successful_exact_message_validation() {
+        let cache = WireCache::new(NonZeroU64::new(1024 * 1024).unwrap_or(NonZeroU64::MIN));
+        let valid = pb::ListStoresRequest {
+            page_size: None,
+            continuation_token: String::new(),
+            name: String::new(),
+        };
+        assert!(validate_all_cached(&cache, &valid).is_empty());
+        assert_eq!(cache.validated_message_count(), 1);
+        assert!(validate_all_cached(&cache, &valid).is_empty());
+        assert_eq!(cache.validated_message_count(), 1);
+
+        let invalid = pb::ListStoresRequest {
+            page_size: Some(pbjson_types::Int32Value { value: 0 }),
+            continuation_token: String::new(),
+            name: String::new(),
+        };
+        assert!(!validate_all_cached(&cache, &invalid).is_empty());
+        assert!(!validate_all_cached(&cache, &invalid).is_empty());
+        assert_eq!(cache.validated_message_count(), 1);
+    }
+
+    #[test]
+    fn test_should_isolate_normalized_json_by_message_type_and_exact_bytes() {
+        let cache = WireCache::new(NonZeroU64::new(1024 * 1024).unwrap_or(NonZeroU64::MIN));
+        let list_descriptor = pb::ListStoresRequest::default().descriptor();
+        let create_descriptor = pb::CreateStoreRequest::default().descriptor();
+        let raw = Bytes::from_static(br#"{"name":null}"#);
+        let normalized = Bytes::from_static(br"{}");
+        cache.cache_normalized_json(&list_descriptor, raw.clone(), normalized.clone());
+
+        assert_eq!(
+            cache.normalized_json(&list_descriptor, &raw),
+            Some(normalized)
+        );
+        assert!(cache.normalized_json(&create_descriptor, &raw).is_none());
+        assert!(
+            cache
+                .normalized_json(&list_descriptor, &Bytes::from_static(br#"{"name": null}"#))
+                .is_none()
+        );
+        let first_route = WireCache::http_validation_key(
+            &list_descriptor,
+            "/stores/01ARZ3NDEKTSV4RRFFQ69G5FAV/check",
+            raw.clone(),
+        );
+        let second_route = WireCache::http_validation_key(
+            &list_descriptor,
+            "/stores/01ARZ3NDEKTSV4RRFFQ69G5FAW/check",
+            raw,
+        );
+        assert_ne!(first_route.0, second_route.0);
+    }
+
+    #[tokio::test]
+    async fn test_should_reuse_validation_only_for_the_exact_http_route_and_body() {
+        let cache = WireCache::new(NonZeroU64::new(1024 * 1024).unwrap_or(NonZeroU64::MIN));
+        let request = pb::GetStoreRequest {
+            store_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+        };
+        let descriptor = request.descriptor();
+        let body = Bytes::from_static(br"{}");
+        let first_route = WireCache::http_validation_key(
+            &descriptor,
+            "/stores/01ARZ3NDEKTSV4RRFFQ69G5FAV/check",
+            body.clone(),
+        );
+
+        let errors = with_http_validation_key(first_route.clone(), async {
+            validate_all_cached(&cache, &request)
+        })
+        .await;
+        assert!(errors.is_empty());
+        assert_eq!(cache.validated_message_count(), 1);
+
+        let errors =
+            with_http_validation_key(first_route, async { validate_all_cached(&cache, &request) })
+                .await;
+        assert!(errors.is_empty());
+        assert_eq!(cache.validated_message_count(), 1);
+
+        let second_route = WireCache::http_validation_key(
+            &descriptor,
+            "/stores/01ARZ3NDEKTSV4RRFFQ69G5FAW/check",
+            body,
+        );
+        let errors = with_http_validation_key(second_route, async {
+            validate_all_cached(&cache, &request)
+        })
+        .await;
+        assert!(errors.is_empty());
+        assert_eq!(cache.validated_message_count(), 2);
+    }
+
+    #[test]
+    fn test_should_never_cache_time_dependent_validation() {
+        let cache = WireCache::new(NonZeroU64::new(1024 * 1024).unwrap_or(NonZeroU64::MIN));
+        let request = pb::ReadChangesRequest {
+            store_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            r#type: String::new(),
+            page_size: None,
+            continuation_token: String::new(),
+            start_time: Some(pbjson_types::Timestamp {
+                seconds: 0,
+                nanos: 0,
+            }),
+        };
+
+        assert!(validate_all_cached(&cache, &request).is_empty());
+        assert!(validate_all_cached(&cache, &request).is_empty());
+        assert_eq!(cache.validated_message_count(), 0);
+    }
 }

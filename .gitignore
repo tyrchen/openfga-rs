@@ -2,3 +2,11 @@
 .tools/
 node_modules/
 .vscode
+.DS_Store
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.profraw
+perf.data*

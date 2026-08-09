@@ -1,0 +1,44 @@
+version: 2
+
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "04:00"
+      timezone: Etc/UTC
+    versioning-strategy: increase
+    open-pull-requests-limit: 10
+    groups:
+      rust-patches:
+        patterns: ["*"]
+        update-types: [patch]
+      rust-minors:
+        patterns: ["*"]
+        update-types: [minor]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "04:30"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 10
+    groups:
+      github-actions:
+        patterns: ["*"]
+
+  - package-ecosystem: npm
+    directory: /tests/sdk-smoke-js
+    schedule:
+      interval: weekly
+      day: monday
+      time: "05:00"
+      timezone: Etc/UTC
+    versioning-strategy: increase
+    open-pull-requests-limit: 5
+    groups:
+      sdk-smoke:
+        patterns: ["*"]

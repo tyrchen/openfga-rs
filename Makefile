@@ -1,5 +1,7 @@
 CARGO ?= cargo
 RUSTFMT_TOOLCHAIN := nightly-2026-07-29
+ACTIONLINT_VERSION := 1.7.12
+ACTIONLINT_TOOL := .tools/actionlint-$(ACTIONLINT_VERSION)/actionlint
 GO_VERSION := 1.26.5
 GO_TOOL := .tools/go/bin/go
 GO_BASELINE_COMMIT := 4e4f79ed841513dfd61746a75ef473f6198299f7
@@ -13,6 +15,7 @@ RUST_WRITER_HTTP_ADDR ?= 127.0.0.1:18085
 RUST_WRITER_GRPC_ADDR ?= 127.0.0.1:18086
 RUST_AUTHZEN_DISABLED_HTTP_ADDR ?= 127.0.0.1:18087
 RUST_AUTHZEN_DISABLED_GRPC_ADDR ?= 127.0.0.1:18088
+SERVER_READINESS_ATTEMPTS ?= 600
 FUZZ_TIME ?= 15
 POSTGRES_TEST_URL ?=
 MYSQL_TEST_URL ?=
@@ -20,10 +23,12 @@ COMPAT_STORAGE_BACKEND ?= postgres
 COMPAT_DATABASE_URL ?= $(POSTGRES_TEST_URL)
 CONFIG ?= config/openfga-development.yaml
 PHASE4_BENCH_REQUESTS ?= 25
+PHASE4_BENCH_MUTATION_REQUESTS ?= 5
 PHASE4_CONSISTENCY_ITERATIONS ?= 32
 PHASE4_SOAK_CLIENTS ?= 100
 PHASE4_SOAK_SECONDS ?= 1800
 PHASE4_RSS_GROWTH_KIB ?= 65536
+PHASE4_MAXIMUM_CONCURRENCY ?= 256
 PHASE4_ARTIFACT_DIR ?= target/phase4
 PHASE4_STORAGE_BACKEND ?= memory
 PHASE4_POSTGRES_MIGRATE ?= false
@@ -37,6 +42,7 @@ PHASE5_ARTIFACT_DIR ?= target/phase5
 PHASE5_PLATFORM := $(shell uname -s | tr '[:upper:]' '[:lower:]')-$(shell uname -m)
 WORKSPACE_TARGET_DIR := $(shell $(CARGO) metadata --no-deps --format-version 1 | \
 	sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
+OPENFGA_SERVER := $(WORKSPACE_TARGET_DIR)/debug/openfga-server
 UPSTREAM_SQLITE_URL_ENV ?= OPENFGA_UPSTREAM_SQLITE_URL
 DESTINATION_SQLITE_URL_ENV ?= OPENFGA_SQLITE_URL
 PROTO_OUTPUT := crates/openfga-proto/src/generated
@@ -52,6 +58,7 @@ phase4-criterion:
 	@$(CARGO) bench -p openfga-check --bench check_latency
 	@$(CARGO) bench -p openfga-model --bench model_compile
 	@$(CARGO) bench -p openfga-model --bench model_compile_memory
+	@$(CARGO) bench -p openfga-service --bench identifier_allocation
 
 test:
 	@$(CARGO) test --workspace --all-targets
@@ -67,11 +74,17 @@ clippy-strict:
 	@$(CARGO) clippy --workspace --all-targets -- \
 		-D warnings -W clippy::pedantic -W clippy::unwrap_used \
 		-W clippy::expect_used -W clippy::indexing_slicing -W clippy::panic
+	@$(CARGO) clippy --manifest-path fuzz/Cargo.toml --all-targets -- \
+		-D warnings -W clippy::pedantic -W clippy::unwrap_used \
+		-W clippy::expect_used -W clippy::indexing_slicing -W clippy::panic
 
 doc:
 	@RUSTDOCFLAGS="-D warnings" $(CARGO) doc --workspace --no-deps
 
-check: check-proto check-docs build test fmt clippy doc
+check: check-proto check-docs check-actions check-fuzz build test fmt clippy doc
+
+check-fuzz:
+	@$(CARGO) check --manifest-path fuzz/Cargo.toml --all-targets
 
 validate-config:
 	@$(CARGO) run --quiet -p openfga-server -- validate-config --config "$(CONFIG)"
@@ -87,6 +100,32 @@ migrate-status:
 
 check-docs:
 	@$(CARGO) run --quiet -p openfga-doc-check
+
+$(ACTIONLINT_TOOL):
+	@actionlint_tmp=$$(mktemp -d); \
+	trap 'rm -rf "$$actionlint_tmp"' EXIT; \
+	case "$$(uname -s)-$$(uname -m)" in \
+		Darwin-arm64) platform=darwin_arm64; sha=aba9ced2dee8d27fecca3dc7feb1a7f9a52caefa1eb46f3271ea66b6e0e6953f ;; \
+		Darwin-x86_64) platform=darwin_amd64; sha=5b44c3bc2255115c9b69e30efc0fecdf498fdb63c5d58e17084fd5f16324c644 ;; \
+		Linux-aarch64) platform=linux_arm64; sha=325e971b6ba9bfa504672e29be93c24981eeb1c07576d730e9f7c8805afff0c6 ;; \
+		Linux-x86_64) platform=linux_amd64; sha=8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8 ;; \
+		*) echo "unsupported actionlint platform: $$(uname -s)-$$(uname -m)" >&2; exit 1 ;; \
+	esac; \
+	archive="actionlint_$(ACTIONLINT_VERSION)_$$platform.tar.gz"; \
+	curl --fail --location --silent --show-error \
+		"https://github.com/rhysd/actionlint/releases/download/v$(ACTIONLINT_VERSION)/$$archive" \
+		--output "$$actionlint_tmp/$$archive"; \
+	if command -v shasum >/dev/null 2>&1; then \
+		actual_sha=$$(shasum -a 256 "$$actionlint_tmp/$$archive" | awk '{print $$1}'); \
+	else \
+		actual_sha=$$(sha256sum "$$actionlint_tmp/$$archive" | awk '{print $$1}'); \
+	fi; \
+	test "$$actual_sha" = "$$sha"; \
+	mkdir -p "$(@D)"; \
+	tar -xzf "$$actionlint_tmp/$$archive" -C "$(@D)" actionlint
+
+check-actions: $(ACTIONLINT_TOOL)
+	@$(ACTIONLINT_TOOL) -color
 
 proto:
 	@$(CARGO) run -p openfga-proto-codegen -- --output $(PROTO_OUTPUT)
@@ -145,20 +184,20 @@ differential-smoke: $(GO_BASELINE) build
 	trap cleanup EXIT INT TERM; \
 	$(GO_BASELINE) run --http-addr $(GO_HTTP_ADDR) --grpc-addr $(GO_GRPC_ADDR) \
 		--playground-enabled=false >"$$phase0_tmp/go.log" 2>&1 & go_pid=$$!; \
-	$(CARGO) run --quiet -p openfga-server -- probe-server \
+	"$(OPENFGA_SERVER)" probe-server \
 		--address $(RUST_PROBE_ADDR) >"$$phase0_tmp/rust.log" 2>&1 & rust_pid=$$!; \
 	for endpoint in "http://$(GO_HTTP_ADDR)/healthz" "http://$(RUST_PROBE_ADDR)/healthz"; do \
 		attempt=0; \
 		until curl --fail --silent "$$endpoint" >/dev/null; do \
 			if ! kill -0 "$$go_pid" 2>/dev/null || ! kill -0 "$$rust_pid" 2>/dev/null; then \
 				echo "a compatibility server exited before readiness" >&2; \
-				tail -100 "$$phase0_tmp/go.log" "$$phase0_tmp/rust.log" >&2; \
+				tail -n 100 "$$phase0_tmp/go.log" "$$phase0_tmp/rust.log" >&2; \
 				exit 1; \
 			fi; \
 			attempt=$$((attempt + 1)); \
-			if test "$$attempt" -ge 100; then \
+			if test "$$attempt" -ge "$(SERVER_READINESS_ATTEMPTS)"; then \
 				echo "server did not become ready: $$endpoint" >&2; \
-				tail -100 "$$phase0_tmp/go.log" "$$phase0_tmp/rust.log" >&2; \
+				tail -n 100 "$$phase0_tmp/go.log" "$$phase0_tmp/rust.log" >&2; \
 				exit 1; \
 			fi; \
 			sleep 0.1; \
@@ -193,9 +232,22 @@ phase2-compatibility: $(GO_BASELINE) build
 			openssl x509 -noout -fingerprint -sha256; \
 	}; \
 	trap cleanup EXIT INT TERM; \
+	printf '%s\n' \
+		'basicConstraints=critical,CA:FALSE' \
+		'keyUsage=critical,digitalSignature,keyEncipherment' \
+		'extendedKeyUsage=serverAuth' \
+		'subjectAltName=DNS:localhost,IP:127.0.0.1' >"$$phase2_tmp/tls.ext"; \
 	openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 1 \
-		-subj /CN=localhost -addext subjectAltName=DNS:localhost,IP:127.0.0.1 \
-		-keyout "$$phase2_tmp/tls.key" -out "$$phase2_tmp/tls.crt" >/dev/null 2>&1; \
+		-subj /CN=openfga-ci-ca \
+		-addext basicConstraints=critical,CA:TRUE \
+		-addext keyUsage=critical,keyCertSign,cRLSign \
+		-keyout "$$phase2_tmp/ca.key" -out "$$phase2_tmp/ca.crt" >/dev/null 2>&1; \
+	openssl req -new -newkey rsa:2048 -nodes -sha256 -subj /CN=localhost \
+		-keyout "$$phase2_tmp/tls.key" -out "$$phase2_tmp/tls.csr" >/dev/null 2>&1; \
+	openssl x509 -req -sha256 -days 1 -in "$$phase2_tmp/tls.csr" \
+		-CA "$$phase2_tmp/ca.crt" -CAkey "$$phase2_tmp/ca.key" -set_serial 1 \
+		-extfile "$$phase2_tmp/tls.ext" -out "$$phase2_tmp/tls.crt" >/dev/null 2>&1; \
+	chmod 600 "$$phase2_tmp/ca.key"; \
 	chmod 600 "$$phase2_tmp/tls.key"; \
 	$(GO_BASELINE) run --http-addr $(GO_HTTP_ADDR) --grpc-addr $(GO_GRPC_ADDR) \
 		--playground-enabled=false >"$$phase2_tmp/go.log" 2>&1 & go_pid=$$!; \
@@ -219,7 +271,7 @@ phase2-compatibility: $(GO_BASELINE) build
 	OPENFGA_SQLITE_URL="$$compat_database_url" \
 	OPENFGA_PRESHARED_KEY=phase2-compatibility-preshared-key-material \
 	OPENFGA_TOKEN_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= \
-	$(CARGO) run --quiet -p openfga-server -- run \
+	"$(OPENFGA_SERVER)" run \
 		--config config/openfga-preshared-development.yaml \
 		>"$$phase2_tmp/rust.log" 2>&1 & rust_pid=$$!; \
 	for endpoint in "http://$(GO_HTTP_ADDR)/healthz" "https://$(RUST_HTTP_ADDR)/readyz"; do \
@@ -227,13 +279,13 @@ phase2-compatibility: $(GO_BASELINE) build
 		until curl --insecure --fail --silent "$$endpoint" >/dev/null; do \
 			if ! kill -0 "$$go_pid" 2>/dev/null || ! kill -0 "$$rust_pid" 2>/dev/null; then \
 				echo "a Phase 2 compatibility server exited before readiness" >&2; \
-				tail -100 "$$phase2_tmp/go.log" "$$phase2_tmp/rust.log" >&2; \
+				tail -n 100 "$$phase2_tmp/go.log" "$$phase2_tmp/rust.log" >&2; \
 				exit 1; \
 			fi; \
 			attempt=$$((attempt + 1)); \
-			if test "$$attempt" -ge 150; then \
+			if test "$$attempt" -ge "$(SERVER_READINESS_ATTEMPTS)"; then \
 				echo "Phase 2 server did not become ready: $$endpoint" >&2; \
-				tail -100 "$$phase2_tmp/go.log" "$$phase2_tmp/rust.log" >&2; \
+				tail -n 100 "$$phase2_tmp/go.log" "$$phase2_tmp/rust.log" >&2; \
 				exit 1; \
 			fi; \
 			sleep 0.1; \
@@ -252,9 +304,12 @@ phase2-compatibility: $(GO_BASELINE) build
 		sleep 0.1; \
 	done; \
 	test "$$(fingerprint "$(RUST_HTTP_ADDR)")" = "$$before_http"; \
-	openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 1 \
-		-subj /CN=localhost -addext subjectAltName=DNS:localhost,IP:127.0.0.1 \
-		-keyout "$$phase2_tmp/tls.next.key" -out "$$phase2_tmp/tls.next.crt" >/dev/null 2>&1; \
+	openssl req -new -newkey rsa:2048 -nodes -sha256 -subj /CN=localhost \
+		-keyout "$$phase2_tmp/tls.next.key" -out "$$phase2_tmp/tls.next.csr" >/dev/null 2>&1; \
+	openssl x509 -req -sha256 -days 1 -in "$$phase2_tmp/tls.next.csr" \
+		-CA "$$phase2_tmp/ca.crt" -CAkey "$$phase2_tmp/ca.key" -set_serial 2 \
+		-extfile "$$phase2_tmp/tls.ext" \
+		-out "$$phase2_tmp/tls.next.crt" >/dev/null 2>&1; \
 	chmod 600 "$$phase2_tmp/tls.next.key"; \
 	mv "$$phase2_tmp/tls.next.key" "$$phase2_tmp/tls.key"; \
 	mv "$$phase2_tmp/tls.next.crt" "$$phase2_tmp/tls.crt"; \
@@ -270,7 +325,7 @@ phase2-compatibility: $(GO_BASELINE) build
 	npm ci --prefix tests/sdk-smoke-js --ignore-scripts --no-audit --no-fund; \
 	FGA_API_URL="http://$(GO_HTTP_ADDR)" node tests/sdk-smoke-js/smoke.mjs \
 		>"$$phase2_tmp/go-sdk.json"; \
-	NODE_EXTRA_CA_CERTS="$$phase2_tmp/tls.crt" \
+	NODE_EXTRA_CA_CERTS="$$phase2_tmp/ca.crt" \
 	FGA_API_URL="https://$(RUST_HTTP_ADDR)" \
 	FGA_API_TOKEN=phase2-compatibility-preshared-key-material \
 		node tests/sdk-smoke-js/smoke.mjs >"$$phase2_tmp/rust-sdk.json"; \
@@ -278,7 +333,7 @@ phase2-compatibility: $(GO_BASELINE) build
 	$(CARGO) run --quiet -p phase2-grpc-smoke -- \
 		--go-url "http://$(GO_GRPC_ADDR)" \
 		--rust-url "https://$(RUST_GRPC_ADDR)" \
-		--rust-ca "$$phase2_tmp/tls.crt" \
+		--rust-ca "$$phase2_tmp/ca.crt" \
 		--rust-token phase2-compatibility-preshared-key-material; \
 	test "$$(curl --insecure --silent --output /dev/null --write-out '%{http_code}' \
 		"https://$(RUST_HTTP_ADDR)/stores")" = 401; \
@@ -364,20 +419,20 @@ check-differential: $(GO_BASELINE) build
 	trap cleanup EXIT INT TERM; \
 	$(GO_BASELINE) run --http-addr $(GO_HTTP_ADDR) --grpc-addr $(GO_GRPC_ADDR) \
 		--playground-enabled=false >"$$phase1_tmp/go.log" 2>&1 & go_pid=$$!; \
-	$(CARGO) run --quiet -p openfga-server -- check-probe-server \
+	"$(OPENFGA_SERVER)" check-probe-server \
 		--address $(RUST_PROBE_ADDR) >"$$phase1_tmp/rust.log" 2>&1 & rust_pid=$$!; \
 	for endpoint in "http://$(GO_HTTP_ADDR)/healthz" "http://$(RUST_PROBE_ADDR)/healthz"; do \
 		attempt=0; \
 		until curl --fail --silent "$$endpoint" >/dev/null; do \
 			if ! kill -0 "$$go_pid" 2>/dev/null || ! kill -0 "$$rust_pid" 2>/dev/null; then \
 				echo "a Check compatibility server exited before readiness" >&2; \
-				tail -100 "$$phase1_tmp/go.log" "$$phase1_tmp/rust.log" >&2; \
+				tail -n 100 "$$phase1_tmp/go.log" "$$phase1_tmp/rust.log" >&2; \
 				exit 1; \
 			fi; \
 			attempt=$$((attempt + 1)); \
-			if test "$$attempt" -ge 100; then \
+			if test "$$attempt" -ge "$(SERVER_READINESS_ATTEMPTS)"; then \
 				echo "Check server did not become ready: $$endpoint" >&2; \
-				tail -100 "$$phase1_tmp/go.log" "$$phase1_tmp/rust.log" >&2; \
+				tail -n 100 "$$phase1_tmp/go.log" "$$phase1_tmp/rust.log" >&2; \
 				exit 1; \
 			fi; \
 			sleep 0.1; \
@@ -404,7 +459,7 @@ enumeration-differential: $(GO_BASELINE) build
 	OPENFGA__LISTENERS__HTTP=$(RUST_HTTP_ADDR) \
 	OPENFGA__LISTENERS__GRPC=$(RUST_GRPC_ADDR) \
 	OPENFGA_TOKEN_KEY="$$token_key" \
-	$(CARGO) run --quiet -p openfga-server -- run \
+	"$(OPENFGA_SERVER)" run \
 		--config config/openfga-development.yaml \
 		>"$$phase3_tmp/rust.log" 2>&1 & rust_pid=$$!; \
 	for endpoint in "http://$(GO_HTTP_ADDR)/healthz" "http://$(RUST_HTTP_ADDR)/readyz"; do \
@@ -412,13 +467,13 @@ enumeration-differential: $(GO_BASELINE) build
 		until curl --fail --silent "$$endpoint" >/dev/null; do \
 			if ! kill -0 "$$go_pid" 2>/dev/null || ! kill -0 "$$rust_pid" 2>/dev/null; then \
 				echo "an enumeration differential server exited before readiness" >&2; \
-				tail -100 "$$phase3_tmp/go.log" "$$phase3_tmp/rust.log" >&2; \
+				tail -n 100 "$$phase3_tmp/go.log" "$$phase3_tmp/rust.log" >&2; \
 				exit 1; \
 			fi; \
 			attempt=$$((attempt + 1)); \
-			if test "$$attempt" -ge 100; then \
+			if test "$$attempt" -ge "$(SERVER_READINESS_ATTEMPTS)"; then \
 				echo "enumeration server did not become ready: $$endpoint" >&2; \
-				tail -100 "$$phase3_tmp/go.log" "$$phase3_tmp/rust.log" >&2; \
+				tail -n 100 "$$phase3_tmp/go.log" "$$phase3_tmp/rust.log" >&2; \
 				exit 1; \
 			fi; \
 			sleep 0.1; \
@@ -453,7 +508,7 @@ authzen-differential: $(GO_BASELINE) build
 	OPENFGA__AUTHZEN__ENABLED=true \
 	OPENFGA__AUTHZEN__BASE_URL="http://$(RUST_HTTP_ADDR)" \
 	OPENFGA_TOKEN_KEY="$$token_key" \
-	$(CARGO) run --quiet -p openfga-server -- run \
+	"$(OPENFGA_SERVER)" run \
 		--config config/openfga-development.yaml \
 		>"$$phase6_tmp/rust.log" 2>&1 & rust_pid=$$!; \
 	for endpoint in "http://$(GO_HTTP_ADDR)/healthz" "http://$(RUST_HTTP_ADDR)/readyz"; do \
@@ -461,13 +516,13 @@ authzen-differential: $(GO_BASELINE) build
 		until curl --fail --silent "$$endpoint" >/dev/null; do \
 			if ! kill -0 "$$go_pid" 2>/dev/null || ! kill -0 "$$rust_pid" 2>/dev/null; then \
 				echo "an AuthZEN differential server exited before readiness" >&2; \
-				tail -100 "$$phase6_tmp/go.log" "$$phase6_tmp/rust.log" >&2; \
+				tail -n 100 "$$phase6_tmp/go.log" "$$phase6_tmp/rust.log" >&2; \
 				exit 1; \
 			fi; \
 			attempt=$$((attempt + 1)); \
-			if test "$$attempt" -ge 100; then \
+			if test "$$attempt" -ge "$(SERVER_READINESS_ATTEMPTS)"; then \
 				echo "AuthZEN server did not become ready: $$endpoint" >&2; \
-				tail -100 "$$phase6_tmp/go.log" "$$phase6_tmp/rust.log" >&2; \
+				tail -n 100 "$$phase6_tmp/go.log" "$$phase6_tmp/rust.log" >&2; \
 				exit 1; \
 			fi; \
 			sleep 0.1; \
@@ -500,14 +555,14 @@ authzen-conformance: authzen-baseline build
 	OPENFGA__AUTHZEN__ENABLED=true \
 	OPENFGA__AUTHZEN__BASE_URL="http://openfga.example" \
 	OPENFGA_TOKEN_KEY="$$token_key" \
-	$(CARGO) run --quiet -p openfga-server -- run \
+	"$(OPENFGA_SERVER)" run \
 		--config config/openfga-development.yaml \
 		>"$$phase6_tmp/rust.log" 2>&1 & rust_pid=$$!; \
 	OPENFGA__LISTENERS__HTTP=$(RUST_AUTHZEN_DISABLED_HTTP_ADDR) \
 	OPENFGA__LISTENERS__GRPC=$(RUST_AUTHZEN_DISABLED_GRPC_ADDR) \
 	OPENFGA__AUTHZEN__ENABLED=false \
 	OPENFGA_TOKEN_KEY="$$token_key" \
-	$(CARGO) run --quiet -p openfga-server -- run \
+	"$(OPENFGA_SERVER)" run \
 		--config config/openfga-development.yaml \
 		>"$$phase6_tmp/rust-disabled.log" 2>&1 & disabled_rust_pid=$$!; \
 	for endpoint in "http://$(RUST_HTTP_ADDR)/readyz" "http://$(RUST_AUTHZEN_DISABLED_HTTP_ADDR)/readyz"; do \
@@ -515,13 +570,13 @@ authzen-conformance: authzen-baseline build
 		until curl --fail --silent "$$endpoint" >/dev/null; do \
 			if ! kill -0 "$$rust_pid" 2>/dev/null || ! kill -0 "$$disabled_rust_pid" 2>/dev/null; then \
 				echo "a Rust AuthZEN conformance server exited before readiness" >&2; \
-				tail -100 "$$phase6_tmp/rust.log" "$$phase6_tmp/rust-disabled.log" >&2; \
+				tail -n 100 "$$phase6_tmp/rust.log" "$$phase6_tmp/rust-disabled.log" >&2; \
 				exit 1; \
 			fi; \
 			attempt=$$((attempt + 1)); \
-			if test "$$attempt" -ge 100; then \
+			if test "$$attempt" -ge "$(SERVER_READINESS_ATTEMPTS)"; then \
 				echo "Rust AuthZEN conformance server did not become ready: $$endpoint" >&2; \
-				tail -100 "$$phase6_tmp/rust.log" "$$phase6_tmp/rust-disabled.log" >&2; \
+				tail -n 100 "$$phase6_tmp/rust.log" "$$phase6_tmp/rust-disabled.log" >&2; \
 				exit 1; \
 			fi; \
 			sleep 0.1; \
@@ -550,7 +605,7 @@ phase4-scale: $(GO_BASELINE) build-release
 		test -z "$$rust_pid" || wait "$$rust_pid" 2>/dev/null || true; \
 		test -z "$$writer_pid" || wait "$$writer_pid" 2>/dev/null || true; \
 		if test "$$phase4_status" -ne 0; then \
-			tail -100 "$$phase4_tmp/go.log" "$$phase4_tmp/rust.log" "$$phase4_tmp/writer.log" 2>/dev/null || true; \
+			tail -n 100 "$$phase4_tmp/go.log" "$$phase4_tmp/rust.log" "$$phase4_tmp/writer.log" 2>/dev/null || true; \
 		fi; \
 		rm -rf "$$phase4_tmp"; \
 		return "$$phase4_status"; \
@@ -574,6 +629,7 @@ phase4-scale: $(GO_BASELINE) build-release
 	OPENFGA__TRANSPORT__ADMISSION__WRITES=1000000 \
 	OPENFGA__TRANSPORT__ADMISSION__CHECKS=1000000 \
 	OPENFGA__TRANSPORT__ADMISSION__ENUMERATION=1000000 \
+	OPENFGA__TRANSPORT__MAXIMUM_CONCURRENCY=$(PHASE4_MAXIMUM_CONCURRENCY) \
 	OPENFGA_DATABASE_URL="$(POSTGRES_TEST_URL)" \
 	OPENFGA_TOKEN_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= \
 	"$$server_binary" run --config config/openfga-development.yaml \
@@ -583,11 +639,11 @@ phase4-scale: $(GO_BASELINE) build-release
 		until curl --fail --silent "$$endpoint" >/dev/null; do \
 			if ! kill -0 "$$go_pid" 2>/dev/null || ! kill -0 "$$rust_pid" 2>/dev/null; then \
 				echo "a Phase 4 scale server exited before readiness" >&2; \
-				tail -100 "$$phase4_tmp/go.log" "$$phase4_tmp/rust.log" >&2; \
+				tail -n 100 "$$phase4_tmp/go.log" "$$phase4_tmp/rust.log" >&2; \
 				exit 1; \
 			fi; \
 			attempt=$$((attempt + 1)); \
-			test "$$attempt" -lt 150 || { echo "Phase 4 server did not become ready: $$endpoint" >&2; exit 1; }; \
+			test "$$attempt" -lt "$(SERVER_READINESS_ATTEMPTS)" || { echo "Phase 4 server did not become ready: $$endpoint" >&2; exit 1; }; \
 			sleep 0.1; \
 		done; \
 	done; \
@@ -604,6 +660,7 @@ phase4-scale: $(GO_BASELINE) build-release
 		OPENFGA__TRANSPORT__ADMISSION__WRITES=1000000 \
 		OPENFGA__TRANSPORT__ADMISSION__CHECKS=1000000 \
 		OPENFGA__TRANSPORT__ADMISSION__ENUMERATION=1000000 \
+		OPENFGA__TRANSPORT__MAXIMUM_CONCURRENCY=$(PHASE4_MAXIMUM_CONCURRENCY) \
 		OPENFGA_DATABASE_URL="$(POSTGRES_TEST_URL)" \
 		OPENFGA_TOKEN_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= \
 		"$$server_binary" run --config config/openfga-development.yaml \
@@ -612,11 +669,11 @@ phase4-scale: $(GO_BASELINE) build-release
 		until curl --fail --silent "http://$(RUST_WRITER_HTTP_ADDR)/readyz" >/dev/null; do \
 			if ! kill -0 "$$writer_pid" 2>/dev/null; then \
 				echo "the Phase 4 writer server exited before readiness" >&2; \
-				tail -100 "$$phase4_tmp/writer.log" >&2; \
+				tail -n 100 "$$phase4_tmp/writer.log" >&2; \
 				exit 1; \
 			fi; \
 			attempt=$$((attempt + 1)); \
-			test "$$attempt" -lt 150 || { echo "Phase 4 writer did not become ready" >&2; exit 1; }; \
+			test "$$attempt" -lt "$(SERVER_READINESS_ATTEMPTS)" || { echo "Phase 4 writer did not become ready" >&2; exit 1; }; \
 			sleep 0.1; \
 		done; \
 		writer_arg="--writer-url http://$(RUST_WRITER_HTTP_ADDR)/"; \
@@ -632,6 +689,7 @@ phase4-scale: $(GO_BASELINE) build-release
 		--go-pid "$$go_pid" \
 		--rust-pid "$$rust_pid" \
 		--requests-per-client "$(PHASE4_BENCH_REQUESTS)" \
+		--mutation-requests-per-client "$(PHASE4_BENCH_MUTATION_REQUESTS)" \
 		>"$(PHASE4_ARTIFACT_DIR)/reference-benchmark.json"; \
 	resource_samples="$$phase4_tmp/process-resources.tsv"; \
 	process_threads() { \
@@ -709,6 +767,7 @@ phase4-postgres-scale-smoke:
 		PHASE4_CONSISTENCY_ITERATIONS=8 \
 		PHASE4_SOAK_CLIENTS=16 \
 		PHASE4_SOAK_SECONDS=30 \
+		PHASE4_MAXIMUM_CONCURRENCY=64 \
 		PHASE4_STORAGE_BACKEND=postgres \
 		PHASE4_POSTGRES_MIGRATE=true \
 		PHASE4_SOAK_CONSISTENCY_ARG=--higher-consistency
@@ -730,6 +789,10 @@ phase4-local-postgres-scale-smoke:
 	postgres_started=true; \
 	postgres_url="postgresql://$$(id -un)@127.0.0.1:$(PHASE4_POSTGRES_PORT)/postgres?sslmode=disable"; \
 	$(MAKE) postgres-storage POSTGRES_TEST_URL="$$postgres_url"; \
+	$(MAKE) sqlx-prepare-check POSTGRES_TEST_URL="$$postgres_url"; \
+	$(MAKE) phase2-compatibility \
+		COMPAT_STORAGE_BACKEND=postgres \
+		COMPAT_DATABASE_URL="$$postgres_url"; \
 	$(MAKE) phase4-postgres-scale-smoke \
 		POSTGRES_TEST_URL="$$postgres_url"
 
@@ -785,9 +848,11 @@ fuzz-model:
 
 audit:
 	@$(CARGO) audit
+	@$(CARGO) audit --file fuzz/Cargo.lock
 
 deny:
 	@$(CARGO) deny check
+	@$(CARGO) deny --manifest-path fuzz/Cargo.toml check
 
 $(GITLEAKS_TOOL):
 	@phase5_tmp=$$(mktemp -d); \
@@ -845,7 +910,7 @@ sbom: build-release $(SYFT_TOOL)
 	trap 'rm -rf "$$phase5_tmp"' EXIT; \
 	mkdir -p "$(PHASE5_ARTIFACT_DIR)"; \
 	test -x "$(WORKSPACE_TARGET_DIR)/release/openfga-server"; \
-	cp "$(WORKSPACE_TARGET_DIR)/release/openfga-server" Cargo.lock Cargo.toml LICENSE.md \
+	cp "$(WORKSPACE_TARGET_DIR)/release/openfga-server" Cargo.lock Cargo.toml LICENSE NOTICE \
 		"$$phase5_tmp/"; \
 	$(SYFT_TOOL) scan "dir:$$phase5_tmp" \
 		--source-name openfga-rs --source-version "$$(git rev-parse HEAD)" \
@@ -857,7 +922,13 @@ release-artifacts: build-release sbom
 	artifact="openfga-server-$(PHASE5_PLATFORM).tar.gz"; \
 	test -n "$(WORKSPACE_TARGET_DIR)"; \
 	tar -czf "$(PHASE5_ARTIFACT_DIR)/$$artifact" \
-		-C "$(WORKSPACE_TARGET_DIR)/release" openfga-server; \
+		-C "$(WORKSPACE_TARGET_DIR)/release" openfga-server \
+		-C "$(CURDIR)" LICENSE NOTICE README.md \
+		config/openfga-development.yaml config/openfga-preshared-development.yaml; \
+	for required in openfga-server LICENSE NOTICE README.md \
+		config/openfga-development.yaml config/openfga-preshared-development.yaml; do \
+		tar -tzf "$(PHASE5_ARTIFACT_DIR)/$$artifact" | grep -Fx "$$required" >/dev/null; \
+	done; \
 	cd "$(PHASE5_ARTIFACT_DIR)"; \
 	if command -v shasum >/dev/null 2>&1; then \
 		shasum -a 256 "$$artifact" openfga-rs-$(PHASE5_PLATFORM).cdx.json \
@@ -908,7 +979,7 @@ release:
 update-submodule:
 	@git submodule update --init --recursive --remote
 
-.PHONY: audit build cel-baseline cel-spike check check-agent-sync check-baseline check-corpus-differential check-differential check-docs \
+.PHONY: audit build cel-baseline cel-spike check check-actions check-agent-sync check-baseline check-corpus-differential check-differential check-docs check-fuzz \
 	check-oracle check-proto check-spike \
 	clippy clippy-strict \
 	conformance deny differential-smoke doc enumeration-differential fmt fuzz-condition fuzz-domain fuzz-model go-baseline listobjects-spike model-baseline \

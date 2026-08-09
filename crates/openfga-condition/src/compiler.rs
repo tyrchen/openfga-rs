@@ -1,12 +1,15 @@
 //! Bounded CEL parsing, static checking, and IR construction.
 
-use std::{collections::BTreeMap, fmt, mem::size_of, panic::catch_unwind};
+use std::{
+    collections::BTreeMap, fmt, mem::size_of, num::NonZeroU64, panic::catch_unwind, sync::Arc,
+};
 
 use cel_parser::{
     ParseErrors, Parser,
     ast::{CallExpr, ComprehensionExpr, EntryExpr, Expr, IdedExpr, MapEntryExpr, operators},
     reference::Val,
 };
+use moka::sync::Cache;
 use openfga_domain::{
     ConditionContext, ConditionName, ContextValue, Fingerprint, FingerprintBuilder, ParameterName,
 };
@@ -27,10 +30,54 @@ use crate::{
     value::RuntimeValue,
 };
 
-/// Stateless compiler for validated `OpenFGA` condition definitions.
-#[derive(Clone, Copy, Debug, Default)]
+const MAXIMUM_COMPILED_CONDITION_WEIGHT: u64 = 64 * 1024 * 1024;
+const ESTIMATED_CACHE_ENTRY_OVERHEAD_BYTES: usize = 256;
+
+/// Bounded compiler for validated `OpenFGA` condition definitions.
+///
+/// Successful immutable programs are coalesced and cached by definition and compilation limits.
+/// Failed compilations are never retained.
+#[derive(Clone)]
 #[non_exhaustive]
-pub struct ConditionCompiler;
+pub struct ConditionCompiler {
+    compiled: Cache<Fingerprint, Arc<CompiledCondition>>,
+}
+
+impl Default for ConditionCompiler {
+    fn default() -> Self {
+        Self::new(NonZeroU64::new(MAXIMUM_COMPILED_CONDITION_WEIGHT).unwrap_or(NonZeroU64::MIN))
+    }
+}
+
+impl ConditionCompiler {
+    /// Creates a compiler with a finite compiled-program cache weight.
+    #[must_use]
+    pub fn new(maximum_compiled_weight: NonZeroU64) -> Self {
+        Self {
+            compiled: Cache::builder()
+                .max_capacity(maximum_compiled_weight.get())
+                .weigher(|_key: &Fingerprint, condition: &Arc<CompiledCondition>| {
+                    u32::try_from(
+                        condition
+                            .estimated_owned_bytes()
+                            .saturating_add(ESTIMATED_CACHE_ENTRY_OVERHEAD_BYTES),
+                    )
+                    .unwrap_or(u32::MAX)
+                })
+                .build(),
+        }
+    }
+}
+
+impl fmt::Debug for ConditionCompiler {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConditionCompiler")
+            .field("cached_conditions", &self.compiled.entry_count())
+            .field("weighted_size", &self.compiled.weighted_size())
+            .finish_non_exhaustive()
+    }
+}
 
 impl ConditionCompiler {
     /// Parses, bounds, statically checks, and fingerprints a condition.
@@ -43,43 +90,73 @@ impl ConditionCompiler {
         &self,
         definition: &ConditionDefinition,
         limits: &ConditionLimits,
-    ) -> Result<CompiledCondition, CompileError> {
-        validate_definition(definition, limits)?;
-        let parsed = catch_unwind(|| Parser::new().parse(definition.expression()))
-            .map_err(|_| CompileError::new(CompileErrorKind::Syntax, 0))?;
-        let expression =
-            parsed.map_err(|errors| copy_parse_error(&errors, definition.expression()))?;
-        validate_ast_shape(&expression, limits)?;
-        let mut lowerer = Lowerer::new(definition);
-        let root = lowerer.lower(&expression)?;
-        if lowerer.node(root)?.static_type != StaticType::Bool {
-            return Err(CompileError::non_boolean(static_type_name(
-                &lowerer.node(root)?.static_type,
-            )));
-        }
-        let metadata = CompiledMetadata {
-            fingerprint: fingerprint_definition(definition),
-        };
-        let estimated_owned_bytes = size_of::<CompiledCondition>()
+    ) -> Result<Arc<CompiledCondition>, CompileError> {
+        let key = compilation_cache_key(definition, limits);
+        self.compiled
+            .try_get_with(key, || compile_uncached(definition, limits))
+            .map_err(|error| (*error).clone())
+    }
+}
+
+fn compile_uncached(
+    definition: &ConditionDefinition,
+    limits: &ConditionLimits,
+) -> Result<Arc<CompiledCondition>, CompileError> {
+    validate_definition(definition, limits)?;
+    let parsed = catch_unwind(|| Parser::new().parse(definition.expression()))
+        .map_err(|_| CompileError::new(CompileErrorKind::Syntax, 0))?;
+    let expression = parsed.map_err(|errors| copy_parse_error(&errors, definition.expression()))?;
+    validate_ast_shape(&expression, limits)?;
+    let mut lowerer = Lowerer::new(definition);
+    let root = lowerer.lower(&expression)?;
+    if lowerer.node(root)?.static_type != StaticType::Bool {
+        return Err(CompileError::non_boolean(static_type_name(
+            &lowerer.node(root)?.static_type,
+        )));
+    }
+    let metadata = CompiledMetadata {
+        fingerprint: fingerprint_definition(definition),
+    };
+    let estimated_owned_bytes =
+        size_of::<CompiledCondition>()
             .saturating_add(definition.expression().len().saturating_mul(4))
             .saturating_add(definition.parameters().len().saturating_mul(
                 size_of::<(ParameterName, ParameterType)>() + 4 * size_of::<usize>(),
             ))
             .saturating_add(lowerer.nodes.capacity().saturating_mul(size_of::<Node>()))
             .saturating_add(lowerer.nodes.len().saturating_mul(128));
-        Ok(CompiledCondition {
-            name: definition.name().clone(),
-            parameters: definition.parameters().clone(),
-            program: Program {
-                nodes: lowerer.nodes,
-                root,
-            },
-            metadata,
-            runtime_value_bytes: limits.runtime_value_bytes(),
-            runtime_collection_items: limits.runtime_collection_items(),
-            estimated_owned_bytes,
-        })
-    }
+    Ok(Arc::new(CompiledCondition {
+        name: definition.name().clone(),
+        parameters: definition.parameters().clone(),
+        program: Program {
+            nodes: lowerer.nodes,
+            root,
+        },
+        metadata,
+        runtime_value_bytes: limits.runtime_value_bytes(),
+        runtime_collection_items: limits.runtime_collection_items(),
+        estimated_owned_bytes,
+    }))
+}
+
+fn compilation_cache_key(
+    definition: &ConditionDefinition,
+    limits: &ConditionLimits,
+) -> Fingerprint {
+    let definition_fingerprint = fingerprint_definition(definition);
+    let mut builder = FingerprintBuilder::new("openfga.condition.compilation-cache.v1");
+    builder.write_bytes(definition_fingerprint.as_bytes());
+    builder.write_u64(limits.expression_bytes() as u64);
+    builder.write_u64(limits.ast_nodes() as u64);
+    builder.write_u64(limits.ast_depth() as u64);
+    builder.write_u64(limits.identifiers() as u64);
+    builder.write_u64(limits.literals() as u64);
+    builder.write_u64(limits.comprehensions() as u64);
+    builder.write_u64(limits.parameters() as u64);
+    builder.write_u64(limits.literal_collection_items() as u64);
+    builder.write_u64(limits.runtime_value_bytes() as u64);
+    builder.write_u64(limits.runtime_collection_items() as u64);
+    builder.finish()
 }
 
 const fn static_type_name(value: &StaticType) -> &'static str {
@@ -1036,5 +1113,31 @@ fn fingerprint_type(parameter_type: &ParameterType, builder: &mut FingerprintBui
             builder.write_tag(11);
             fingerprint_type(value, builder);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::BTreeMap, error::Error, sync::Arc};
+
+    use openfga_domain::{ConditionName, ParameterName};
+
+    use super::ConditionCompiler;
+    use crate::{ConditionDefinition, ConditionLimits, ParameterType};
+
+    #[test]
+    fn test_should_reuse_a_compiled_condition_for_identical_semantics() -> Result<(), Box<dyn Error>>
+    {
+        let definition = ConditionDefinition::new(
+            ConditionName::try_from("under_limit")?,
+            "value < 100".to_owned(),
+            BTreeMap::from([(ParameterName::try_from("value")?, ParameterType::int())]),
+        );
+        let compiler = ConditionCompiler::default();
+        let first = compiler.compile(&definition, &ConditionLimits::default())?;
+        let second = compiler.compile(&definition, &ConditionLimits::default())?;
+
+        assert!(Arc::ptr_eq(&first, &second));
+        Ok(())
     }
 }

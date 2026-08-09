@@ -29,7 +29,8 @@ The status command also fails closed on an interrupted migration, checksum misma
 embedded migration, invalid metadata, or database connectivity failure.
 
 PostgreSQL uses an advisory migration lock, MySQL uses the SQLx backend migration lock, and SQLite
-serializes through its single configured connection. In every case, run one dedicated migration
+serializes migrations through a process-wide permit in addition to its single configured
+connection. In every case, run one dedicated migration
 job with application admission stopped; lock ownership does not make mixed application versions
 semantically compatible.
 

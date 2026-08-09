@@ -1,13 +1,14 @@
 //! Criterion coverage for cold and warm explicit authorization-model loads.
 
 use std::{
+    cell::Cell,
     error::Error,
     hint::black_box,
     sync::Arc,
     time::{Duration, Instant, SystemTime},
 };
 
-use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use openfga_cache::{CachedModelStorage, ModelCacheConfig};
 use openfga_domain::{
     AuthorizationModelId, ConsistencyPreference, Deadline, RelationName, RequestTimeout, StoreId,
@@ -21,11 +22,13 @@ use openfga_storage::{
     ModelReader, ModelWriter, OperationContext, StorageCancellationToken, StoredAuthorizationModel,
 };
 use openfga_storage_memory::{MemoryStorage, MemoryStorageConfig};
-use tokio::runtime::Runtime;
+use tokio::{runtime::Runtime, task::JoinSet};
+use ulid::Ulid;
 
 const STORE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 const MODEL_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAW";
 const LATENCY_SAMPLES: usize = 2_000;
+const PUBLICATION_BURST: usize = 100;
 
 fn benchmark_model_load(criterion: &mut Criterion) {
     let fixture = Fixture::build();
@@ -61,6 +64,44 @@ fn benchmark_model_load(criterion: &mut Criterion) {
     fixture.shutdown();
 }
 
+fn benchmark_model_publication(criterion: &mut Criterion) {
+    let fixture = Fixture::build();
+    assert!(
+        fixture.is_ok(),
+        "model-publication benchmark fixture must be valid: {:?}",
+        fixture.as_ref().err(),
+    );
+    let Ok(fixture) = fixture else {
+        return;
+    };
+    let storage_writer: Arc<dyn ModelWriter> = fixture.storage.clone();
+    let cached_writer: Arc<dyn ModelWriter> = Arc::new(fixture.fresh_cache());
+    let next_model = Cell::new(1_u128 << 80);
+    let mut group = criterion.benchmark_group("authorization_model_publication");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(2));
+    group.throughput(Throughput::Elements(PUBLICATION_BURST as u64));
+    group.bench_function("memory_storage_burst_100", |bencher| {
+        bencher.iter_batched(
+            || fixture.publication_models(&next_model),
+            |models| fixture.publish(Arc::clone(&storage_writer), models),
+            BatchSize::LargeInput,
+        );
+    });
+    group.bench_function("cached_storage_burst_100", |bencher| {
+        bencher.iter_batched(
+            || fixture.publication_models(&next_model),
+            |models| fixture.publish(Arc::clone(&cached_writer), models),
+            BatchSize::LargeInput,
+        );
+    });
+    group.finish();
+    drop(cached_writer);
+    drop(storage_writer);
+    fixture.shutdown();
+}
+
 fn sample_p95(fixture: &Fixture, cold: bool, workload: &str) {
     let warm = (!cold).then(|| {
         let cache = fixture.fresh_cache();
@@ -88,6 +129,7 @@ fn sample_p95(fixture: &Fixture, cold: bool, workload: &str) {
 struct Fixture {
     runtime: Runtime,
     storage: Arc<MemoryStorage>,
+    compiler: ModelCompiler,
     store_id: StoreId,
     model_id: AuthorizationModelId,
 }
@@ -106,6 +148,7 @@ impl Fixture {
         Ok(Self {
             runtime,
             storage,
+            compiler: ModelCompiler::default(),
             store_id,
             model_id,
         })
@@ -117,7 +160,7 @@ impl Fixture {
         CachedModelStorage::new(
             reader,
             writer,
-            ModelCompiler::default(),
+            self.compiler.clone(),
             ModelCacheConfig::default(),
         )
     }
@@ -137,10 +180,47 @@ impl Fixture {
         black_box(result.ok());
     }
 
+    fn publication_models(&self, next_model: &Cell<u128>) -> Vec<Arc<StoredAuthorizationModel>> {
+        let models = (0..PUBLICATION_BURST)
+            .map(|_| {
+                let sequence = next_model.get();
+                next_model.set(sequence.saturating_add(1));
+                stored_model(
+                    self.store_id,
+                    AuthorizationModelId::from_ulid(Ulid::from(sequence)),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>();
+        assert!(models.is_ok(), "publication model fixtures must be valid");
+        models.unwrap_or_default()
+    }
+
+    fn publish(&self, writer: Arc<dyn ModelWriter>, models: Vec<Arc<StoredAuthorizationModel>>) {
+        let result = self.runtime.block_on(async move {
+            let mut tasks = JoinSet::new();
+            for model in models {
+                let writer = Arc::clone(&writer);
+                tasks.spawn(async move {
+                    let context = operation_context().map_err(|error| error.to_string())?;
+                    writer
+                        .write_model(&context, model)
+                        .await
+                        .map_err(|error| error.to_string())
+                });
+            }
+            while let Some(write) = tasks.join_next().await {
+                write.map_err(|error| error.to_string())??;
+            }
+            Ok::<(), String>(())
+        });
+        assert!(result.is_ok(), "model-publication benchmark must succeed");
+    }
+
     fn shutdown(self) {
         let Self {
             runtime,
             storage,
+            compiler: _,
             store_id: _,
             model_id: _,
         } = self;
@@ -197,5 +277,5 @@ fn stored_model(
     )?))
 }
 
-criterion_group!(benches, benchmark_model_load);
+criterion_group!(benches, benchmark_model_load, benchmark_model_publication);
 criterion_main!(benches);

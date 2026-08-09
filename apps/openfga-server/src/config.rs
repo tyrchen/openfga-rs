@@ -219,6 +219,8 @@ pub(crate) struct ModelCachePolicy {
     pub(crate) source_weight: u64,
     #[serde(default = "default_model_compiled_weight")]
     pub(crate) compiled_weight: u64,
+    #[serde(default = "default_condition_compiled_weight")]
+    pub(crate) condition_compiled_weight: u64,
     #[serde(default = "default_model_aliases")]
     pub(crate) latest_aliases: u64,
     #[serde(default = "default_model_immutable_ttl_seconds")]
@@ -232,6 +234,7 @@ impl Default for ModelCachePolicy {
         Self {
             source_weight: default_model_source_weight(),
             compiled_weight: default_model_compiled_weight(),
+            condition_compiled_weight: default_condition_compiled_weight(),
             latest_aliases: default_model_aliases(),
             immutable_ttl_seconds: default_model_immutable_ttl_seconds(),
             latest_alias_ttl_seconds: default_model_alias_ttl_seconds(),
@@ -412,6 +415,8 @@ pub(crate) struct TransportPolicy {
     pub(crate) maximum_message_bytes: usize,
     #[serde(default = "default_concurrency")]
     pub(crate) maximum_concurrency: usize,
+    #[serde(default = "default_wire_cache_bytes")]
+    pub(crate) maximum_wire_cache_bytes: u64,
     #[serde(default = "default_token_key_id")]
     pub(crate) token_key_id: String,
     #[serde(default = "default_token_key_env")]
@@ -901,6 +906,7 @@ impl ServerConfig {
         let aggregate = [
             self.cache.model.source_weight,
             self.cache.model.compiled_weight,
+            self.cache.model.condition_compiled_weight,
             self.cache.decision.weight,
             self.cache.tuple.weight,
             alias_bytes,
@@ -1138,6 +1144,9 @@ impl ServerConfig {
         }
         if !(1..=65_536).contains(&self.transport.maximum_concurrency) {
             bail!("maximum concurrency must be between 1 and 65536");
+        }
+        if !(1..=1024 * 1024 * 1024).contains(&self.transport.maximum_wire_cache_bytes) {
+            bail!("maximum wire cache bytes must be between 1 and 1073741824");
         }
         let mut key_ids = BTreeSet::new();
         key_ids.insert(
@@ -1487,6 +1496,10 @@ const fn default_concurrency() -> usize {
     64
 }
 
+const fn default_wire_cache_bytes() -> u64 {
+    64 * 1_024 * 1_024
+}
+
 fn default_token_key_id() -> String {
     "primary".to_owned()
 }
@@ -1637,6 +1650,10 @@ const fn default_model_source_weight() -> u64 {
 
 const fn default_model_compiled_weight() -> u64 {
     128 * 1024 * 1024
+}
+
+const fn default_condition_compiled_weight() -> u64 {
+    64 * 1024 * 1024
 }
 
 const fn default_model_aliases() -> u64 {
