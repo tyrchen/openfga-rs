@@ -323,6 +323,56 @@ pub(crate) fn model_definition(
     ))
 }
 
+/// Converts a pinned `OpenFGA` authorization-model message into validated project source values.
+///
+/// This boundary is public for the offline upstream datastore migration tool. It applies the same
+/// limits and semantic conversion as the live write-model API.
+///
+/// # Errors
+///
+/// Returns an API validation error when the wire model exceeds limits or contains invalid names,
+/// rewrites, restrictions, conditions, or parameter types.
+pub fn model_definition_from_wire(
+    model: &pb::AuthorizationModel,
+    limits: &InputLimits,
+) -> Result<AuthorizationModelDefinition, ApiError> {
+    model_definition(
+        &pb::WriteAuthorizationModelRequest {
+            store_id: String::new(),
+            type_definitions: model.type_definitions.clone(),
+            schema_version: model.schema_version.clone(),
+            conditions: model.conditions.clone(),
+        },
+        limits,
+    )
+}
+
+/// Converts one pinned `OpenFGA` tuple message into a validated relationship tuple.
+///
+/// # Errors
+///
+/// Returns an API validation error for an invalid tuple grammar or condition context.
+pub fn relationship_tuple_from_wire(
+    tuple: pb::TupleKey,
+    limits: &InputLimits,
+    measured_context_bytes: usize,
+) -> Result<RelationshipTuple, ApiError> {
+    relationship_tuple_for_wire_semantics(tuple, limits, measured_context_bytes)
+}
+
+/// Converts one pinned `OpenFGA` assertion message into the project storage representation.
+///
+/// # Errors
+///
+/// Returns an API validation error for invalid tuple or context data.
+pub fn assertion_from_wire(
+    assertion: pb::Assertion,
+    limits: &InputLimits,
+    measured_container_bytes: usize,
+) -> Result<Assertion, ApiError> {
+    domain_assertion_for_wire_semantics(assertion, limits, measured_container_bytes)
+}
+
 fn type_definition(
     definition: &pb::TypeDefinition,
     limits: &InputLimits,

@@ -1,0 +1,12 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Generated manifests, build output, and checksum-verified developer tools"
+paths = [
+  '''^crates/openfga-proto/proto\.lock\.json$''',
+  '''^vendors/openfga/telemetry/grafana/dashboards/openfga\.json$''',
+  '''^target/''',
+  '''^\.tools/''',
+  '''(^|/)node_modules/''',
+]

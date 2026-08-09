@@ -282,14 +282,34 @@ async fn run(path: &Path) -> Result<()> {
 async fn migrate(path: &Path, command: MigrationCommand) -> Result<()> {
     let config = config::ServerConfig::load(path).await?;
     runtime::install_crypto_provider()?;
-    let postgres = runtime::postgres_config(&config, false)?;
-    let status = match command {
-        MigrationCommand::Up => openfga_storage_sql::apply_migrations(&postgres)
-            .await
-            .context("failed to apply PostgreSQL migrations")?,
-        MigrationCommand::Status => openfga_storage_sql::migration_status(&postgres)
-            .await
-            .context("failed to read PostgreSQL migration status")?,
+    let status = match config.storage.backend {
+        config::StorageBackend::Postgres => {
+            let postgres = runtime::postgres_config(&config, false)?;
+            match command {
+                MigrationCommand::Up => openfga_storage_sql::apply_migrations(&postgres)
+                    .await
+                    .context("failed to apply PostgreSQL migrations")?,
+                MigrationCommand::Status => openfga_storage_sql::migration_status(&postgres)
+                    .await
+                    .context("failed to read PostgreSQL migration status")?,
+            }
+        }
+        config::StorageBackend::MySql | config::StorageBackend::Sqlite => {
+            let portable = runtime::portable_sql_config(&config, false)?;
+            match command {
+                MigrationCommand::Up => openfga_storage_sql::apply_portable_migrations(&portable)
+                    .await
+                    .context("failed to apply portable SQL migrations")?,
+                MigrationCommand::Status => {
+                    openfga_storage_sql::portable_migration_status(&portable)
+                        .await
+                        .context("failed to read portable SQL migration status")?
+                }
+            }
+        }
+        config::StorageBackend::Memory => {
+            bail!("migration commands require a SQL storage backend")
+        }
     };
     let state = match status.state() {
         openfga_storage_sql::MigrationState::Fresh => "fresh",
@@ -304,7 +324,7 @@ async fn migrate(path: &Path, command: MigrationCommand) -> Result<()> {
         state,
     })?;
     if matches!(command, MigrationCommand::Status) && state != "current" {
-        bail!("PostgreSQL schema is not current");
+        bail!("SQL schema is not current");
     }
     Ok(())
 }

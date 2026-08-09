@@ -1,0 +1,29 @@
+[package]
+name = "openfga-upstream-migrate"
+description = "Offline migration from the pinned OpenFGA SQLite schema"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+openfga-domain.workspace = true
+openfga-model.workspace = true
+openfga-proto.workspace = true
+openfga-storage.workspace = true
+openfga-storage-sql.workspace = true
+openfga-transport.workspace = true
+pbjson-types.workspace = true
+prost.workspace = true
+secrecy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+tokio.workspace = true

@@ -1,4 +1,4 @@
-//! `PostgreSQL` implementation of every narrow storage capability.
+//! `portable SQL` implementation of every narrow storage capability.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -11,8 +11,7 @@ use std::{
 
 use async_trait::async_trait;
 use openfga_domain::{
-    AuthorizationModelId, ChangeId, ConsistencyPreference, RelationshipTuple, StoreId, SubjectKind,
-    SubjectRef, TupleKey,
+    AuthorizationModelId, ChangeId, RelationshipTuple, StoreId, SubjectKind, SubjectRef, TupleKey,
 };
 use openfga_model::{MODEL_COMPILER_FORMAT_VERSION, ModelCompiler};
 use openfga_storage::{
@@ -29,18 +28,19 @@ use opentelemetry::{
 };
 use secrecy::ExposeSecret;
 use sqlx::{
-    FromRow, PgPool, Postgres, QueryBuilder, Transaction,
-    postgres::{PgConnectOptions, PgPoolOptions},
+    Any, AnyPool, FromRow, QueryBuilder, Transaction,
+    any::{AnyConnectOptions, AnyPoolOptions},
 };
 use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore},
     time::{Instant, sleep_until},
 };
-use tracing::{instrument, warn};
+use tracing::instrument;
 use ulid::Ulid;
 
 use crate::{
-    PostgresMutationFaultInjector, PostgresMutationStage, PostgresStorageConfig,
+    PortableSqlDialect, PortableSqlStorageConfig, PostgresMutationFaultInjector,
+    PostgresMutationStage,
     codec::{
         decode_assertions, decode_model, decode_tuple, encode_assertions, encode_condition_context,
         encode_model, encode_tuple,
@@ -49,7 +49,7 @@ use crate::{
     fault::NoSqlMutationFaults,
 };
 
-pub(crate) const SCHEMA_VERSION: i64 = 202_608_050_001;
+pub(crate) const PORTABLE_SCHEMA_VERSION: i64 = 202_608_080_001;
 const SUBJECT_OBJECT: i16 = 0;
 const SUBJECT_USERSET: i16 = 1;
 const SUBJECT_WILDCARD: i16 = 2;
@@ -57,35 +57,34 @@ const CHANGE_WRITE: i16 = 0;
 const CHANGE_DELETE: i16 = 1;
 const ULID_MAX_TIMESTAMP_MS: u64 = (1_u64 << 48) - 1;
 
-pub(crate) static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+pub(crate) static MYSQL_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations-mysql");
+pub(crate) static SQLITE_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations-sqlite");
 
-/// Durable `PostgreSQL` backend with strict primary/replica routing.
-pub struct PostgresStorage {
-    primary: PgPool,
-    replica: Option<PgPool>,
+/// Durable `MySQL` or `SQLite` backend using backend-specific migrations and portable queries.
+pub struct PortableSqlStorage {
+    primary: AnyPool,
     work_permits: Arc<Semaphore>,
-    config: PostgresStorageConfig,
+    config: PortableSqlStorageConfig,
     compiler: ModelCompiler,
     faults: Arc<dyn PostgresMutationFaultInjector>,
-    metrics: PostgresMetrics,
+    metrics: PortableMetrics,
 }
 
-struct PostgresMetrics {
+struct PortableMetrics {
     wait_duration: Histogram<f64>,
     _pool_connections: ObservableGauge<u64>,
     _work_available: ObservableGauge<u64>,
 }
 
-impl PostgresMetrics {
-    fn new(primary: &PgPool, replica: Option<&PgPool>, work_permits: &Arc<Semaphore>) -> Self {
+impl PortableMetrics {
+    fn new(primary: &AnyPool, work_permits: &Arc<Semaphore>) -> Self {
         let meter = opentelemetry::global::meter("openfga-storage-sql");
         let primary = primary.clone();
-        let replica = replica.cloned();
         let work_permits = Arc::clone(work_permits);
         Self {
             wait_duration: meter
                 .f64_histogram("openfga.storage.work.wait.duration")
-                .with_description("Time waiting for bounded PostgreSQL work admission")
+                .with_description("Time waiting for bounded portable SQL work admission")
                 .with_unit("s")
                 .with_boundaries(vec![
                     0.000_1, 0.000_25, 0.000_5, 0.001, 0.002_5, 0.005, 0.01, 0.025, 0.05, 0.1,
@@ -94,17 +93,14 @@ impl PostgresMetrics {
                 .build(),
             _pool_connections: meter
                 .u64_observable_gauge("openfga.storage.pool.connections")
-                .with_description("Open and idle PostgreSQL pool connections")
+                .with_description("Open and idle portable SQL pool connections")
                 .with_callback(move |observer| {
                     observe_pool(observer, "primary", &primary);
-                    if let Some(replica) = &replica {
-                        observe_pool(observer, "replica", replica);
-                    }
                 })
                 .build(),
             _work_available: meter
                 .u64_observable_gauge("openfga.storage.work.available")
-                .with_description("Immediately available PostgreSQL work permits")
+                .with_description("Immediately available portable SQL work permits")
                 .with_callback(move |observer| {
                     observer.observe(
                         u64::try_from(work_permits.available_permits()).unwrap_or(u64::MAX),
@@ -121,13 +117,13 @@ impl PostgresMetrics {
     }
 }
 
-impl fmt::Debug for PostgresMetrics {
+impl fmt::Debug for PortableMetrics {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("PostgresMetrics")
+        formatter.write_str("PortableMetrics")
     }
 }
 
-fn observe_pool(observer: &dyn AsyncInstrument<u64>, role: &'static str, pool: &PgPool) {
+fn observe_pool(observer: &dyn AsyncInstrument<u64>, role: &'static str, pool: &AnyPool) {
     let open = u64::from(pool.size());
     let idle = u64::try_from(pool.num_idle()).unwrap_or(u64::MAX);
     observer.observe(
@@ -155,13 +151,13 @@ struct PreparedTupleMutation<'a> {
     options: TupleWriteOptions,
 }
 
-impl PostgresStorage {
+impl PortableSqlStorage {
     /// Connects bounded pools and optionally applies embedded forward migrations.
     ///
     /// # Errors
     ///
     /// Returns a redacted configuration, availability, migration, or schema-version failure.
-    pub async fn connect(config: PostgresStorageConfig) -> Result<Self, StorageError> {
+    pub async fn connect(config: PortableSqlStorageConfig) -> Result<Self, StorageError> {
         Self::connect_with_faults(config, Arc::new(NoSqlMutationFaults)).await
     }
 
@@ -172,47 +168,41 @@ impl PostgresStorage {
     /// Returns the same failures as [`Self::connect`].
     #[doc(hidden)]
     pub async fn connect_with_faults(
-        config: PostgresStorageConfig,
+        config: PortableSqlStorageConfig,
         faults: Arc<dyn PostgresMutationFaultInjector>,
     ) -> Result<Self, StorageError> {
         config.validate().map_err(|error| {
             StorageError::with_source(
                 StorageErrorKind::Integrity,
-                "postgres_configuration_invalid",
+                "portable_configuration_invalid",
                 error,
             )
         })?;
         let primary = connect_pool(&config, config.primary_url.expose_secret()).await?;
         if config.migrate_on_connect {
-            MIGRATOR.run(&primary).await.map_err(|error| {
-                StorageError::with_source(
-                    StorageErrorKind::Integrity,
-                    "postgres_migration_failed",
-                    error,
-                )
-            })?;
+            migrator(config.dialect)
+                .run(&primary)
+                .await
+                .map_err(|error| {
+                    StorageError::with_source(
+                        StorageErrorKind::Integrity,
+                        "portable_migration_failed",
+                        error,
+                    )
+                })?;
         }
         verify_schema(&primary).await?;
-        let replica = match &config.replica_url {
-            Some(url) => {
-                let pool = connect_pool(&config, url.expose_secret()).await?;
-                verify_schema(&pool).await?;
-                Some(pool)
-            }
-            None => None,
-        };
         let work_permits = Arc::new(Semaphore::new(
             usize::try_from(config.max_connections.get()).map_err(|_| {
                 StorageError::new(
                     StorageErrorKind::Integrity,
-                    "postgres_work_limit_out_of_range",
+                    "portable_work_limit_out_of_range",
                 )
             })?,
         ));
-        let metrics = PostgresMetrics::new(&primary, replica.as_ref(), &work_permits);
+        let metrics = PortableMetrics::new(&primary, &work_permits);
         Ok(Self {
             primary,
-            replica,
             work_permits,
             config,
             compiler: ModelCompiler::default(),
@@ -227,36 +217,29 @@ impl PostgresStorage {
     ///
     /// Returns an integrity failure for a failed, older, or newer schema.
     pub async fn migrate(&self) -> Result<(), StorageError> {
-        MIGRATOR.run(&self.primary).await.map_err(|error| {
-            StorageError::with_source(
-                StorageErrorKind::Integrity,
-                "postgres_migration_failed",
-                error,
-            )
-        })?;
+        migrator(self.config.dialect)
+            .run(&self.primary)
+            .await
+            .map_err(|error| {
+                StorageError::with_source(
+                    StorageErrorKind::Integrity,
+                    "portable_migration_failed",
+                    error,
+                )
+            })?;
         verify_schema(&self.primary).await
     }
 
-    /// Closes primary and replica pools, waiting for checked-out connections to return.
+    /// Closes the pool, waiting for checked-out connections to return.
     pub async fn close(&self) {
-        if let Some(replica) = &self.replica {
-            replica.close().await;
-        }
         self.primary.close().await;
     }
 
     /// Returns the primary pool for bounded operational diagnostics.
     #[doc(hidden)]
     #[must_use]
-    pub const fn primary_pool(&self) -> &PgPool {
+    pub const fn primary_pool(&self) -> &AnyPool {
         &self.primary
-    }
-
-    /// Returns the configured replica pool for bounded operational diagnostics.
-    #[doc(hidden)]
-    #[must_use]
-    pub fn replica_pool(&self) -> Option<&PgPool> {
-        self.replica.as_ref()
     }
 
     /// Returns immediately available global storage-work permits.
@@ -284,7 +267,7 @@ impl PostgresStorage {
                 Err(_) => (
                     Err(StorageError::new(
                         StorageErrorKind::Unavailable,
-                        "postgres_work_admission_closed",
+                        "portable_work_admission_closed",
                     )),
                     "closed",
                 ),
@@ -294,46 +277,14 @@ impl PostgresStorage {
         result
     }
 
-    async fn read_pool<'a>(&'a self, context: &OperationContext) -> &'a PgPool {
-        if matches!(
-            context.consistency(),
-            ConsistencyPreference::HigherConsistency
-        ) {
-            return &self.primary;
-        }
-        let Some(replica) = &self.replica else {
-            return &self.primary;
-        };
-        let maximum_lag_seconds = self.config.replica_max_lag.as_secs_f64();
-        let healthy = match execute(
-            context,
-            sqlx::query_scalar::<_, bool>(
-                "SELECT NOT pg_is_in_recovery() OR COALESCE(EXTRACT(EPOCH FROM clock_timestamp() \
-                 - pg_last_xact_replay_timestamp()) <= $1, FALSE)",
-            )
-            .bind(maximum_lag_seconds)
-            .fetch_one(replica),
-            "postgres_replica_lag_check_failed",
-        )
-        .await
-        {
-            Ok(healthy) => healthy,
-            Err(error) => {
-                warn!(
-                    error_kind = ?error.kind(),
-                    error_code = error.code(),
-                    "PostgreSQL replica lag check failed; routing read to primary"
-                );
-                false
-            }
-        };
-        if healthy { replica } else { &self.primary }
+    fn read_pool(&self, _context: &OperationContext) -> &AnyPool {
+        &self.primary
     }
 
     async fn write_tuples_in_transaction(
         &self,
         context: &OperationContext,
-        transaction: &mut Transaction<'_, Postgres>,
+        transaction: &mut Transaction<'_, Any>,
         store_id: StoreId,
         mutation: PreparedTupleMutation<'_>,
     ) -> Result<Vec<ChangeId>, StorageError> {
@@ -344,25 +295,20 @@ impl PostgresStorage {
             write_order,
             options,
         } = mutation;
-        configure_transaction_deadline(context, transaction).await?;
+        configure_transaction_deadline(context, transaction)?;
         self.faults.check(PostgresMutationStage::BeforeLock)?;
+        // Every mutation that changes tuples also advances this global allocator. Locking it first
+        // gives MySQL a deterministic serialization point even when the tuple key does not exist,
+        // which a READ COMMITTED `SELECT .. FOR UPDATE` cannot gap-lock reliably.
+        let locked_change_id =
+            lock_change_allocator(context, transaction, self.config.dialect).await?;
         let mut affected = deletes.clone();
         affected.extend(writes.keys().cloned());
         let mut existing = BTreeMap::new();
         for key in &affected {
-            execute(
-                context,
-                sqlx::query(
-                    "SELECT pg_advisory_xact_lock(hashtextextended($2, hashtextextended($1, 0)))",
-                )
-                .bind(store_id.to_string())
-                .bind(key.to_string())
-                .execute(&mut **transaction),
-                "postgres_tuple_lock_failed",
-            )
-            .await?;
             if let Some(tuple) =
-                read_exact_in_transaction(context, transaction, store_id, key).await?
+                read_exact_in_transaction(context, transaction, self.config.dialect, store_id, key)
+                    .await?
             {
                 existing.insert(key.clone(), tuple);
             }
@@ -370,7 +316,7 @@ impl PostgresStorage {
         self.faults.check(PostgresMutationStage::AfterLock)?;
 
         validate_conflict_policy(delete_order, write_order, writes, &existing, options)?;
-        let timestamp_ms = transaction_timestamp(context, transaction).await?;
+        let timestamp_ms = system_time_to_millis(SystemTime::now())?;
         let mut changes = Vec::with_capacity(deletes.len().saturating_add(writes.len()));
 
         for key in deletes {
@@ -392,14 +338,9 @@ impl PostgresStorage {
         self.faults.check(PostgresMutationStage::AfterWrite)?;
 
         let mut change_ids = Vec::with_capacity(changes.len());
-        let mut previous_change_id = if changes.is_empty() {
-            None
-        } else {
-            lock_change_allocator(context, transaction).await?
-        };
+        let mut previous_change_id = locked_change_id;
         for (operation, tuple) in changes {
-            let change_id =
-                next_change_id(context, transaction, timestamp_ms, previous_change_id).await?;
+            let change_id = next_change_id(timestamp_ms, previous_change_id)?;
             insert_change(
                 context,
                 transaction,
@@ -422,12 +363,12 @@ impl PostgresStorage {
     }
 }
 
-impl fmt::Debug for PostgresStorage {
+impl fmt::Debug for PortableSqlStorage {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("PostgresStorage")
+            .debug_struct("PortableSqlStorage")
             .field("config", &self.config)
-            .field("replica_configured", &self.replica.is_some())
+            .field("dialect", &self.config.dialect)
             .field("faults", &self.faults)
             .field("metrics", &self.metrics)
             .finish_non_exhaustive()
@@ -435,7 +376,7 @@ impl fmt::Debug for PostgresStorage {
 }
 
 #[async_trait]
-impl TupleReader for PostgresStorage {
+impl TupleReader for PortableSqlStorage {
     #[instrument(skip_all, fields(store_id = %store_id))]
     async fn read_tuples(
         &self,
@@ -446,8 +387,8 @@ impl TupleReader for PostgresStorage {
     ) -> Result<Page<StoredTuple>, StorageError> {
         let _work_permit = self.acquire_work(context).await?;
         context.check()?;
-        let pool = self.read_pool(context).await;
-        let mut query = QueryBuilder::<Postgres>::new(tuple_select_prefix());
+        let pool = self.read_pool(context);
+        let mut query = QueryBuilder::<Any>::new(tuple_select_prefix());
         query
             .push(" WHERE store_id = ")
             .push_bind(store_id.to_string());
@@ -465,7 +406,7 @@ impl TupleReader for PostgresStorage {
         let rows = execute(
             context,
             query.build_query_as::<TupleRow>().fetch_all(pool),
-            "postgres_read_tuples_failed",
+            "portable_read_tuples_failed",
         )
         .await?;
         tuple_page(rows, options.maximum_results())
@@ -479,30 +420,26 @@ impl TupleReader for PostgresStorage {
         key: &TupleKey,
     ) -> Result<StoredTuple, StorageError> {
         let _work_permit = self.acquire_work(context).await?;
-        let pool = self.read_pool(context).await;
+        let pool = self.read_pool(context);
         let parts = TupleParts::from_key(key);
         let store_id_text = store_id.to_string();
         let row = execute(
             context,
-            sqlx::query_as!(
-                TupleRow,
-                r#"SELECT tuple_payload,
-                    (EXTRACT(EPOCH FROM inserted_at) * 1000)::BIGINT AS "inserted_at_ms!"
-                   FROM tuples
-                   WHERE store_id = $1 AND object_type = $2 AND object_id = $3
-                     AND relation = $4 AND subject_kind = $5 AND subject_type = $6
-                     AND subject_id = $7 AND subject_relation = $8"#,
-                store_id_text,
-                parts.object_type,
-                parts.object_id,
-                parts.relation,
-                parts.subject_kind,
-                parts.subject_type,
-                parts.subject_id,
-                parts.subject_relation,
+            sqlx::query_as::<_, TupleRow>(
+                "SELECT tuple_payload, inserted_at_ms FROM tuples WHERE store_id = ? AND \
+                 object_type = ? AND object_id = ? AND relation = ? AND subject_kind = ? AND \
+                 subject_type = ? AND subject_id = ? AND subject_relation = ?",
             )
+            .bind(store_id_text)
+            .bind(parts.object_type)
+            .bind(parts.object_id)
+            .bind(parts.relation)
+            .bind(parts.subject_kind)
+            .bind(parts.subject_type)
+            .bind(parts.subject_id)
+            .bind(parts.subject_relation)
             .fetch_one(pool),
-            "postgres_read_exact_tuple_failed",
+            "portable_read_exact_tuple_failed",
         )
         .await?;
         row.into_stored_tuple()
@@ -516,8 +453,8 @@ impl TupleReader for PostgresStorage {
         options: ReadOptions,
     ) -> Result<TupleStream, StorageError> {
         let _work_permit = self.acquire_work(context).await?;
-        let pool = self.read_pool(context).await;
-        let mut query = QueryBuilder::<Postgres>::new(tuple_select_prefix());
+        let pool = self.read_pool(context);
+        let mut query = QueryBuilder::<Any>::new(tuple_select_prefix());
         query
             .push(" WHERE store_id = ")
             .push_bind(store_id.to_string())
@@ -535,7 +472,7 @@ impl TupleReader for PostgresStorage {
         let rows = execute(
             context,
             query.build_query_as::<TupleRow>().fetch_all(pool),
-            "postgres_read_object_relation_failed",
+            "portable_read_object_relation_failed",
         )
         .await?;
         bounded_rows_to_stream(rows, options.maximum_results(), |tuple| {
@@ -551,8 +488,8 @@ impl TupleReader for PostgresStorage {
         options: ReadOptions,
     ) -> Result<TupleStream, StorageError> {
         let _work_permit = self.acquire_work(context).await?;
-        let pool = self.read_pool(context).await;
-        let mut query = QueryBuilder::<Postgres>::new(tuple_select_prefix());
+        let pool = self.read_pool(context);
+        let mut query = QueryBuilder::<Any>::new(tuple_select_prefix());
         query
             .push(" WHERE store_id = ")
             .push_bind(store_id.to_string())
@@ -584,7 +521,7 @@ impl TupleReader for PostgresStorage {
         let rows = execute(
             context,
             query.build_query_as::<TupleRow>().fetch_all(pool),
-            "postgres_read_userset_tuples_failed",
+            "portable_read_userset_tuples_failed",
         )
         .await?;
         bounded_rows_to_stream(rows, options.maximum_results(), |tuple| {
@@ -600,8 +537,8 @@ impl TupleReader for PostgresStorage {
         options: ReadOptions,
     ) -> Result<TupleStream, StorageError> {
         let _work_permit = self.acquire_work(context).await?;
-        let pool = self.read_pool(context).await;
-        let mut query = QueryBuilder::<Postgres>::new(tuple_select_prefix());
+        let pool = self.read_pool(context);
+        let mut query = QueryBuilder::<Any>::new(tuple_select_prefix());
         query
             .push(" WHERE store_id = ")
             .push_bind(store_id.to_string())
@@ -628,7 +565,7 @@ impl TupleReader for PostgresStorage {
         let rows = execute(
             context,
             query.build_query_as::<TupleRow>().fetch_all(pool),
-            "postgres_read_reverse_tuples_failed",
+            "portable_read_reverse_tuples_failed",
         )
         .await?;
         bounded_rows_to_stream(rows, options.maximum_results(), |tuple| {
@@ -643,31 +580,29 @@ impl TupleReader for PostgresStorage {
         key: &TupleKey,
     ) -> Result<bool, StorageError> {
         let _work_permit = self.acquire_work(context).await?;
-        let pool = self.read_pool(context).await;
+        let pool = self.read_pool(context);
         let parts = TupleParts::from_key(key);
         let store_id_text = store_id.to_string();
-        execute(
+        let exists = execute(
             context,
-            sqlx::query_scalar!(
-                r#"SELECT EXISTS(
-                    SELECT 1 FROM tuples
-                    WHERE store_id = $1 AND object_type = $2 AND object_id = $3
-                      AND relation = $4 AND subject_kind = $5 AND subject_type = $6
-                      AND subject_id = $7 AND subject_relation = $8
-                ) AS "exists!""#,
-                store_id_text,
-                parts.object_type,
-                parts.object_id,
-                parts.relation,
-                parts.subject_kind,
-                parts.subject_type,
-                parts.subject_id,
-                parts.subject_relation,
+            sqlx::query_scalar::<_, i64>(
+                "SELECT EXISTS(SELECT 1 FROM tuples WHERE store_id = ? AND object_type = ? AND \
+                 object_id = ? AND relation = ? AND subject_kind = ? AND subject_type = ? AND \
+                 subject_id = ? AND subject_relation = ?)",
             )
+            .bind(store_id_text)
+            .bind(parts.object_type)
+            .bind(parts.object_id)
+            .bind(parts.relation)
+            .bind(parts.subject_kind)
+            .bind(parts.subject_type)
+            .bind(parts.subject_id)
+            .bind(parts.subject_relation)
             .fetch_one(pool),
-            "postgres_tuple_exists_failed",
+            "portable_tuple_exists_failed",
         )
-        .await
+        .await?;
+        Ok(exists != 0)
     }
 
     async fn count_object_relation(
@@ -677,8 +612,8 @@ impl TupleReader for PostgresStorage {
         filter: &ObjectRelationFilter,
     ) -> Result<u64, StorageError> {
         let _work_permit = self.acquire_work(context).await?;
-        let pool = self.read_pool(context).await;
-        let mut query = QueryBuilder::<Postgres>::new("SELECT COUNT(*) FROM tuples");
+        let pool = self.read_pool(context);
+        let mut query = QueryBuilder::<Any>::new("SELECT COUNT(*) FROM tuples");
         query
             .push(" WHERE store_id = ")
             .push_bind(store_id.to_string())
@@ -693,13 +628,13 @@ impl TupleReader for PostgresStorage {
         let count = execute(
             context,
             query.build_query_scalar::<i64>().fetch_one(pool),
-            "postgres_count_object_relation_failed",
+            "portable_count_object_relation_failed",
         )
         .await?;
         u64::try_from(count).map_err(|error| {
             StorageError::with_source(
                 StorageErrorKind::Integrity,
-                "postgres_tuple_count_invalid",
+                "portable_tuple_count_invalid",
                 error,
             )
         })
@@ -707,7 +642,7 @@ impl TupleReader for PostgresStorage {
 }
 
 #[async_trait]
-impl TupleWriter for PostgresStorage {
+impl TupleWriter for PortableSqlStorage {
     #[instrument(skip_all, fields(store_id = %store_id, deletes = deletes.len(), writes = writes.len()))]
     async fn write_tuples(
         &self,
@@ -731,7 +666,7 @@ impl TupleWriter for PostgresStorage {
         {
             return Err(StorageError::new(
                 StorageErrorKind::ResourceExhausted,
-                "postgres_tuple_mutation_limit",
+                "portable_tuple_mutation_limit",
             ));
         }
         if deletes.iter().any(|key| writes.contains_key(key)) {
@@ -746,7 +681,7 @@ impl TupleWriter for PostgresStorage {
         let mut transaction = execute(
             context,
             self.primary.begin(),
-            "postgres_tuple_transaction_begin_failed",
+            "portable_tuple_transaction_begin_failed",
         )
         .await?;
         let result = self
@@ -774,7 +709,7 @@ impl TupleWriter for PostgresStorage {
         execute(
             context,
             transaction.commit(),
-            "postgres_tuple_transaction_commit_failed",
+            "portable_tuple_transaction_commit_failed",
         )
         .await?;
         Ok(MutationOutcome::new(change_ids))
@@ -782,7 +717,7 @@ impl TupleWriter for PostgresStorage {
 }
 
 #[async_trait]
-impl ModelReader for PostgresStorage {
+impl ModelReader for PortableSqlStorage {
     async fn read_model(
         &self,
         context: &OperationContext,
@@ -790,22 +725,20 @@ impl ModelReader for PostgresStorage {
         model_id: AuthorizationModelId,
     ) -> Result<Arc<StoredAuthorizationModel>, StorageError> {
         let _work_permit = self.acquire_work(context).await?;
-        let pool = self.read_pool(context).await;
+        let pool = self.read_pool(context);
         let store_id_text = store_id.to_string();
         let model_id_text = model_id.to_string();
         let row = execute(
             context,
-            sqlx::query_as!(
-                ModelRow,
-                r#"SELECT model_id, schema_version, compiler_format_version,
-                    source_fingerprint, source_payload,
-                    (EXTRACT(EPOCH FROM written_at) * 1000)::BIGINT AS "written_at_ms!"
-                   FROM authorization_models WHERE store_id = $1 AND model_id = $2"#,
-                store_id_text,
-                model_id_text,
+            sqlx::query_as::<_, ModelRow>(
+                "SELECT model_id, schema_version, compiler_format_version, source_fingerprint, \
+                 source_payload, written_at_ms FROM authorization_models WHERE store_id = ? AND \
+                 model_id = ?",
             )
+            .bind(store_id_text)
+            .bind(model_id_text)
             .fetch_one(pool),
-            "postgres_read_model_failed",
+            "portable_read_model_failed",
         )
         .await?;
         row.into_model(store_id, model_id, &self.compiler)
@@ -817,24 +750,21 @@ impl ModelReader for PostgresStorage {
         store_id: StoreId,
     ) -> Result<Arc<StoredAuthorizationModel>, StorageError> {
         let _work_permit = self.acquire_work(context).await?;
-        let pool = self.read_pool(context).await;
+        let pool = self.read_pool(context);
         let store_id_text = store_id.to_string();
         let row = execute(
             context,
-            sqlx::query_as!(
-                ModelRow,
-                r#"SELECT model_id, schema_version, compiler_format_version,
-                    source_fingerprint, source_payload,
-                    (EXTRACT(EPOCH FROM written_at) * 1000)::BIGINT AS "written_at_ms!"
-                   FROM authorization_models
-                   WHERE store_id = $1 ORDER BY model_id DESC LIMIT 1"#,
-                store_id_text,
+            sqlx::query_as::<_, ModelRow>(
+                "SELECT model_id, schema_version, compiler_format_version, source_fingerprint, \
+                 source_payload, written_at_ms FROM authorization_models WHERE store_id = ? ORDER \
+                 BY model_id DESC LIMIT 1",
             )
+            .bind(store_id_text)
             .fetch_one(pool),
-            "postgres_read_latest_model_failed",
+            "portable_read_latest_model_failed",
         )
         .await?;
-        let model_id = parse_id(&row.model_id, "postgres_model_id_invalid")?;
+        let model_id = parse_id(&row.model_id, "portable_model_id_invalid")?;
         row.into_model(store_id, model_id, &self.compiler)
     }
 
@@ -845,13 +775,13 @@ impl ModelReader for PostgresStorage {
         options: &PageOptions,
     ) -> Result<Page<Arc<StoredAuthorizationModel>>, StorageError> {
         let _work_permit = self.acquire_work(context).await?;
-        let pool = self.read_pool(context).await;
-        let mut query = QueryBuilder::<Postgres>::new(model_select_columns());
+        let pool = self.read_pool(context);
+        let mut query = QueryBuilder::<Any>::new(model_select_columns());
         query
             .push(" WHERE store_id = ")
             .push_bind(store_id.to_string());
         if let Some(cursor) = options.after() {
-            let after = cursor_id::<AuthorizationModelId>(cursor, "postgres_model_cursor_invalid")?;
+            let after = cursor_id::<AuthorizationModelId>(cursor, "portable_model_cursor_invalid")?;
             query.push(" AND model_id < ").push_bind(after.to_string());
         }
         query
@@ -860,13 +790,13 @@ impl ModelReader for PostgresStorage {
         let rows = execute(
             context,
             query.build_query_as::<ModelRow>().fetch_all(pool),
-            "postgres_list_models_failed",
+            "portable_list_models_failed",
         )
         .await?;
         let has_more = rows.len() > options.maximum_results();
         let mut models = Vec::with_capacity(rows.len().min(options.maximum_results()));
         for row in rows.into_iter().take(options.maximum_results()) {
-            let model_id = parse_id(&row.model_id, "postgres_model_id_invalid")?;
+            let model_id = parse_id(&row.model_id, "portable_model_id_invalid")?;
             models.push(row.into_model(store_id, model_id, &self.compiler)?);
         }
         let continuation = if has_more {
@@ -882,7 +812,7 @@ impl ModelReader for PostgresStorage {
 }
 
 #[async_trait]
-impl ModelWriter for PostgresStorage {
+impl ModelWriter for PortableSqlStorage {
     async fn write_model(
         &self,
         context: &OperationContext,
@@ -895,8 +825,8 @@ impl ModelWriter for PostgresStorage {
             context,
             sqlx::query(
                 "INSERT INTO authorization_models (store_id, model_id, schema_version, \
-                 compiler_format_version, source_fingerprint, source_payload, written_at) VALUES \
-                 ($1, $2, $3, $4, $5, $6, to_timestamp($7::double precision / 1000.0))",
+                 compiler_format_version, source_fingerprint, source_payload, written_at_ms) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(model.store_id().to_string())
             .bind(model.model_id().to_string())
@@ -909,7 +839,7 @@ impl ModelWriter for PostgresStorage {
             .bind(payload)
             .bind(written_at_ms)
             .execute(&self.primary),
-            "postgres_write_model_failed",
+            "portable_write_model_failed",
         )
         .await
         .map(|_| ())
@@ -917,27 +847,24 @@ impl ModelWriter for PostgresStorage {
 }
 
 #[async_trait]
-impl StoreReader for PostgresStorage {
+impl StoreReader for PortableSqlStorage {
     async fn read_store(
         &self,
         context: &OperationContext,
         store_id: StoreId,
     ) -> Result<StoreRecord, StorageError> {
         let _work_permit = self.acquire_work(context).await?;
-        let pool = self.read_pool(context).await;
+        let pool = self.read_pool(context);
         let store_id_text = store_id.to_string();
         let row = execute(
             context,
-            sqlx::query_as!(
-                StoreRow,
-                r#"SELECT id, name,
-                    (EXTRACT(EPOCH FROM created_at) * 1000)::BIGINT AS "created_at_ms!",
-                    (EXTRACT(EPOCH FROM updated_at) * 1000)::BIGINT AS "updated_at_ms!"
-                   FROM stores WHERE id = $1 AND deleted_at IS NULL"#,
-                store_id_text,
+            sqlx::query_as::<_, StoreRow>(
+                "SELECT id, name, created_at_ms, updated_at_ms FROM stores WHERE id = ? AND \
+                 deleted_at_ms IS NULL",
             )
+            .bind(store_id_text)
             .fetch_one(pool),
-            "postgres_read_store_failed",
+            "portable_read_store_failed",
         )
         .await?;
         row.into_record()
@@ -950,16 +877,16 @@ impl StoreReader for PostgresStorage {
         options: &PageOptions,
     ) -> Result<Page<StoreRecord>, StorageError> {
         let _work_permit = self.acquire_work(context).await?;
-        let pool = self.read_pool(context).await;
-        let mut query = QueryBuilder::<Postgres>::new(store_select_columns());
-        query.push(" WHERE deleted_at IS NULL");
+        let pool = self.read_pool(context);
+        let mut query = QueryBuilder::<Any>::new(store_select_columns());
+        query.push(" WHERE deleted_at_ms IS NULL");
         if let Some(name) = filter.name() {
             query
                 .push(" AND name = ")
                 .push_bind(name.as_str().to_owned());
         }
         if let Some(after) = options.after() {
-            let id = cursor_id::<StoreId>(after, "postgres_store_cursor_invalid")?;
+            let id = cursor_id::<StoreId>(after, "portable_store_cursor_invalid")?;
             query.push(" AND id > ").push_bind(id.to_string());
         }
         query
@@ -968,7 +895,7 @@ impl StoreReader for PostgresStorage {
         let rows = execute(
             context,
             query.build_query_as::<StoreRow>().fetch_all(pool),
-            "postgres_list_stores_failed",
+            "portable_list_stores_failed",
         )
         .await?;
         let has_more = rows.len() > options.maximum_results();
@@ -990,7 +917,7 @@ impl StoreReader for PostgresStorage {
 }
 
 #[async_trait]
-impl StoreWriter for PostgresStorage {
+impl StoreWriter for PortableSqlStorage {
     async fn create_store(
         &self,
         context: &OperationContext,
@@ -998,21 +925,25 @@ impl StoreWriter for PostgresStorage {
         name: StoreName,
     ) -> Result<StoreRecord, StorageError> {
         let _work_permit = self.acquire_work(context).await?;
-        let row = execute(
+        let now_ms = system_time_to_millis(SystemTime::now())?;
+        execute(
             context,
-            sqlx::query_as::<_, StoreRow>(
-                "INSERT INTO stores (id, name, created_at, updated_at) VALUES ($1, $2, \
-                 CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) RETURNING id, name, (EXTRACT(EPOCH FROM \
-                 created_at) * 1000)::BIGINT AS created_at_ms, (EXTRACT(EPOCH FROM updated_at) * \
-                 1000)::BIGINT AS updated_at_ms",
+            sqlx::query(
+                "INSERT INTO stores (id, name, created_at_ms, updated_at_ms) VALUES (?, ?, ?, ?)",
             )
             .bind(store_id.to_string())
             .bind(name.as_str())
-            .fetch_one(&self.primary),
-            "postgres_create_store_failed",
+            .bind(now_ms)
+            .bind(now_ms)
+            .execute(&self.primary),
+            "portable_create_store_failed",
         )
         .await?;
-        row.into_record()
+        Ok(StoreRecord::new(
+            store_id,
+            name,
+            millis_to_system_time(now_ms)?,
+        ))
     }
 
     async fn rename_store(
@@ -1022,21 +953,28 @@ impl StoreWriter for PostgresStorage {
         name: StoreName,
     ) -> Result<StoreRecord, StorageError> {
         let _work_permit = self.acquire_work(context).await?;
-        let row = execute(
+        let updated_at_ms = system_time_to_millis(SystemTime::now())?;
+        let result = execute(
             context,
-            sqlx::query_as::<_, StoreRow>(
-                "UPDATE stores SET name = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND \
-                 deleted_at IS NULL RETURNING id, name, (EXTRACT(EPOCH FROM created_at) * \
-                 1000)::BIGINT AS created_at_ms, (EXTRACT(EPOCH FROM updated_at) * 1000)::BIGINT \
-                 AS updated_at_ms",
+            sqlx::query(
+                "UPDATE stores SET name = ?, updated_at_ms = ? WHERE id = ? AND deleted_at_ms IS \
+                 NULL",
             )
-            .bind(store_id.to_string())
             .bind(name.as_str())
-            .fetch_one(&self.primary),
-            "postgres_rename_store_failed",
+            .bind(updated_at_ms)
+            .bind(store_id.to_string())
+            .execute(&self.primary),
+            "portable_rename_store_failed",
         )
         .await?;
-        row.into_record()
+        if result.rows_affected() == 0 {
+            return Err(StorageError::new(
+                StorageErrorKind::NotFound,
+                "store_not_found",
+            ));
+        }
+        drop(_work_permit);
+        self.read_store(context, store_id).await
     }
 
     async fn delete_store(
@@ -1047,10 +985,10 @@ impl StoreWriter for PostgresStorage {
         let _work_permit = self.acquire_work(context).await?;
         execute(
             context,
-            sqlx::query("DELETE FROM stores WHERE id = $1")
+            sqlx::query("DELETE FROM stores WHERE id = ?")
                 .bind(store_id.to_string())
                 .execute(&self.primary),
-            "postgres_delete_store_failed",
+            "portable_delete_store_failed",
         )
         .await?;
         Ok(())
@@ -1058,7 +996,7 @@ impl StoreWriter for PostgresStorage {
 }
 
 #[async_trait]
-impl AssertionReader for PostgresStorage {
+impl AssertionReader for PortableSqlStorage {
     async fn read_assertions(
         &self,
         context: &OperationContext,
@@ -1066,16 +1004,16 @@ impl AssertionReader for PostgresStorage {
         model_id: AuthorizationModelId,
     ) -> Result<Arc<[Assertion]>, StorageError> {
         let _work_permit = self.acquire_work(context).await?;
-        let pool = self.read_pool(context).await;
+        let pool = self.read_pool(context);
         match execute(
             context,
             sqlx::query_scalar::<_, Vec<u8>>(
-                "SELECT assertions_payload FROM assertions WHERE store_id = $1 AND model_id = $2",
+                "SELECT assertions_payload FROM assertions WHERE store_id = ? AND model_id = ?",
             )
             .bind(store_id.to_string())
             .bind(model_id.to_string())
             .fetch_optional(pool),
-            "postgres_read_assertions_failed",
+            "portable_read_assertions_failed",
         )
         .await?
         {
@@ -1086,7 +1024,7 @@ impl AssertionReader for PostgresStorage {
 }
 
 #[async_trait]
-impl AssertionWriter for PostgresStorage {
+impl AssertionWriter for PortableSqlStorage {
     async fn write_assertions(
         &self,
         context: &OperationContext,
@@ -1096,19 +1034,17 @@ impl AssertionWriter for PostgresStorage {
     ) -> Result<(), StorageError> {
         let _work_permit = self.acquire_work(context).await?;
         let payload = encode_assertions(&assertions)?;
+        let written_at_ms = system_time_to_millis(SystemTime::now())?;
+        let statement = assertion_upsert(self.config.dialect);
         execute(
             context,
-            sqlx::query(
-                "INSERT INTO assertions (store_id, model_id, assertions_payload, written_at) \
-                 VALUES ($1, $2, $3, CURRENT_TIMESTAMP) ON CONFLICT (store_id, model_id) DO \
-                 UPDATE SET assertions_payload = EXCLUDED.assertions_payload, written_at = \
-                 EXCLUDED.written_at",
-            )
-            .bind(store_id.to_string())
-            .bind(model_id.to_string())
-            .bind(payload)
-            .execute(&self.primary),
-            "postgres_write_assertions_failed",
+            sqlx::query(statement)
+                .bind(store_id.to_string())
+                .bind(model_id.to_string())
+                .bind(payload)
+                .bind(written_at_ms)
+                .execute(&self.primary),
+            "portable_write_assertions_failed",
         )
         .await
         .map(|_| ())
@@ -1116,7 +1052,7 @@ impl AssertionWriter for PostgresStorage {
 }
 
 #[async_trait]
-impl ChangeReader for PostgresStorage {
+impl ChangeReader for PortableSqlStorage {
     async fn read_changes(
         &self,
         context: &OperationContext,
@@ -1125,8 +1061,8 @@ impl ChangeReader for PostgresStorage {
         options: &PageOptions,
     ) -> Result<Page<TupleChange>, StorageError> {
         let _work_permit = self.acquire_work(context).await?;
-        let pool = self.read_pool(context).await;
-        let mut query = QueryBuilder::<Postgres>::new(change_select_columns());
+        let pool = self.read_pool(context);
+        let mut query = QueryBuilder::<Any>::new(change_select_columns());
         query
             .push(" WHERE store_id = ")
             .push_bind(store_id.to_string());
@@ -1137,12 +1073,11 @@ impl ChangeReader for PostgresStorage {
         }
         if let Some(start_time) = filter.start_time() {
             query
-                .push(" AND changed_at >= to_timestamp(")
-                .push_bind(system_time_to_millis(start_time)?)
-                .push("::double precision / 1000.0)");
+                .push(" AND changed_at_ms >= ")
+                .push_bind(system_time_to_millis(start_time)?);
         }
         if let Some(after) = options.after() {
-            let id = cursor_id::<ChangeId>(after, "postgres_change_cursor_invalid")?;
+            let id = cursor_id::<ChangeId>(after, "portable_change_cursor_invalid")?;
             query.push(" AND change_id > ").push_bind(id.to_string());
         }
         query
@@ -1151,7 +1086,7 @@ impl ChangeReader for PostgresStorage {
         let rows = execute(
             context,
             query.build_query_as::<ChangeRow>().fetch_all(pool),
-            "postgres_read_changes_failed",
+            "portable_read_changes_failed",
         )
         .await?;
         let has_more = rows.len() > options.maximum_results();
@@ -1173,7 +1108,7 @@ impl ChangeReader for PostgresStorage {
 }
 
 #[async_trait]
-impl HealthCheck for PostgresStorage {
+impl HealthCheck for PortableSqlStorage {
     async fn health(&self, context: &OperationContext) -> Result<HealthStatus, StorageError> {
         let version = execute(
             context,
@@ -1181,10 +1116,10 @@ impl HealthCheck for PostgresStorage {
                 "SELECT schema_version FROM openfga_schema_metadata WHERE singleton = TRUE",
             )
             .fetch_one(&self.primary),
-            "postgres_health_failed",
+            "portable_health_failed",
         )
         .await?;
-        if version != SCHEMA_VERSION {
+        if version != PORTABLE_SCHEMA_VERSION {
             return Err(schema_version_error(version));
         }
         Ok(HealthStatus::new(true, "ready"))
@@ -1216,11 +1151,11 @@ struct StoreRow {
 
 impl StoreRow {
     fn into_record(self) -> Result<StoreRecord, StorageError> {
-        let id = parse_id(&self.id, "postgres_store_id_invalid")?;
+        let id = parse_id(&self.id, "portable_store_id_invalid")?;
         let name = StoreName::new(self.name).map_err(|error| {
             StorageError::with_source(
                 StorageErrorKind::Integrity,
-                "postgres_store_name_invalid",
+                "portable_store_name_invalid",
                 error,
             )
         })?;
@@ -1263,7 +1198,7 @@ impl ModelRow {
         {
             return Err(StorageError::new(
                 StorageErrorKind::Integrity,
-                "postgres_model_metadata_mismatch",
+                "portable_model_metadata_mismatch",
             ));
         }
         Ok(model)
@@ -1286,12 +1221,12 @@ impl ChangeRow {
             _ => {
                 return Err(StorageError::new(
                     StorageErrorKind::Integrity,
-                    "postgres_change_operation_invalid",
+                    "portable_change_operation_invalid",
                 ));
             }
         };
         Ok(TupleChange::new(
-            parse_id(&self.change_id, "postgres_change_id_invalid")?,
+            parse_id(&self.change_id, "portable_change_id_invalid")?,
             store_id,
             operation,
             decode_tuple(&self.tuple_payload)?,
@@ -1331,30 +1266,33 @@ impl<'a> TupleParts<'a> {
 }
 
 pub(crate) async fn connect_pool(
-    config: &PostgresStorageConfig,
+    config: &PortableSqlStorageConfig,
     url: &str,
-) -> Result<PgPool, StorageError> {
+) -> Result<AnyPool, StorageError> {
     validate_url_query_keys(url)?;
-    let options =
-        PgConnectOptions::from_str(url).map_err(|error| map_sqlx(error, "postgres_url_invalid"))?;
-    let statement_timeout = format!("{}ms", config.statement_timeout.as_millis().max(1));
-    PgPoolOptions::new()
+    sqlx::any::install_default_drivers();
+    let options = AnyConnectOptions::from_str(url)
+        .map_err(|error| map_sqlx(error, "portable_url_invalid"))?;
+    let dialect = config.dialect;
+    AnyPoolOptions::new()
         .max_connections(config.max_connections.get())
         .min_connections(config.min_connections)
         .acquire_timeout(config.acquire_timeout)
         .after_connect(move |connection, _metadata| {
-            let timeout = statement_timeout.clone();
             Box::pin(async move {
-                sqlx::query("SELECT set_config('statement_timeout', $1, false)")
-                    .bind(timeout)
-                    .execute(connection)
-                    .await?;
+                let statement = match dialect {
+                    PortableSqlDialect::MySql => {
+                        "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED"
+                    }
+                    PortableSqlDialect::Sqlite => "PRAGMA foreign_keys = ON",
+                };
+                sqlx::query(statement).execute(connection).await?;
                 Ok(())
             })
         })
         .connect_with(options)
         .await
-        .map_err(|error| map_sqlx(error, "postgres_connect_failed"))
+        .map_err(|error| map_sqlx(error, "portable_connect_failed"))
 }
 
 fn validate_url_query_keys(url: &str) -> Result<(), StorageError> {
@@ -1385,12 +1323,23 @@ fn validate_url_query_keys(url: &str) -> Result<(), StorageError> {
                 | "user"
                 | "password"
                 | "application_name"
+                | "mode"
+                | "cache"
+                | "immutable"
+                | "vfs"
+                | "journal_mode"
+                | "locking_mode"
+                | "busy_timeout"
+                | "foreign_keys"
+                | "synchronous"
+                | "charset"
+                | "collation"
                 | "options"
         ) || valid_scoped_option(key);
         if !accepted {
             return Err(StorageError::new(
                 StorageErrorKind::Integrity,
-                "postgres_url_parameter_not_allowed",
+                "portable_url_parameter_not_allowed",
             ));
         }
     }
@@ -1411,14 +1360,14 @@ fn valid_scoped_option(key: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
 }
 
-async fn verify_schema(pool: &PgPool) -> Result<(), StorageError> {
+async fn verify_schema(pool: &AnyPool) -> Result<(), StorageError> {
     let version = sqlx::query_scalar::<_, i64>(
         "SELECT schema_version FROM openfga_schema_metadata WHERE singleton = TRUE",
     )
     .fetch_one(pool)
     .await
-    .map_err(|error| map_sqlx(error, "postgres_schema_version_read_failed"))?;
-    if version == SCHEMA_VERSION {
+    .map_err(|error| map_sqlx(error, "portable_schema_version_read_failed"))?;
+    if version == PORTABLE_SCHEMA_VERSION {
         Ok(())
     } else {
         Err(schema_version_error(version))
@@ -1426,15 +1375,15 @@ async fn verify_schema(pool: &PgPool) -> Result<(), StorageError> {
 }
 
 fn schema_version_error(version: i64) -> StorageError {
-    if version > SCHEMA_VERSION {
+    if version > PORTABLE_SCHEMA_VERSION {
         StorageError::new(
             StorageErrorKind::Integrity,
-            "postgres_schema_newer_than_binary",
+            "portable_schema_newer_than_binary",
         )
     } else {
         StorageError::new(
             StorageErrorKind::Unavailable,
-            "postgres_schema_migration_required",
+            "portable_schema_migration_required",
         )
     }
 }
@@ -1451,20 +1400,39 @@ async fn execute<T>(
 }
 
 fn tuple_select_prefix() -> &'static str {
-    "SELECT tuple_payload, (EXTRACT(EPOCH FROM inserted_at) * 1000)::BIGINT AS inserted_at_ms FROM \
-     tuples"
+    "SELECT tuple_payload, inserted_at_ms FROM tuples"
 }
 fn store_select_columns() -> &'static str {
-    "SELECT id, name, (EXTRACT(EPOCH FROM created_at) * 1000)::BIGINT AS created_at_ms, \
-     (EXTRACT(EPOCH FROM updated_at) * 1000)::BIGINT AS updated_at_ms FROM stores"
+    "SELECT id, name, created_at_ms, updated_at_ms FROM stores"
 }
 fn model_select_columns() -> &'static str {
     "SELECT model_id, schema_version, compiler_format_version, source_fingerprint, source_payload, \
-     (EXTRACT(EPOCH FROM written_at) * 1000)::BIGINT AS written_at_ms FROM authorization_models"
+     written_at_ms FROM authorization_models"
 }
 fn change_select_columns() -> &'static str {
-    "SELECT change_id, operation, tuple_payload, (EXTRACT(EPOCH FROM changed_at) * 1000)::BIGINT \
-     AS changed_at_ms FROM tuple_changes"
+    "SELECT change_id, operation, tuple_payload, changed_at_ms FROM tuple_changes"
+}
+
+pub(crate) const fn migrator(dialect: PortableSqlDialect) -> &'static sqlx::migrate::Migrator {
+    match dialect {
+        PortableSqlDialect::MySql => &MYSQL_MIGRATOR,
+        PortableSqlDialect::Sqlite => &SQLITE_MIGRATOR,
+    }
+}
+
+const fn assertion_upsert(dialect: PortableSqlDialect) -> &'static str {
+    match dialect {
+        PortableSqlDialect::MySql => {
+            "INSERT INTO assertions (store_id, model_id, assertions_payload, written_at_ms) VALUES \
+             (?, ?, ?, ?) AS incoming ON DUPLICATE KEY UPDATE assertions_payload = \
+             incoming.assertions_payload, written_at_ms = incoming.written_at_ms"
+        }
+        PortableSqlDialect::Sqlite => {
+            "INSERT INTO assertions (store_id, model_id, assertions_payload, written_at_ms) VALUES \
+             (?, ?, ?, ?) ON CONFLICT (store_id, model_id) DO UPDATE SET assertions_payload = \
+             excluded.assertions_payload, written_at_ms = excluded.written_at_ms"
+        }
+    }
 }
 
 fn unique_deletes(deletes: Vec<TupleKey>) -> Result<BTreeSet<TupleKey>, StorageError> {
@@ -1538,95 +1506,59 @@ fn validate_conflict_policy(
 
 async fn read_exact_in_transaction(
     context: &OperationContext,
-    transaction: &mut Transaction<'_, Postgres>,
+    transaction: &mut Transaction<'_, Any>,
+    dialect: PortableSqlDialect,
     store_id: StoreId,
     key: &TupleKey,
 ) -> Result<Option<RelationshipTuple>, StorageError> {
     let parts = TupleParts::from_key(key);
+    let mut query = QueryBuilder::<Any>::new("SELECT tuple_payload FROM tuples WHERE store_id = ");
+    query
+        .push_bind(store_id.to_string())
+        .push(" AND object_type = ")
+        .push_bind(parts.object_type)
+        .push(" AND object_id = ")
+        .push_bind(parts.object_id)
+        .push(" AND relation = ")
+        .push_bind(parts.relation)
+        .push(" AND subject_kind = ")
+        .push_bind(parts.subject_kind)
+        .push(" AND subject_type = ")
+        .push_bind(parts.subject_type)
+        .push(" AND subject_id = ")
+        .push_bind(parts.subject_id)
+        .push(" AND subject_relation = ")
+        .push_bind(parts.subject_relation);
+    if dialect == PortableSqlDialect::MySql {
+        query.push(" FOR UPDATE");
+    }
     let payload = execute(
         context,
-        sqlx::query_scalar::<_, Vec<u8>>(
-            "SELECT tuple_payload FROM tuples WHERE store_id = $1 AND object_type = $2 AND \
-             object_id = $3 AND relation = $4 AND subject_kind = $5 AND subject_type = $6 AND \
-             subject_id = $7 AND subject_relation = $8 FOR UPDATE",
-        )
-        .bind(store_id.to_string())
-        .bind(parts.object_type)
-        .bind(parts.object_id)
-        .bind(parts.relation)
-        .bind(parts.subject_kind)
-        .bind(parts.subject_type)
-        .bind(parts.subject_id)
-        .bind(parts.subject_relation)
-        .fetch_optional(&mut **transaction),
-        "postgres_tuple_lock_read_failed",
+        query
+            .build_query_scalar::<Vec<u8>>()
+            .fetch_optional(&mut **transaction),
+        "portable_tuple_lock_read_failed",
     )
     .await?;
     payload.map(|payload| decode_tuple(&payload)).transpose()
 }
 
-async fn transaction_timestamp(
+fn configure_transaction_deadline(
     context: &OperationContext,
-    transaction: &mut Transaction<'_, Postgres>,
-) -> Result<i64, StorageError> {
-    execute(
-        context,
-        sqlx::query_scalar::<_, i64>(
-            "SELECT (EXTRACT(EPOCH FROM transaction_timestamp()) * 1000)::BIGINT",
-        )
-        .fetch_one(&mut **transaction),
-        "postgres_transaction_timestamp_failed",
-    )
-    .await
-}
-
-async fn configure_transaction_deadline(
-    context: &OperationContext,
-    transaction: &mut Transaction<'_, Postgres>,
+    _transaction: &mut Transaction<'_, Any>,
 ) -> Result<(), StorageError> {
-    let remaining = context
-        .deadline()
-        .instant()
-        .saturating_duration_since(std::time::Instant::now());
-    let milliseconds = remaining.as_millis().max(1).to_string();
-    execute(
-        context,
-        sqlx::query("SELECT set_config('statement_timeout', $1, TRUE)")
-            .bind(milliseconds)
-            .execute(&mut **transaction),
-        "postgres_transaction_deadline_configuration_failed",
-    )
-    .await
-    .map(|_| ())
+    context.check()
 }
 
-async fn next_change_id(
-    context: &OperationContext,
-    transaction: &mut Transaction<'_, Postgres>,
-    timestamp_ms: i64,
-    previous: Option<ChangeId>,
-) -> Result<ChangeId, StorageError> {
-    let sequence = execute(
-        context,
-        sqlx::query_scalar::<_, i64>("SELECT nextval('openfga_change_sequence')")
-            .fetch_one(&mut **transaction),
-        "postgres_change_sequence_failed",
-    )
-    .await?;
+fn next_change_id(timestamp_ms: i64, previous: Option<ChangeId>) -> Result<ChangeId, StorageError> {
     let mut timestamp = u64::try_from(timestamp_ms).map_err(|error| {
         StorageError::with_source(
             StorageErrorKind::Internal,
-            "postgres_change_timestamp_invalid",
+            "portable_change_timestamp_invalid",
             error,
         )
     })?;
-    let mut random = u128::try_from(sequence).map_err(|error| {
-        StorageError::with_source(
-            StorageErrorKind::Internal,
-            "postgres_change_sequence_invalid",
-            error,
-        )
-    })?;
+    let mut random = 0;
     if let Some(previous) = previous {
         let previous = previous.as_ulid();
         if timestamp < previous.timestamp_ms()
@@ -1637,7 +1569,7 @@ async fn next_change_id(
                 timestamp = timestamp.checked_add(1).ok_or_else(|| {
                     StorageError::new(
                         StorageErrorKind::Internal,
-                        "postgres_change_timestamp_overflow",
+                        "portable_change_timestamp_overflow",
                     )
                 })?;
                 random = 0;
@@ -1649,13 +1581,13 @@ async fn next_change_id(
     if timestamp > ULID_MAX_TIMESTAMP_MS {
         return Err(StorageError::new(
             StorageErrorKind::Internal,
-            "postgres_change_timestamp_overflow",
+            "portable_change_timestamp_overflow",
         ));
     }
     ChangeId::try_from(Ulid::from_parts(timestamp, random).to_string()).map_err(|error| {
         StorageError::with_source(
             StorageErrorKind::Internal,
-            "postgres_change_id_invalid",
+            "portable_change_id_invalid",
             error,
         )
     })
@@ -1663,35 +1595,38 @@ async fn next_change_id(
 
 async fn lock_change_allocator(
     context: &OperationContext,
-    transaction: &mut Transaction<'_, Postgres>,
+    transaction: &mut Transaction<'_, Any>,
+    dialect: PortableSqlDialect,
 ) -> Result<Option<ChangeId>, StorageError> {
+    let statement = if dialect == PortableSqlDialect::MySql {
+        "SELECT last_change_id FROM openfga_change_allocator WHERE singleton = TRUE FOR UPDATE"
+    } else {
+        "SELECT last_change_id FROM openfga_change_allocator WHERE singleton = TRUE"
+    };
     let value = execute(
         context,
-        sqlx::query_scalar::<_, Option<String>>(
-            "SELECT last_change_id FROM openfga_change_allocator WHERE singleton = TRUE FOR UPDATE",
-        )
-        .fetch_one(&mut **transaction),
-        "postgres_change_allocator_lock_failed",
+        sqlx::query_scalar::<_, Option<String>>(statement).fetch_one(&mut **transaction),
+        "portable_change_allocator_lock_failed",
     )
     .await?;
     value
-        .map(|value| parse_id(&value, "postgres_change_allocator_invalid"))
+        .map(|value| parse_id(&value, "portable_change_allocator_invalid"))
         .transpose()
 }
 
 async fn update_change_allocator(
     context: &OperationContext,
-    transaction: &mut Transaction<'_, Postgres>,
+    transaction: &mut Transaction<'_, Any>,
     change_id: ChangeId,
 ) -> Result<(), StorageError> {
     execute(
         context,
         sqlx::query(
-            "UPDATE openfga_change_allocator SET last_change_id = $1 WHERE singleton = TRUE",
+            "UPDATE openfga_change_allocator SET last_change_id = ? WHERE singleton = TRUE",
         )
         .bind(change_id.to_string())
         .execute(&mut **transaction),
-        "postgres_change_allocator_update_failed",
+        "portable_change_allocator_update_failed",
     )
     .await
     .map(|_| ())
@@ -1699,7 +1634,7 @@ async fn update_change_allocator(
 
 async fn insert_tuple(
     context: &OperationContext,
-    transaction: &mut Transaction<'_, Postgres>,
+    transaction: &mut Transaction<'_, Any>,
     store_id: StoreId,
     tuple: &RelationshipTuple,
     timestamp_ms: i64,
@@ -1712,8 +1647,7 @@ async fn insert_tuple(
         sqlx::query(
             "INSERT INTO tuples (store_id, object_type, object_id, relation, subject_kind, \
              subject_type, subject_id, subject_relation, condition_name, condition_context, \
-             tuple_payload, inserted_at) VALUES \
-             ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,to_timestamp($12::double precision / 1000.0))",
+             tuple_payload, inserted_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(store_id.to_string())
         .bind(parts.object_type)
@@ -1728,7 +1662,7 @@ async fn insert_tuple(
         .bind(payload)
         .bind(timestamp_ms)
         .execute(&mut **transaction),
-        "postgres_tuple_insert_failed",
+        "portable_tuple_insert_failed",
     )
     .await
     .map(|_| ())
@@ -1736,7 +1670,7 @@ async fn insert_tuple(
 
 async fn delete_tuple(
     context: &OperationContext,
-    transaction: &mut Transaction<'_, Postgres>,
+    transaction: &mut Transaction<'_, Any>,
     store_id: StoreId,
     key: &TupleKey,
 ) -> Result<(), StorageError> {
@@ -1744,9 +1678,9 @@ async fn delete_tuple(
     execute(
         context,
         sqlx::query(
-            "DELETE FROM tuples WHERE store_id=$1 AND object_type=$2 AND object_id=$3 AND \
-             relation=$4 AND subject_kind=$5 AND subject_type=$6 AND subject_id=$7 AND \
-             subject_relation=$8",
+            "DELETE FROM tuples WHERE store_id = ? AND object_type = ? AND object_id = ? AND \
+             relation = ? AND subject_kind = ? AND subject_type = ? AND subject_id = ? AND \
+             subject_relation = ?",
         )
         .bind(store_id.to_string())
         .bind(parts.object_type)
@@ -1757,7 +1691,7 @@ async fn delete_tuple(
         .bind(parts.subject_id)
         .bind(parts.subject_relation)
         .execute(&mut **transaction),
-        "postgres_tuple_delete_failed",
+        "portable_tuple_delete_failed",
     )
     .await
     .map(|_| ())
@@ -1765,7 +1699,7 @@ async fn delete_tuple(
 
 async fn insert_change(
     context: &OperationContext,
-    transaction: &mut Transaction<'_, Postgres>,
+    transaction: &mut Transaction<'_, Any>,
     store_id: StoreId,
     change_id: ChangeId,
     operation: ChangeOperation,
@@ -1790,9 +1724,8 @@ async fn insert_change(
         sqlx::query(
             "INSERT INTO tuple_changes (store_id, change_id, object_type, object_id, relation, \
              subject_kind, subject_type, subject_id, subject_relation, condition_name, \
-             condition_context, tuple_payload, operation, changed_at) VALUES \
-             ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,to_timestamp($14::double precision / \
-             1000.0))",
+             condition_context, tuple_payload, operation, changed_at_ms) VALUES (?, ?, ?, ?, ?, \
+             ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(store_id.to_string())
         .bind(change_id.to_string())
@@ -1809,7 +1742,7 @@ async fn insert_change(
         .bind(operation)
         .bind(timestamp_ms)
         .execute(&mut **transaction),
-        "postgres_changelog_insert_failed",
+        "portable_changelog_insert_failed",
     )
     .await
     .map(|_| ())
@@ -1829,7 +1762,7 @@ fn condition_columns(
         })
 }
 
-fn push_tuple_read_filter(query: &mut QueryBuilder<Postgres>, filter: &TupleReadFilter) {
+fn push_tuple_read_filter(query: &mut QueryBuilder<Any>, filter: &TupleReadFilter) {
     if let Some(value) = filter.object_type() {
         query.push(" AND object_type = ").push_bind(value.as_str());
     }
@@ -1843,7 +1776,7 @@ fn push_tuple_read_filter(query: &mut QueryBuilder<Postgres>, filter: &TupleRead
         push_exact_subject(query, value);
     }
 }
-fn push_exact_subject(query: &mut QueryBuilder<Postgres>, subject: &SubjectRef) {
+fn push_exact_subject(query: &mut QueryBuilder<Any>, subject: &SubjectRef) {
     let (kind, ty, id, relation) = subject_parts(subject);
     query
         .push(" AND subject_kind = ")
@@ -1856,7 +1789,7 @@ fn push_exact_subject(query: &mut QueryBuilder<Postgres>, subject: &SubjectRef) 
         .push_bind(relation.to_owned());
 }
 
-fn push_subject_allowlist(query: &mut QueryBuilder<Postgres>, subjects: &BTreeSet<SubjectRef>) {
+fn push_subject_allowlist(query: &mut QueryBuilder<Any>, subjects: &BTreeSet<SubjectRef>) {
     if subjects.is_empty() {
         return;
     }
@@ -1878,10 +1811,7 @@ fn push_subject_allowlist(query: &mut QueryBuilder<Postgres>, subjects: &BTreeSe
     query.push(")");
 }
 
-fn push_condition_filter(
-    query: &mut QueryBuilder<Postgres>,
-    filter: &openfga_storage::ConditionFilter,
-) {
+fn push_condition_filter(query: &mut QueryBuilder<Any>, filter: &openfga_storage::ConditionFilter) {
     if filter.is_any() {
         return;
     }
@@ -1913,7 +1843,7 @@ fn subject_parts(subject: &SubjectRef) -> (i16, &str, &str, &str) {
     )
 }
 
-fn push_after_tuple(query: &mut QueryBuilder<Postgres>, key: &TupleKey) {
+fn push_after_tuple(query: &mut QueryBuilder<Any>, key: &TupleKey) {
     let parts = TupleParts::from_key(key);
     query
         .push(
@@ -1939,14 +1869,14 @@ fn tuple_cursor(cursor: &StorageCursor) -> Result<TupleKey, StorageError> {
     let value = std::str::from_utf8(cursor.as_bytes()).map_err(|error| {
         StorageError::with_source(
             StorageErrorKind::InvalidContinuation,
-            "postgres_tuple_cursor_utf8",
+            "portable_tuple_cursor_utf8",
             error,
         )
     })?;
     value.parse().map_err(|error| {
         StorageError::with_source(
             StorageErrorKind::InvalidContinuation,
-            "postgres_tuple_cursor_invalid",
+            "portable_tuple_cursor_invalid",
             error,
         )
     })
@@ -2028,13 +1958,13 @@ fn page_fetch_limit(maximum: usize) -> Result<i64, StorageError> {
     i64::try_from(maximum.checked_add(1).ok_or_else(|| {
         StorageError::new(
             StorageErrorKind::ResourceExhausted,
-            "postgres_page_limit_overflow",
+            "portable_page_limit_overflow",
         )
     })?)
     .map_err(|error| {
         StorageError::with_source(
             StorageErrorKind::ResourceExhausted,
-            "postgres_page_limit_invalid",
+            "portable_page_limit_invalid",
             error,
         )
     })
@@ -2045,7 +1975,7 @@ fn system_time_to_millis(value: SystemTime) -> Result<i64, StorageError> {
         .map_err(|error| {
             StorageError::with_source(
                 StorageErrorKind::Integrity,
-                "postgres_timestamp_before_epoch",
+                "portable_timestamp_before_epoch",
                 error,
             )
         })?
@@ -2053,7 +1983,7 @@ fn system_time_to_millis(value: SystemTime) -> Result<i64, StorageError> {
     i64::try_from(millis).map_err(|error| {
         StorageError::with_source(
             StorageErrorKind::Integrity,
-            "postgres_timestamp_overflow",
+            "portable_timestamp_overflow",
             error,
         )
     })
@@ -2062,14 +1992,14 @@ fn millis_to_system_time(value: i64) -> Result<SystemTime, StorageError> {
     let millis = u64::try_from(value).map_err(|error| {
         StorageError::with_source(
             StorageErrorKind::Integrity,
-            "postgres_timestamp_negative",
+            "portable_timestamp_negative",
             error,
         )
     })?;
     UNIX_EPOCH
         .checked_add(Duration::from_millis(millis))
         .ok_or_else(|| {
-            StorageError::new(StorageErrorKind::Integrity, "postgres_timestamp_overflow")
+            StorageError::new(StorageErrorKind::Integrity, "portable_timestamp_overflow")
         })
 }
 fn internal_conversion(
@@ -2089,10 +2019,10 @@ mod tests {
             "postgresql://user@localhost/openfga?unknown=database-secret-canary",
         )
         .err()
-        .ok_or("unknown PostgreSQL URL parameter was accepted")?;
+        .ok_or("unknown portable SQL URL parameter was accepted")?;
         let diagnostic = format!("{error:?} {error}");
 
-        assert_eq!(error.code(), "postgres_url_parameter_not_allowed");
+        assert_eq!(error.code(), "portable_url_parameter_not_allowed");
         assert!(!diagnostic.contains("database-secret-canary"));
         Ok(())
     }

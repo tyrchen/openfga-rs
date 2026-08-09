@@ -1539,6 +1539,7 @@ version = "0.37.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b1f111c8c41e7c61a49cd34e44c7619462967221a6443b0ec299e0ac30cfb9b1"
 dependencies = [
+ "cc",
  "pkg-config",
  "vcpkg",
 ]
@@ -2040,6 +2041,27 @@ dependencies = [
  "tracing-subscriber",
  "typed-builder",
  "ulid",
+]
+
+[[package]]
+name = "openfga-upstream-migrate"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "openfga-domain",
+ "openfga-model",
+ "openfga-proto",
+ "openfga-storage",
+ "openfga-storage-sql",
+ "openfga-transport",
+ "pbjson-types",
+ "prost",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
 ]
 
 [[package]]
@@ -3267,7 +3289,9 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "sqlx-core",
+ "sqlx-mysql",
  "sqlx-postgres",
+ "sqlx-sqlite",
  "syn 2.0.119",
  "thiserror 2.0.19",
  "tokio",

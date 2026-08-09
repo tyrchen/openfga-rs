@@ -13,6 +13,9 @@ RUST_WRITER_HTTP_ADDR ?= 127.0.0.1:18085
 RUST_WRITER_GRPC_ADDR ?= 127.0.0.1:18086
 FUZZ_TIME ?= 15
 POSTGRES_TEST_URL ?=
+MYSQL_TEST_URL ?=
+COMPAT_STORAGE_BACKEND ?= postgres
+COMPAT_DATABASE_URL ?= $(POSTGRES_TEST_URL)
 CONFIG ?= config/openfga-development.yaml
 PHASE4_BENCH_REQUESTS ?= 25
 PHASE4_CONSISTENCY_ITERATIONS ?= 32
@@ -24,6 +27,16 @@ PHASE4_STORAGE_BACKEND ?= memory
 PHASE4_POSTGRES_MIGRATE ?= false
 PHASE4_POSTGRES_PORT ?= 55432
 PHASE4_SOAK_CONSISTENCY_ARG ?=
+GITLEAKS_VERSION := 8.30.1
+GITLEAKS_TOOL := .tools/gitleaks-$(GITLEAKS_VERSION)/gitleaks
+SYFT_VERSION := 1.50.0
+SYFT_TOOL := .tools/syft-$(SYFT_VERSION)/syft
+PHASE5_ARTIFACT_DIR ?= target/phase5
+PHASE5_PLATFORM := $(shell uname -s | tr '[:upper:]' '[:lower:]')-$(shell uname -m)
+WORKSPACE_TARGET_DIR := $(shell $(CARGO) metadata --no-deps --format-version 1 | \
+	sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
+UPSTREAM_SQLITE_URL_ENV ?= OPENFGA_UPSTREAM_SQLITE_URL
+DESTINATION_SQLITE_URL_ENV ?= OPENFGA_SQLITE_URL
 PROTO_OUTPUT := crates/openfga-proto/src/generated
 
 build:
@@ -156,9 +169,15 @@ differential-smoke: $(GO_BASELINE) build
 	npm audit --prefix tests/sdk-smoke-js --audit-level=moderate
 
 phase2-compatibility: $(GO_BASELINE) build
-	@test -n "$(POSTGRES_TEST_URL)" || { echo "POSTGRES_TEST_URL is required" >&2; exit 1; }
+	@test "$(COMPAT_STORAGE_BACKEND)" = sqlite || test -n "$(COMPAT_DATABASE_URL)" || { \
+		echo "COMPAT_DATABASE_URL is required for $(COMPAT_STORAGE_BACKEND)" >&2; exit 1; \
+	}
 	@set -eu; \
 	phase2_tmp=$$(mktemp -d); \
+	compat_database_url="$(COMPAT_DATABASE_URL)"; \
+	if test "$(COMPAT_STORAGE_BACKEND)" = sqlite; then \
+		compat_database_url="sqlite://$$phase2_tmp/openfga.db?mode=rwc"; \
+	fi; \
 	go_pid=""; rust_pid=""; \
 	cleanup() { \
 		test -z "$$go_pid" || kill "$$go_pid" 2>/dev/null || true; \
@@ -185,9 +204,16 @@ phase2-compatibility: $(GO_BASELINE) build
 	OPENFGA__TLS__CERTIFICATE_PATH="$$phase2_tmp/tls.crt" \
 	OPENFGA__TLS__PRIVATE_KEY_PATH="$$phase2_tmp/tls.key" \
 	OPENFGA__TLS__RELOAD_INTERVAL_SECONDS=1 \
-	OPENFGA__STORAGE__BACKEND=postgres \
+	OPENFGA__STORAGE__BACKEND=$(COMPAT_STORAGE_BACKEND) \
 	OPENFGA__STORAGE__POSTGRES__MIGRATE_ON_START=true \
-	OPENFGA_DATABASE_URL="$(POSTGRES_TEST_URL)" \
+	OPENFGA__STORAGE__MYSQL__URL_ENV=OPENFGA_MYSQL_URL \
+	OPENFGA__STORAGE__MYSQL__MIGRATE_ON_START=true \
+	OPENFGA__STORAGE__SQLITE__URL_ENV=OPENFGA_SQLITE_URL \
+	OPENFGA__STORAGE__SQLITE__MAX_CONNECTIONS=1 \
+	OPENFGA__STORAGE__SQLITE__MIGRATE_ON_START=true \
+	OPENFGA_DATABASE_URL="$$compat_database_url" \
+	OPENFGA_MYSQL_URL="$$compat_database_url" \
+	OPENFGA_SQLITE_URL="$$compat_database_url" \
 	OPENFGA_PRESHARED_KEY=phase2-compatibility-preshared-key-material \
 	OPENFGA_TOKEN_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= \
 	$(CARGO) run --quiet -p openfga-server -- run \
@@ -283,6 +309,31 @@ postgres-storage:
 	@test -n "$(POSTGRES_TEST_URL)" || { echo "POSTGRES_TEST_URL is required" >&2; exit 1; }
 	@OPENFGA_POSTGRES_TEST_URL="$(POSTGRES_TEST_URL)" \
 		$(CARGO) test -p openfga-storage-sql --test postgres -- --ignored
+
+mysql-storage:
+	@test -n "$(MYSQL_TEST_URL)" || { echo "MYSQL_TEST_URL is required" >&2; exit 1; }
+	@OPENFGA_MYSQL_TEST_URL="$(MYSQL_TEST_URL)" \
+		$(CARGO) test -p openfga-storage-sql --test portable \
+			test_should_satisfy_mysql_contract_and_plan_gates -- --ignored
+
+sqlite-storage:
+	@$(CARGO) test -p openfga-storage-sql --test portable
+
+upstream-migration:
+	@$(CARGO) run --quiet -p openfga-upstream-migrate -- \
+		--source-url-env "$(UPSTREAM_SQLITE_URL_ENV)" \
+		--destination-url-env "$(DESTINATION_SQLITE_URL_ENV)"
+
+upstream-migration-drill:
+	@$(CARGO) test -p openfga-upstream-migrate
+
+phase5-sqlite-compatibility:
+	@$(MAKE) phase2-compatibility COMPAT_STORAGE_BACKEND=sqlite COMPAT_DATABASE_URL=
+
+phase5-mysql-compatibility:
+	@test -n "$(MYSQL_TEST_URL)" || { echo "MYSQL_TEST_URL is required" >&2; exit 1; }
+	@$(MAKE) phase2-compatibility COMPAT_STORAGE_BACKEND=mysql \
+		COMPAT_DATABASE_URL="$(MYSQL_TEST_URL)"
 
 sqlx-prepare-check:
 	@test -n "$(POSTGRES_TEST_URL)" || { echo "POSTGRES_TEST_URL is required" >&2; exit 1; }
@@ -627,6 +678,98 @@ audit:
 deny:
 	@$(CARGO) deny check
 
+$(GITLEAKS_TOOL):
+	@phase5_tmp=$$(mktemp -d); \
+	trap 'rm -rf "$$phase5_tmp"' EXIT; \
+	case "$$(uname -s)-$$(uname -m)" in \
+		Darwin-arm64) platform=darwin_arm64; sha=b40ab0ae55c505963e365f271a8d3846efbc170aa17f2607f13df610a9aeb6a5 ;; \
+		Darwin-x86_64) platform=darwin_x64; sha=dfe101a4db2255fc85120ac7f3d25e4342c3c20cf749f2c20a18081af1952709 ;; \
+		Linux-aarch64) platform=linux_arm64; sha=e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080 ;; \
+		Linux-x86_64) platform=linux_x64; sha=551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb ;; \
+		*) echo "unsupported gitleaks platform: $$(uname -s)-$$(uname -m)" >&2; exit 1 ;; \
+	esac; \
+	archive="gitleaks_$(GITLEAKS_VERSION)_$$platform.tar.gz"; \
+	curl --fail --location --silent --show-error \
+		"https://github.com/gitleaks/gitleaks/releases/download/v$(GITLEAKS_VERSION)/$$archive" \
+		--output "$$phase5_tmp/$$archive"; \
+	if command -v shasum >/dev/null 2>&1; then \
+		actual_sha=$$(shasum -a 256 "$$phase5_tmp/$$archive" | awk '{print $$1}'); \
+	else \
+		actual_sha=$$(sha256sum "$$phase5_tmp/$$archive" | awk '{print $$1}'); \
+	fi; \
+	test "$$actual_sha" = "$$sha"; \
+	mkdir -p "$(@D)"; \
+	tar -xzf "$$phase5_tmp/$$archive" -C "$(@D)" gitleaks
+
+$(SYFT_TOOL):
+	@phase5_tmp=$$(mktemp -d); \
+	trap 'rm -rf "$$phase5_tmp"' EXIT; \
+	case "$$(uname -s)-$$(uname -m)" in \
+		Darwin-arm64) platform=darwin_arm64; sha=e32fdb9d47823fa633748a1efca2528fd77c37469ea93c9e40ab835da44e4cce ;; \
+		Darwin-x86_64) platform=darwin_amd64; sha=d11a8c7bc27114853bd7c1e1b2f3be3ddda3a1de17aee585329f04c369341c75 ;; \
+		Linux-aarch64) platform=linux_arm64; sha=887c57cbcc2d0e8c5c110a4571a3fc7150058b24d74f993ee4663516e5c8ce86 ;; \
+		Linux-x86_64) platform=linux_amd64; sha=bf7b29ff57f06da30918266a0e1c2885a8f99784798d1bdb1628886aa015d788 ;; \
+		*) echo "unsupported syft platform: $$(uname -s)-$$(uname -m)" >&2; exit 1 ;; \
+	esac; \
+	archive="syft_$(SYFT_VERSION)_$$platform.tar.gz"; \
+	curl --fail --location --silent --show-error \
+		"https://github.com/anchore/syft/releases/download/v$(SYFT_VERSION)/$$archive" \
+		--output "$$phase5_tmp/$$archive"; \
+	if command -v shasum >/dev/null 2>&1; then \
+		actual_sha=$$(shasum -a 256 "$$phase5_tmp/$$archive" | awk '{print $$1}'); \
+	else \
+		actual_sha=$$(sha256sum "$$phase5_tmp/$$archive" | awk '{print $$1}'); \
+	fi; \
+	test "$$actual_sha" = "$$sha"; \
+	mkdir -p "$(@D)"; \
+	tar -xzf "$$phase5_tmp/$$archive" -C "$(@D)" syft
+
+secret-scan: $(GITLEAKS_TOOL)
+	@$(GITLEAKS_TOOL) git --no-banner --redact --verbose .
+	@$(GITLEAKS_TOOL) dir --no-banner --redact --verbose .
+
+sbom: build-release $(SYFT_TOOL)
+	@set -eu; \
+	phase5_tmp=$$(mktemp -d); \
+	trap 'rm -rf "$$phase5_tmp"' EXIT; \
+	mkdir -p "$(PHASE5_ARTIFACT_DIR)"; \
+	test -x "$(WORKSPACE_TARGET_DIR)/release/openfga-server"; \
+	cp "$(WORKSPACE_TARGET_DIR)/release/openfga-server" Cargo.lock Cargo.toml LICENSE.md \
+		"$$phase5_tmp/"; \
+	$(SYFT_TOOL) scan "dir:$$phase5_tmp" \
+		--source-name openfga-rs --source-version "$$(git rev-parse HEAD)" \
+		-o cyclonedx-json="$(PHASE5_ARTIFACT_DIR)/openfga-rs-$(PHASE5_PLATFORM).cdx.json" \
+		-o spdx-json="$(PHASE5_ARTIFACT_DIR)/openfga-rs-$(PHASE5_PLATFORM).spdx.json"
+
+release-artifacts: build-release sbom
+	@set -eu; \
+	artifact="openfga-server-$(PHASE5_PLATFORM).tar.gz"; \
+	test -n "$(WORKSPACE_TARGET_DIR)"; \
+	tar -czf "$(PHASE5_ARTIFACT_DIR)/$$artifact" \
+		-C "$(WORKSPACE_TARGET_DIR)/release" openfga-server; \
+	cd "$(PHASE5_ARTIFACT_DIR)"; \
+	if command -v shasum >/dev/null 2>&1; then \
+		shasum -a 256 "$$artifact" openfga-rs-$(PHASE5_PLATFORM).cdx.json \
+			openfga-rs-$(PHASE5_PLATFORM).spdx.json > SHA256SUMS-$(PHASE5_PLATFORM); \
+	else \
+		sha256sum "$$artifact" openfga-rs-$(PHASE5_PLATFORM).cdx.json \
+			openfga-rs-$(PHASE5_PLATFORM).spdx.json > SHA256SUMS-$(PHASE5_PLATFORM); \
+	fi
+
+security: audit deny secret-scan sbom
+
+phase5-ga-evidence: differential-smoke check-spike enumeration-differential security \
+	release-artifacts phase4-scale-smoke
+
+phase5-release-gate: check clippy-strict sqlite-storage upstream-migration-drill \
+	phase5-sqlite-compatibility phase5-ga-evidence
+	@test -n "$(POSTGRES_TEST_URL)" || { echo "POSTGRES_TEST_URL is required" >&2; exit 1; }
+	@test -n "$(MYSQL_TEST_URL)" || { echo "MYSQL_TEST_URL is required" >&2; exit 1; }
+	@$(MAKE) postgres-storage phase2-compatibility \
+		POSTGRES_TEST_URL="$(POSTGRES_TEST_URL)"
+	@$(MAKE) mysql-storage phase5-mysql-compatibility \
+		MYSQL_TEST_URL="$(MYSQL_TEST_URL)"
+
 check-agent-sync:
 	@cmp -s CLAUDE.md AGENTS.md || { \
 		echo "AGENTS.md must stay in sync with CLAUDE.md"; \
@@ -658,4 +801,7 @@ update-submodule:
 	check-oracle check-proto check-spike \
 	clippy clippy-strict \
 	conformance deny differential-smoke doc enumeration-differential fmt fuzz-condition fuzz-domain fuzz-model go-baseline listobjects-spike model-baseline \
-	model-spike phase2-compatibility phase4-criterion postgres-storage proto release sqlx-prepare-check storage-contract test update-submodule verify-go-pin verify-go-tool
+	model-spike mysql-storage phase2-compatibility phase4-criterion phase5-mysql-compatibility \
+	phase5-ga-evidence phase5-release-gate phase5-sqlite-compatibility postgres-storage proto release release-artifacts \
+	sbom secret-scan security sqlite-storage sqlx-prepare-check storage-contract test \
+	update-submodule upstream-migration upstream-migration-drill verify-go-pin verify-go-tool

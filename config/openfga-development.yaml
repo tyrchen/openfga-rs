@@ -18,6 +18,22 @@ storage:
     replicaMaxLagMs: 1000
     maxTupleMutations: 100
     migrateOnStart: false
+  mysql:
+    urlEnv: OPENFGA_MYSQL_URL
+    maxConnections: 16
+    minConnections: 0
+    acquireTimeoutMs: 5000
+    statementTimeoutMs: 5000
+    maxTupleMutations: 100
+    migrateOnStart: false
+  sqlite:
+    urlEnv: OPENFGA_SQLITE_URL
+    maxConnections: 1
+    minConnections: 0
+    acquireTimeoutMs: 5000
+    statementTimeoutMs: 5000
+    maxTupleMutations: 100
+    migrateOnStart: false
 cache:
   model:
     sourceWeight: 67108864

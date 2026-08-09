@@ -5,8 +5,9 @@ This runbook covers configuration validation, secret injection, deployment, and 
 [`openfga-development.yaml`](../../config/openfga-development.yaml) and
 [`openfga-preshared-development.yaml`](../../config/openfga-preshared-development.yaml).
 
-> The project is not yet production-ready. A production profile enables the implemented safety
-> checks, but it is not a GA support statement.
+The exact supported profiles and version pins are in the
+[compatibility matrix](../compatibility.md). A production claim is valid only with the matching
+release gates and operational controls.
 
 ## Safety invariants
 
@@ -21,8 +22,9 @@ This runbook covers configuration validation, secret injection, deployment, and 
   certificate/key pair atomically for both listeners; malformed replacements retain the active
   identity. Other referenced secrets, authorization policy, and OIDC bootstrap state require a
   coordinated restart.
-- `storage.backend: memory` is volatile. Use PostgreSQL for any data that must survive restart.
-- PostgreSQL starts only against the exact schema version embedded in the binary unless
+- `storage.backend: memory` is volatile. Use PostgreSQL or MySQL for distributed deployment, or
+  SQLite for an embedded single-process deployment, when data must survive restart.
+- Every SQL backend starts only against the exact schema version embedded in the binary unless
   `migrateOnStart` is explicitly enabled.
 
 ## Production baseline
@@ -129,6 +131,41 @@ Omit `replicaUrlEnv` when there is no replica. Latency-preferring reads use a co
 only while its replay lag is within `replicaMaxLagMs`; otherwise they conservatively use the
 primary.
 
+## Backend profiles
+
+Choose one backend and retain the unused checked-in sections as documentation/defaults:
+
+```yaml
+storage:
+  backend: mysql
+  mysql:
+    urlEnv: OPENFGA_MYSQL_URL
+    maxConnections: 32
+    minConnections: 4
+    acquireTimeoutMs: 5000
+    statementTimeoutMs: 5000
+    maxTupleMutations: 100
+    migrateOnStart: false
+```
+
+```yaml
+storage:
+  backend: sqlite
+  sqlite:
+    urlEnv: OPENFGA_SQLITE_URL
+    maxConnections: 1
+    minConnections: 0
+    acquireTimeoutMs: 5000
+    statementTimeoutMs: 5000
+    maxTupleMutations: 100
+    migrateOnStart: false
+```
+
+MySQL and SQLite do not route reads to replicas. SQLite requires exactly one connection so the
+process serializes mutations and avoids lock-upgrade races; do not share its database file among
+server processes. Use a `sqlite://...?...mode=rwc` URL and protect the database, WAL/SHM files and
+parent directory with service-account permissions.
+
 Omit `telemetry.otlpEndpoint` to disable trace and metric export. When configured, it must identify
 an OTLP gRPC collector; route the collector's metric pipeline to the Prometheus datasource used by
 the checked-in dashboard and alerts.
@@ -144,6 +181,8 @@ limits because this service only trusts the socket peer address.
 | --- | --- | --- |
 | `storage.postgres.primaryUrlEnv` | PostgreSQL URL for the writable primary | New process/pool required |
 | `storage.postgres.replicaUrlEnv` | Optional read-only replica URL | New process/pool required |
+| `storage.mysql.urlEnv` | MySQL URL for the writable primary | New process/pool required |
+| `storage.sqlite.urlEnv` | SQLite file URL for the single embedded database | New process/pool required |
 | `transport.tokenKeyEnv` | Standard-base64 encoding of the active 32–64-byte signing key | New tokens use this key ID |
 | `transport.tokenVerificationKeys[].keyEnv` | Standard-base64 encoding of prior 32–64-byte keys | Existing tokens remain valid during a bounded overlap window |
 | `auth.preshared.keys[].keyEnv` | 32–256 ASCII-graphic bytes from a CSPRNG-backed secret | Follow the overlap procedure in the authentication runbook |
@@ -158,6 +197,8 @@ configuration, logs, tickets, or shell history.
 | Area | Important constraints |
 | --- | --- |
 | PostgreSQL | `maxConnections` is 1–65,536; `minConnections` cannot exceed it; acquisition and statement timeouts are 1 ms–5 minutes; tuple mutations are 1–5,000 |
+| MySQL | Same pool/timeout/mutation bounds as PostgreSQL; no replica URL; evaluator and enumeration concurrency must leave control-plane headroom |
+| SQLite | `maxConnections` must equal 1; `minConnections` is 0 or 1; the same timeout and mutation bounds apply |
 | Model cache | source/compiled byte weights are positive and each at most 512 MiB; immutable TTL is at most 30 days; the mutable latest alias is at most 5 minutes and is bypassed by higher-consistency reads |
 | Mutable caches | decision/tuple byte weights are positive and each at most 512 MiB; TTL is at most 24 hours; tuple entries hold at most 100,000 rows; higher-consistency reads bypass and do not populate either cache |
 | Aggregate cache | configured source, compiled, decision, tuple, and estimated latest-alias capacity is at most 1 GiB per process |
@@ -201,7 +242,7 @@ These overrides are configuration values, not the separately referenced secret v
    make print-effective-config CONFIG=/absolute/path/openfga.yaml
    ```
 
-3. For PostgreSQL, require a current schema before admitting traffic:
+3. For any SQL backend, require a current schema before admitting traffic:
 
    ```sh
    make migrate-status CONFIG=/absolute/path/openfga.yaml

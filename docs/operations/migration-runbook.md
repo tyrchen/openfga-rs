@@ -1,8 +1,9 @@
-# PostgreSQL migration runbook
+# SQL and upstream migration runbook
 
-`openfga-server` embeds forward-only SQLx migrations. It verifies the SQLx migration history,
-checksums, and the project-owned `openfga_schema_metadata` version before serving PostgreSQL-backed
-traffic.
+`openfga-server` embeds separate forward-only SQLx migrations for PostgreSQL, MySQL, and SQLite. It
+verifies migration history, checksums, and the project-owned `openfga_schema_metadata` version
+before serving SQL-backed traffic. The selected `storage.backend` determines which migration set
+the CLI uses.
 
 ## Commands and states
 
@@ -27,9 +28,14 @@ nonzero unless the state is `current`, which makes it suitable for a deployment 
 The status command also fails closed on an interrupted migration, checksum mismatch, missing
 embedded migration, invalid metadata, or database connectivity failure.
 
+PostgreSQL uses an advisory migration lock, MySQL uses the SQLx backend migration lock, and SQLite
+serializes through its single configured connection. In every case, run one dedicated migration
+job with application admission stopped; lock ownership does not make mixed application versions
+semantically compatible.
+
 ## Planned upgrade
 
-1. Read the release notes and inspect every new migration. Confirm PostgreSQL-version support,
+1. Read the release notes and inspect every new migration. Confirm backend-version support,
    lock behavior, storage growth, expected duration, and whether old and new binaries can safely
    overlap. If compatibility is not explicitly proven, plan a write outage.
 2. Record the current binary digest, configuration revision, `migrate status` JSON, PostgreSQL
@@ -37,7 +43,7 @@ embedded migration, invalid metadata, or database connectivity failure.
 3. Take and verify a recoverable backup using the
    [backup/restore runbook](backup-restore-runbook.md). A snapshot without a tested restore is not
    rollback evidence.
-4. Set `storage.postgres.migrateOnStart: false`. Keep it false for multi-replica production so a
+4. Set the selected backend's `migrateOnStart: false`. Keep it false for multi-replica production so a
    dedicated migration job owns the change.
 5. Remove old application instances from admission and stop writes. Wait for in-flight requests to
    drain.
@@ -47,7 +53,7 @@ embedded migration, invalid metadata, or database connectivity failure.
    make migrate-up CONFIG=/absolute/path/openfga.yaml
    ```
 
-   SQLx serializes migration application with the backend lock and verifies prior checksums. Do not
+   SQLx serializes migration application with the backend mechanism and verifies prior checksums. Do not
    treat that lock as proof that mixed application versions are semantically compatible.
 7. Require a clean postcondition:
 
@@ -90,3 +96,50 @@ For an incompatible schema rollback:
 6. Start a canary, verify health and authenticated read/write/Check behavior, then shift traffic.
 
 Do not destructively rewrite the active database to imitate a down migration.
+
+## Pinned upstream OpenFGA SQLite conversion
+
+`openfga-upstream-migrate` is an offline converter for OpenFGA commit
+`4e4f79ed841513dfd61746a75ef473f6198299f7` and its SQLite schema. It is not a generic converter
+for arbitrary upstream releases or PostgreSQL/MySQL layouts.
+
+The converter requires:
+
+- a quiesced upstream application and a source SQLite URL opened without create permission;
+- a different, empty openfga-rs SQLite destination;
+- source/destination URL values supplied through environment references, never command arguments;
+- enough disk space for both databases and a verified pre-conversion backup.
+
+The converter rejects more than 100,000 active stores or data namespaces, more than 10,000 models
+or assertion sets per namespace, oversized encoded models/assertions/contexts, and tuple batches
+outside `1..=1000`. These limits are enforced in the source queries so a hostile or corrupt source
+cannot force an unbounded in-memory collection.
+
+Run the fixture drill first:
+
+```sh
+make upstream-migration-drill
+```
+
+Then set `OPENFGA_UPSTREAM_SQLITE_URL` and `OPENFGA_SQLITE_URL` in the migration job environment
+and run:
+
+```sh
+make upstream-migration
+```
+
+The tool starts a write-blocking source snapshot, verifies required pinned columns, validates every
+model/assertion/tuple through the same wire boundary used by the server, compiles every model, and
+writes bounded tuple batches. It preserves store and authorization-model identities. Deleted store
+directory records stay deleted, while their model/assertion/tuple namespaces—and orphan namespaces
+without a directory record—remain available under the original store ID. The upstream changelog is
+deliberately not copied because its physical cursor contract differs; imported tuples create fresh
+cutover change records and the JSON report states
+`"changelogPolicy": "reset-as-cutover-writes"`.
+
+Before cutover, require a successful report, compare store/model/assertion/tuple counts, start an
+isolated server on the destination, and run representative allow/deny checks plus SDK smoke. Keep
+the source read-only and retained through the rollback window. Rollback is traffic reversal to the
+unchanged upstream database; do not attempt reverse synchronization after writes have begun on the
+new destination. If the verification window permits writes, rollback requires discarding those
+writes or a separately designed reconciliation process.

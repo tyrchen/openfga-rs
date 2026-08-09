@@ -39,7 +39,10 @@ use openfga_storage::{
     OperationContext, StorageCancellationToken, StoreReader, StoreWriter, TupleReader, TupleWriter,
 };
 use openfga_storage_memory::{MemoryStorage, MemoryStorageConfig};
-use openfga_storage_sql::{PostgresStorage, PostgresStorageConfig};
+use openfga_storage_sql::{
+    PortableSqlDialect, PortableSqlStorage, PortableSqlStorageConfig, PostgresStorage,
+    PostgresStorageConfig,
+};
 use openfga_transport::{
     AuthenticatedGrpcService, OpenFgaApi, OpenFgaServices, TransportConfig, grpc_service,
     http_router,
@@ -134,6 +137,7 @@ impl fmt::Debug for TlsMaterial {
 enum StorageOwner {
     Memory(Arc<MemoryStorage>),
     Postgres(Arc<PostgresStorage>),
+    PortableSql(Arc<PortableSqlStorage>),
 }
 
 #[derive(Clone)]
@@ -150,6 +154,7 @@ impl fmt::Debug for StorageOwner {
         match self {
             Self::Memory(_) => formatter.write_str("StorageOwner::Memory"),
             Self::Postgres(_) => formatter.write_str("StorageOwner::Postgres"),
+            Self::PortableSql(_) => formatter.write_str("StorageOwner::PortableSql"),
         }
     }
 }
@@ -161,6 +166,13 @@ struct RuntimeAssembly {
     storage: StorageOwner,
     health: Arc<dyn HealthCheck>,
     identifiers: Arc<SystemIdentifierSource>,
+    cache_controller: InvalidationController,
+}
+
+struct StorageAssembly {
+    services: OpenFgaServices,
+    storage: StorageOwner,
+    health: Arc<dyn HealthCheck>,
     cache_controller: InvalidationController,
 }
 
@@ -324,12 +336,16 @@ pub(crate) async fn run(config: ServerConfig) -> Result<()> {
 }
 
 fn storage_capacities(config: &ServerConfig) -> Result<(Option<usize>, Option<u32>)> {
-    let is_postgres = config.storage.backend == StorageBackend::Postgres;
-    let work = is_postgres
-        .then(|| usize::try_from(config.storage.postgres.max_connections))
+    let pool = match config.storage.backend {
+        StorageBackend::Memory => None,
+        StorageBackend::Postgres => Some(config.storage.postgres.max_connections),
+        StorageBackend::MySql => Some(config.storage.mysql.max_connections),
+        StorageBackend::Sqlite => Some(config.storage.sqlite.max_connections),
+    };
+    let work = pool
+        .map(usize::try_from)
         .transpose()
-        .context("PostgreSQL work capacity is out of range")?;
-    let pool = is_postgres.then_some(config.storage.postgres.max_connections);
+        .context("SQL work capacity is out of range")?;
     Ok((work, pool))
 }
 
@@ -368,6 +384,35 @@ pub(crate) fn postgres_config(
     Ok(built)
 }
 
+pub(crate) fn portable_sql_config(
+    config: &ServerConfig,
+    migrate_on_connect: bool,
+) -> Result<PortableSqlStorageConfig> {
+    let (dialect, raw) = match config.storage.backend {
+        StorageBackend::MySql => (PortableSqlDialect::MySql, &config.storage.mysql),
+        StorageBackend::Sqlite => (PortableSqlDialect::Sqlite, &config.storage.sqlite),
+        _ => bail!("portable migration commands require storage.backend: mysql or sqlite"),
+    };
+    let maximum =
+        NonZeroU32::new(raw.max_connections).context("SQL maximum connections must be nonzero")?;
+    let mutations = NonZeroU32::new(raw.max_tuple_mutations)
+        .context("SQL tuple mutation limit must be nonzero")?;
+    let built = PortableSqlStorageConfig::builder()
+        .dialect(dialect)
+        .primary_url(load_secret(&raw.url_env)?)
+        .max_connections(maximum)
+        .min_connections(raw.min_connections)
+        .acquire_timeout(Duration::from_millis(raw.acquire_timeout_ms))
+        .statement_timeout(Duration::from_millis(raw.statement_timeout_ms))
+        .max_tuple_mutations(mutations)
+        .migrate_on_connect(migrate_on_connect)
+        .build();
+    built
+        .validate()
+        .context("portable SQL configuration is invalid")?;
+    Ok(built)
+}
+
 async fn assemble(config: &ServerConfig) -> Result<RuntimeAssembly> {
     let (authentication, jwks_actor) = authentication(config).await?;
     let limits = InputLimits::default();
@@ -377,56 +422,12 @@ async fn assemble(config: &ServerConfig) -> Result<RuntimeAssembly> {
     );
     let identifier_service: Arc<dyn IdentifierSource> = identifiers.clone();
     let (budgets, cache_policy) = service_policy(config)?;
-    let (services, storage, health, cache_controller) = match config.storage.backend {
-        StorageBackend::Memory => {
-            let capacity = NonZeroUsize::new(config.storage.memory.actor_capacity)
-                .context("memory actor capacity must be nonzero")?;
-            let storage = Arc::new(
-                MemoryStorage::start(MemoryStorageConfig::new(
-                    limits.clone(),
-                    capacity,
-                    config.drain_timeout(),
-                )?)
-                .context("failed to start memory storage actor")?,
-            );
-            let health: Arc<dyn HealthCheck> = storage.clone();
-            let (services, cache_controller) = services(
-                &storage,
-                identifier_service,
-                limits.clone(),
-                budgets,
-                cache_policy,
-            )?;
-            (
-                services,
-                StorageOwner::Memory(storage),
-                health,
-                cache_controller,
-            )
-        }
-        StorageBackend::Postgres => {
-            let postgres = postgres_config(config, config.storage.postgres.migrate_on_start)?;
-            let storage = Arc::new(
-                PostgresStorage::connect(postgres)
-                    .await
-                    .context("failed to connect PostgreSQL storage")?,
-            );
-            let health: Arc<dyn HealthCheck> = storage.clone();
-            let (services, cache_controller) = services(
-                &storage,
-                identifier_service,
-                limits.clone(),
-                budgets,
-                cache_policy,
-            )?;
-            (
-                services,
-                StorageOwner::Postgres(storage),
-                health,
-                cache_controller,
-            )
-        }
-    };
+    let StorageAssembly {
+        services,
+        storage,
+        health,
+        cache_controller,
+    } = assemble_storage(config, &limits, identifier_service, budgets, cache_policy).await?;
     let (token_key, verification_keys) = load_token_keys(config)?;
     let token_codec = Arc::new(
         TokenCodec::new(token_key, verification_keys, &limits)
@@ -458,6 +459,93 @@ async fn assemble(config: &ServerConfig) -> Result<RuntimeAssembly> {
         identifiers,
         cache_controller,
     })
+}
+
+async fn assemble_storage(
+    config: &ServerConfig,
+    limits: &InputLimits,
+    identifier_service: Arc<dyn IdentifierSource>,
+    budgets: ServiceBudgets,
+    cache_policy: ServiceCachePolicy,
+) -> Result<StorageAssembly> {
+    let assembly = match config.storage.backend {
+        StorageBackend::Memory => {
+            let capacity = NonZeroUsize::new(config.storage.memory.actor_capacity)
+                .context("memory actor capacity must be nonzero")?;
+            let storage = Arc::new(
+                MemoryStorage::start(MemoryStorageConfig::new(
+                    limits.clone(),
+                    capacity,
+                    config.drain_timeout(),
+                )?)
+                .context("failed to start memory storage actor")?,
+            );
+            let health: Arc<dyn HealthCheck> = storage.clone();
+            let (services, cache_controller) = services(
+                &storage,
+                identifier_service,
+                limits.clone(),
+                budgets,
+                cache_policy,
+            )?;
+            StorageAssembly {
+                services,
+                storage: StorageOwner::Memory(storage),
+                health,
+                cache_controller,
+            }
+        }
+        StorageBackend::Postgres => {
+            let postgres = postgres_config(config, config.storage.postgres.migrate_on_start)?;
+            let storage = Arc::new(
+                PostgresStorage::connect(postgres)
+                    .await
+                    .context("failed to connect PostgreSQL storage")?,
+            );
+            let health: Arc<dyn HealthCheck> = storage.clone();
+            let (services, cache_controller) = services(
+                &storage,
+                identifier_service,
+                limits.clone(),
+                budgets,
+                cache_policy,
+            )?;
+            StorageAssembly {
+                services,
+                storage: StorageOwner::Postgres(storage),
+                health,
+                cache_controller,
+            }
+        }
+        StorageBackend::MySql | StorageBackend::Sqlite => {
+            let migrate_on_start = match config.storage.backend {
+                StorageBackend::MySql => config.storage.mysql.migrate_on_start,
+                StorageBackend::Sqlite => config.storage.sqlite.migrate_on_start,
+                StorageBackend::Memory | StorageBackend::Postgres => false,
+            };
+            let portable = portable_sql_config(config, migrate_on_start)?;
+            let storage = Arc::new(
+                PortableSqlStorage::connect(portable)
+                    .await
+                    .context("failed to connect portable SQL storage")?,
+            );
+            let health: Arc<dyn HealthCheck> = storage.clone();
+            let (services, cache_controller) = services(
+                &storage,
+                identifier_service,
+                limits.clone(),
+                budgets,
+                cache_policy,
+            )?;
+            StorageAssembly {
+                services,
+                storage: StorageOwner::PortableSql(storage),
+                health,
+                cache_controller,
+            }
+        }
+    };
+    Ok(assembly)
 }
 
 fn service_policy(config: &ServerConfig) -> Result<(ServiceBudgets, ServiceCachePolicy)> {
@@ -897,6 +985,11 @@ async fn capacity(
                 Some(storage.primary_pool().size()),
                 Some(storage.primary_pool().num_idle()),
             ),
+            StorageOwner::PortableSql(storage) => (
+                Some(storage.available_work_permits()),
+                Some(storage.primary_pool().size()),
+                Some(storage.primary_pool().num_idle()),
+            ),
         };
     Json(CapacityResponse {
         runtime_tasks: tokio::runtime::Handle::current()
@@ -1225,6 +1318,12 @@ async fn shutdown_resources(
         StorageOwner::Postgres(storage) => {
             let storage = Arc::try_unwrap(storage)
                 .map_err(|_| anyhow::anyhow!("PostgreSQL references remain after drain"))?;
+            storage.close().await;
+            Ok(())
+        }
+        StorageOwner::PortableSql(storage) => {
+            let storage = Arc::try_unwrap(storage)
+                .map_err(|_| anyhow::anyhow!("portable SQL references remain after drain"))?;
             storage.close().await;
             Ok(())
         }

@@ -105,6 +105,9 @@ impl Default for TlsConfig {
 pub(crate) enum StorageBackend {
     Memory,
     Postgres,
+    #[serde(rename = "mysql")]
+    MySql,
+    Sqlite,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -115,6 +118,10 @@ pub(crate) struct StorageConfig {
     pub(crate) memory: MemoryConfig,
     #[serde(default)]
     pub(crate) postgres: PostgresConfig,
+    #[serde(default = "default_mysql_config")]
+    pub(crate) mysql: PortableDatabaseConfig,
+    #[serde(default = "default_sqlite_config")]
+    pub(crate) sqlite: PortableDatabaseConfig,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -169,6 +176,24 @@ impl Default for PostgresConfig {
             migrate_on_start: false,
         }
     }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct PortableDatabaseConfig {
+    pub(crate) url_env: String,
+    #[serde(default = "default_max_connections")]
+    pub(crate) max_connections: u32,
+    #[serde(default)]
+    pub(crate) min_connections: u32,
+    #[serde(default = "default_database_timeout_ms")]
+    pub(crate) acquire_timeout_ms: u64,
+    #[serde(default = "default_database_timeout_ms")]
+    pub(crate) statement_timeout_ms: u64,
+    #[serde(default = "default_tuple_mutations")]
+    pub(crate) max_tuple_mutations: u32,
+    #[serde(default)]
+    pub(crate) migrate_on_start: bool,
 }
 
 /// Finite in-process cache policy.
@@ -1029,6 +1054,8 @@ impl ServerConfig {
         {
             bail!("PostgreSQL tuple mutation limit must be between 1 and 5000");
         }
+        validate_portable_database(&self.storage.mysql, "MySQL", false)?;
+        validate_portable_database(&self.storage.sqlite, "SQLite", true)?;
         Ok(())
     }
 
@@ -1162,19 +1189,22 @@ impl ServerConfig {
     }
 
     fn validate_database_concurrency(&self) -> Result<()> {
-        if self.storage.backend != StorageBackend::Postgres {
+        let pool = match self.storage.backend {
+            StorageBackend::Memory => return Ok(()),
+            StorageBackend::Postgres => self.storage.postgres.max_connections,
+            StorageBackend::MySql => self.storage.mysql.max_connections,
+            StorageBackend::Sqlite => self.storage.sqlite.max_connections,
+        };
+        if pool == 1 {
             return Ok(());
         }
-        let pool = self.storage.postgres.max_connections;
         let request_reads = pool.saturating_sub(POSTGRES_CONTROL_PLANE_HEADROOM).max(1);
         if self.evaluator.concurrent_reads > request_reads {
-            bail!(
-                "evaluator concurrent reads must leave PostgreSQL capacity for control-plane work"
-            );
+            bail!("evaluator concurrent reads must leave SQL capacity for control-plane work");
         }
         if self.evaluator.batch_concurrency > pool || self.list_objects.residual_concurrency > pool
         {
-            bail!("batch and ListObjects concurrency cannot exceed the PostgreSQL work limit");
+            bail!("batch and ListObjects concurrency cannot exceed the SQL work limit");
         }
         let total_work = pool.saturating_mul(POSTGRES_IN_FLIGHT_MULTIPLIER);
         if self
@@ -1188,12 +1218,12 @@ impl ServerConfig {
                 .saturating_mul(self.evaluator.concurrent_reads)
                 > total_work
         {
-            bail!("nested evaluator concurrency exceeds the bounded PostgreSQL work envelope");
+            bail!("nested evaluator concurrency exceeds the bounded SQL work envelope");
         }
         let transport = u32::try_from(self.transport.maximum_concurrency)
-            .context("transport concurrency exceeds the PostgreSQL arithmetic range")?;
+            .context("transport concurrency exceeds the SQL arithmetic range")?;
         if transport > total_work {
-            bail!("transport concurrency cannot exceed four times the PostgreSQL work limit");
+            bail!("transport concurrency cannot exceed four times the SQL work limit");
         }
         Ok(())
     }
@@ -1224,6 +1254,37 @@ impl ServerConfig {
         }
         Ok(())
     }
+}
+
+fn validate_portable_database(
+    config: &PortableDatabaseConfig,
+    label: &'static str,
+    require_single_connection: bool,
+) -> Result<()> {
+    validate_environment_name(&config.url_env)?;
+    if config.max_connections == 0
+        || config.max_connections > 65_536
+        || config.min_connections > config.max_connections
+    {
+        bail!("{label} pool limits are invalid");
+    }
+    if require_single_connection && config.max_connections != 1 {
+        bail!("SQLite maxConnections must be exactly 1 to serialize writes");
+    }
+    bounded_duration(
+        config.acquire_timeout_ms,
+        MAXIMUM_REQUEST_TIMEOUT,
+        &format!("{label} acquire timeout"),
+    )?;
+    bounded_duration(
+        config.statement_timeout_ms,
+        MAXIMUM_REQUEST_TIMEOUT,
+        &format!("{label} statement timeout"),
+    )?;
+    if !(1..=5_000).contains(&config.max_tuple_mutations) {
+        bail!("{label} tuple mutation limit must be between 1 and 5000");
+    }
+    Ok(())
 }
 
 fn parse(contents: &[u8]) -> Result<RawServerConfig> {
@@ -1301,6 +1362,30 @@ const fn default_tls_reload_interval_seconds() -> u64 {
 
 fn default_primary_url_env() -> String {
     "OPENFGA_DATABASE_URL".to_owned()
+}
+
+fn default_mysql_config() -> PortableDatabaseConfig {
+    PortableDatabaseConfig {
+        url_env: "OPENFGA_MYSQL_URL".to_owned(),
+        max_connections: default_max_connections(),
+        min_connections: 0,
+        acquire_timeout_ms: default_database_timeout_ms(),
+        statement_timeout_ms: default_database_timeout_ms(),
+        max_tuple_mutations: default_tuple_mutations(),
+        migrate_on_start: false,
+    }
+}
+
+fn default_sqlite_config() -> PortableDatabaseConfig {
+    PortableDatabaseConfig {
+        url_env: "OPENFGA_SQLITE_URL".to_owned(),
+        max_connections: 1,
+        min_connections: 0,
+        acquire_timeout_ms: default_database_timeout_ms(),
+        statement_timeout_ms: default_database_timeout_ms(),
+        max_tuple_mutations: default_tuple_mutations(),
+        migrate_on_start: false,
+    }
 }
 
 const fn default_max_connections() -> u32 {
@@ -1585,6 +1670,18 @@ evaluator: {}
         let config = ServerConfig::from(parse(VALID.as_bytes())?);
         config.validate()?;
         assert_eq!(config.profile, Profile::Development);
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_accept_documented_mysql_backend_spelling() -> anyhow::Result<()> {
+        let mysql = VALID.replace("backend: memory", "backend: mysql");
+        let config = ServerConfig::from(parse(mysql.as_bytes())?);
+        assert_eq!(config.storage.backend, super::StorageBackend::MySql);
+        config.validate()?;
+
+        let derived_spelling = VALID.replace("backend: memory", "backend: mySql");
+        assert!(parse(derived_spelling.as_bytes()).is_err());
         Ok(())
     }
 

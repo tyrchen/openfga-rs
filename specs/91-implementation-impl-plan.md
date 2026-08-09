@@ -1,10 +1,13 @@
 # Engineering implementation plan
 
-Status: Active · Depends on: all preceding specs
+Status: OpenFGA v1 GA complete 2026-08-08 · Phase 6 planned · Depends on: all preceding specs
 
 ## Readiness assessment
 
-The architectural contracts, upstream pin, research evidence, and release gates are ready. Phase 0 resolved the exact API/proto generation, OpenFGA-compatible CEL implementation direction, and conservative ListObjects baseline. Phase 1 is the active implementation frontier; the Phase 0 crate skeletons contain no provisional public domain API.
+Phases 0–5 are complete: the exact protocol/CEL baseline, semantic engines, secure durable API,
+enumeration, consistency/scale controls, PostgreSQL/MySQL/SQLite matrix, upstream conversion, and GA
+release evidence are implemented and independently reviewed. Phase 6 remains an optional post-GA
+frontier; no Phase 6 capability is implied by the OpenFGA v1 compatibility claim.
 
 Before each implementation phase, re-check dependency versions and security posture; research versions are dated evidence. Every phase is an end-to-end, independently reviewed change set with no incomplete code or temporary fallback.
 
@@ -59,7 +62,7 @@ Verification: artifact regeneration diff, spike test commands, harness smoke, do
 
 Completion evidence: the accepted [protocol](../docs/research/spike-openfga-proto-generation.md), [CEL](../docs/research/spike-cel-openfga-conformance.md), and [ListObjects](../docs/research/spike-listobjects-algorithm.md) spikes; the passing [differential report](../docs/research/phase0-differential-report.md); and finalized protocol/algorithm entries in `99-key-decisions.md`.
 
-## Phase 1 — Semantic spine and local Check (M1, 8–12 weeks)
+## Phase 1 — Semantic spine and local Check (M1, complete 2026-08-06)
 
 | # | Task | Spec | Effort |
 | --- | --- | --- | ---: |
@@ -74,7 +77,7 @@ Exit gate: upstream model/condition/Check outcomes match; generated/reference pr
 
 Verification: focused unit/property/fuzz suites during development, then full Rust gates, vendored Check differential suite, memory storage contract/fault suite, and relevant security limits.
 
-## Phase 2 — Durable API, PostgreSQL, and secure runtime (M2, 10–14 weeks)
+## Phase 2 — Durable API, PostgreSQL, and secure runtime (M2, complete 2026-08-06)
 
 | # | Task | Spec | Effort |
 | --- | --- | --- | ---: |
@@ -89,7 +92,7 @@ Exit gate: official SDK/API differential suite passes for delivered endpoints; P
 
 Verification: full Rust gates; PostgreSQL contract/fault/migration suites; gRPC/HTTP goldens and SDK matrix; OIDC/JWKS/IDOR/limit tests; dependency audit/deny for new dependencies.
 
-## Phase 3 — Enumeration and Expand (M3, 8–12 weeks)
+## Phase 3 — Enumeration and Expand (M3, complete 2026-08-06)
 
 | # | Task | Spec | Effort |
 | --- | --- | --- | ---: |
@@ -103,7 +106,7 @@ Exit gate: no false negatives in bounded generated universes; every emitted obje
 
 Verification: full Rust gates, upstream enumeration differential suite, set properties, stream cancellation/fault suite, and PostgreSQL query plans/load samples.
 
-## Phase 4 — Cache consistency and production scale (M4, 6–9 weeks)
+## Phase 4 — Cache consistency and production scale (M4, complete 2026-08-08)
 
 | # | Task | Spec | Effort |
 | --- | --- | --- | ---: |
@@ -117,7 +120,7 @@ Exit gate: no stale result under higher consistency; cache gaps/failure are cons
 
 Verification: full Rust gates, concurrent write/check and invalidation model/fault suites, actor lifecycle tests, load/soak, and dependency audit/deny for cache additions.
 
-## Phase 5 — Backend matrix and GA hardening (M5, 8–12 weeks)
+## Phase 5 — Backend matrix and GA hardening (M5, complete 2026-08-08)
 
 | # | Task | Spec | Effort |
 | --- | --- | --- | ---: |

@@ -1,6 +1,6 @@
 # Key decisions
 
-Status: Accepted for implementation planning · Decision date: 2026-08-05
+Status: Accepted through GA hardening · Last decision date: 2026-08-08
 
 Each decision may be revisited only when its trigger occurs and the replacement preserves the PRD and verification gates.
 
@@ -28,6 +28,9 @@ Each decision may be revisited only when its trigger occurs and the replacement 
 | KD-020 | Version, authenticate, scope, and bound continuation tokens to prevent tamper, replay, and parser abuse. | Plain serialized cursor; backend-native opaque token. | [domain](10-domain-model-design.md), [transport](20-api-transport-design.md), [security](70-security-design.md) | Exact upstream token compatibility documents an exception. |
 | KD-021 | Pin OpenFGA API `f153694b…` and checksum-verified `protoc 31.1`; check in generated Tonic/Prost artifacts and require byte-for-byte regeneration. | Floating API source; host protoc; runtime reflection only. | [transport](20-api-transport-design.md), [protocol spike](../docs/research/spike-openfga-proto-generation.md) | Vendored OpenFGA baseline or protocol toolchain upgrade. |
 | KD-022 | Use conservative reverse traversal plus residual oracle Check as the ListObjects baseline; keep the faster worker pipeline behind later shadow/graduation controls. | Pipeline as initial authority; object scan plus Check. | [list](15-list-queries-design.md), [algorithm spike](../docs/research/spike-listobjects-algorithm.md) | Pipeline reaches zero mismatches across the complete graduation matrix. |
+| KD-023 | Implement MySQL and SQLite behind the same capability contracts with dialect-specific migrations/locking/upsert/error seams; serialize SQLite through exactly one connection. | Duplicate backend crates; SQLite multi-connection retries; PostgreSQL-only GA. | [storage](13-storage-design.md), [compatibility](../docs/compatibility.md) | A backend cannot preserve the shared contract or a proven native implementation is materially safer/simpler. |
+| KD-024 | Convert upstream data only from the exact pinned OpenFGA SQLite migration version into an empty destination; preserve semantic identities but reset changelog history as cutover writes. | In-place conversion; copy physical changelog cursors; best-effort multi-version importer. | [runtime](21-runtime-operations-design.md), [migration runbook](../docs/operations/migration-runbook.md) | Upstream baseline changes or another source backend/version is explicitly added and tested. |
+| KD-025 | Release checksummed per-platform archives with CycloneDX/SPDX SBOMs and GitHub OIDC/Sigstore provenance after advisory, license, secret, backend and compatibility gates. | Unsigned binary attachment; source-only SBOM; mutable unpinned scanners/actions. | [security](70-security-design.md), [Phase 5 evidence](../docs/research/phase5-ga-release-evidence.md) | Release platform changes while preserving or strengthening provenance and SBOM verification. |
 
 ## Rejected alternatives
 

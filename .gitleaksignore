@@ -1,0 +1,7 @@
+# Synthetic signed JWT used only by the OIDC verifier unit test.
+908c81a7bb3716a793023f469741cce0db0339b5:crates/openfga-auth/src/oidc.rs:jwt:858
+
+# Generated proto input manifest: these are file paths adjacent to SHA-256 digests.
+1af1e2c874e3dcfcc887ecadaf0bc74889666593:crates/openfga-proto/proto.lock.json:generic-api-key:9
+1af1e2c874e3dcfcc887ecadaf0bc74889666593:crates/openfga-proto/proto.lock.json:generic-api-key:10
+1af1e2c874e3dcfcc887ecadaf0bc74889666593:crates/openfga-proto/proto.lock.json:generic-api-key:12

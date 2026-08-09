@@ -17,6 +17,7 @@ pub use api::OpenFgaApi;
 pub use config::{
     OpenFgaServices, OpenFgaServicesBuilder, TransportConfig, TransportConfigBuilder,
 };
+pub use convert::{assertion_from_wire, model_definition_from_wire, relationship_tuple_from_wire};
 pub use error::ApiError;
 pub use grpc::{
     AuthenticatedGrpcService, GrpcAuthenticationInterceptor, GrpcListObjectsStream, grpc_service,

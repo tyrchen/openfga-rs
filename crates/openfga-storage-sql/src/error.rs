@@ -1,4 +1,4 @@
-//! PostgreSQL-to-storage error classification.
+//! SQLx-to-storage error classification with redacted backend sources.
 
 use std::borrow::Cow;
 
@@ -15,11 +15,14 @@ pub(crate) fn map_sqlx(error: sqlx::Error, code: &'static str) -> StorageError {
         | sqlx::Error::ColumnDecode { .. }
         | sqlx::Error::ColumnNotFound(_) => StorageErrorKind::Integrity,
         sqlx::Error::Database(database) => match database.code().as_deref() {
-            Some("23505") => StorageErrorKind::AlreadyExists,
-            Some("23503") => StorageErrorKind::NotFound,
-            Some("23502" | "23514" | "22P02") => StorageErrorKind::Integrity,
-            Some("40001" | "40P01") => StorageErrorKind::Conflict,
-            Some("57014") => StorageErrorKind::Timeout,
+            Some("23505" | "1062" | "1555" | "2067") => StorageErrorKind::AlreadyExists,
+            Some("23503" | "1452" | "787") => StorageErrorKind::NotFound,
+            Some("23502" | "23514" | "22P02" | "1048" | "1299" | "275" | "3819") => {
+                StorageErrorKind::Integrity
+            }
+            Some("40001" | "40P01" | "1213" | "5" | "6") => StorageErrorKind::Conflict,
+            Some("57014" | "1205") => StorageErrorKind::Timeout,
+            Some("2002" | "2003") => StorageErrorKind::Unavailable,
             Some(code) if code.starts_with("08") => StorageErrorKind::Unavailable,
             _ => StorageErrorKind::Internal,
         },
@@ -57,21 +60,18 @@ pub(crate) fn map_sqlx(error: sqlx::Error, code: &'static str) -> StorageError {
             storage.error_code = code,
             storage.sqlx_error_kind = sqlx_error_kind,
             storage.database_code = database_code.as_deref().unwrap_or("none"),
-            "PostgreSQL operation failed",
+            "SQL storage operation failed",
         );
     }
     StorageError::with_source(kind, code, error)
 }
 
 pub(crate) fn cancelled() -> StorageError {
-    StorageError::new(StorageErrorKind::Cancelled, "postgres_operation_cancelled")
+    StorageError::new(StorageErrorKind::Cancelled, "sql_operation_cancelled")
 }
 
 pub(crate) fn timed_out() -> StorageError {
-    StorageError::new(
-        StorageErrorKind::Timeout,
-        "postgres_operation_deadline_elapsed",
-    )
+    StorageError::new(StorageErrorKind::Timeout, "sql_operation_deadline_elapsed")
 }
 
 #[cfg(test)]

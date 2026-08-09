@@ -1,8 +1,10 @@
-# PostgreSQL backup and restore runbook
+# SQL backup and restore runbook
 
 This runbook defines logical backup, point-in-time recovery expectations, verification, and restore
-for the PostgreSQL backend. Set service-specific recovery point and recovery time objectives before
-production use; the commands below do not choose them for you.
+for the PostgreSQL, MySQL, and SQLite backends. Set service-specific recovery point and recovery
+time objectives before production use; the commands below do not choose them for you.
+
+## PostgreSQL
 
 PostgreSQL documents that `pg_dump` creates a consistent single-database export while traffic is
 concurrent, and that custom archives are portable and inspectable with `pg_restore`. For regular
@@ -130,3 +132,57 @@ in recovery or at an unverified replica.
 - Run isolated restore drills on a fixed cadence and before schema migrations.
 - Record backup duration, restore duration, data size, recovery point, tool versions, and verifier
   results without recording DSNs, tokens, tuple contents, object IDs, or subject IDs.
+
+## MySQL
+
+Use MySQL 8.4 client tools matching the advertised server family. Store credentials in a protected
+option file or the platform secret mechanism, not `--password` arguments. A consistent InnoDB
+logical dump uses one transaction and must include `_sqlx_migrations`,
+`openfga_schema_metadata`, and `openfga_change_allocator`:
+
+```sh
+mysqldump \
+  --defaults-extra-file=/run/openfga/mysql-backup.cnf \
+  --single-transaction \
+  --quick \
+  --routines=false \
+  --set-gtid-purged=OFF \
+  openfga > openfga.mysql.sql
+```
+
+Require exit status zero, checksum and encrypt the result, and restore it only into a new empty
+database:
+
+```sh
+mysql \
+  --defaults-extra-file=/run/openfga/mysql-restore.cnf \
+  openfga_restore < openfga.mysql.sql
+```
+
+Run `make migrate-status` with a restore-specific YAML, then the same count, selected-read,
+changelog, allow/deny Check, and reversible-write probes used for PostgreSQL. For lower RPO, use the
+provider's physical snapshot/binlog PITR procedure, restore to a new instance, and apply the same
+verification before promotion. Never replay a logical dump over the active database.
+
+## SQLite
+
+SQLite is a single-process embedded profile. The safest routine backup uses the SQLite online
+backup API from an operator-controlled tool or `VACUUM INTO` while the server is running; a raw file
+copy is allowed only after the server is fully stopped and all WAL/SHM state is included or
+checkpointed. Keep the parent directory private and verify free disk space first.
+
+For a stopped-server copy:
+
+```sh
+sqlite3 /var/lib/openfga/openfga.db 'PRAGMA wal_checkpoint(TRUNCATE); PRAGMA integrity_check;'
+cp -p /var/lib/openfga/openfga.db /secure-backup/openfga.db
+```
+
+Require `integrity_check` to return `ok`, checksum/encrypt the backup, then copy it to a new path.
+Point a restore-specific configuration at `sqlite:///new/path/openfga.db?mode=rw`, run
+`make migrate-status`, start an isolated server, and run store/model/tuple/changelog and allow/deny
+checks before promotion. Never overwrite the active file during restore.
+
+`make sqlite-storage` includes an automated file backup/restore test and verifies that a deliberately
+newer schema is rejected by the older binary. This is regression evidence, not a substitute for a
+drill against the deployment's filesystem, encryption, retention, and RTO controls.

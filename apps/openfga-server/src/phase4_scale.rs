@@ -1344,7 +1344,10 @@ fn reference_semantic(
             if objects.is_empty() {
                 bail!("ListObjects benchmark returned an empty allow set");
             }
-            if objects.windows(2).any(|window| window[0] == window[1]) {
+            if objects
+                .windows(2)
+                .any(|window| matches!(window, [left, right] if left == right))
+            {
                 bail!("ListObjects benchmark returned duplicate objects");
             }
             let expected_fixture = match relation {
