@@ -9,6 +9,27 @@ storage:
   backend: memory
   memory:
     actorCapacity: 256
+  dynamodb:
+    tableName: openfga
+    region: us-west-2
+    maximumInFlight: 64
+    attemptTimeoutMs: 2000
+    operationTimeoutMs: 5000
+    maximumAttempts: 3
+    maximumConflictRetries: 5
+    maximumTupleMutations: 49
+    garbageCollectionBatchSize: 16
+    garbageCollectionIntervalMs: 30000
+    garbageCollectionGracePeriodMs: 300000
+    assertionRollbackRetentionMs: 300000
+    garbageCollectionMaximumWorkLagMs: 900000
+    garbageCollectionShutdownTimeoutMs: 5000
+    pointInTimeRecovery: true
+    deletionProtection: false
+    tags:
+      application: openfga
+      managed-by: openfga-rs
+    provisionOnStart: false
   postgres:
     primaryUrlEnv: OPENFGA_DATABASE_URL
     maxConnections: 16

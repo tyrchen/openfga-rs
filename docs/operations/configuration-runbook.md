@@ -22,8 +22,8 @@ release gates and operational controls.
   certificate/key pair atomically for both listeners; malformed replacements retain the active
   identity. Other referenced secrets, authorization policy, and OIDC bootstrap state require a
   coordinated restart.
-- `storage.backend: memory` is volatile. Use PostgreSQL or MySQL for distributed deployment, or
-  SQLite for an embedded single-process deployment, when data must survive restart.
+- `storage.backend: memory` is volatile. Use an advertised durable backend when data must survive
+  restart; DynamoDB remains preview-only until its real-AWS graduation evidence is complete.
 - Every SQL backend starts only against the exact schema version embedded in the binary unless
   `migrateOnStart` is explicitly enabled.
 
@@ -181,6 +181,37 @@ process serializes mutations and avoids lock-upgrade races; do not share its dat
 server processes. Use a `sqlite://...?...mode=rwc` URL and protect the database, WAL/SHM files and
 parent directory with service-account permissions.
 
+```yaml
+storage:
+  backend: dynamodb
+  dynamodb:
+    tableName: openfga-production
+    region: us-west-2
+    maximumInFlight: 64
+    attemptTimeoutMs: 2000
+    operationTimeoutMs: 5000
+    maximumAttempts: 3
+    maximumConflictRetries: 5
+    maximumTupleMutations: 49
+    garbageCollectionBatchSize: 16
+    garbageCollectionIntervalMs: 30000
+    garbageCollectionGracePeriodMs: 300000
+    assertionRollbackRetentionMs: 300000
+    garbageCollectionMaximumWorkLagMs: 900000
+    garbageCollectionShutdownTimeoutMs: 5000
+    kmsKeyIdentifier: null # omit for the DynamoDB AWS-owned key
+    pointInTimeRecovery: true
+    deletionProtection: false
+    tags:
+      application: openfga
+      managed-by: openfga-rs
+    provisionOnStart: false
+```
+
+DynamoDB credentials come only from the AWS SDK workload-identity chain. Production configuration
+cannot set a custom endpoint. See the [DynamoDB runbook](dynamodb-runbook.md) for provisioning,
+least-privilege IAM, KMS/PITR, restore, and evidence requirements.
+
 Omit `telemetry.otlpEndpoint` to disable trace and metric export. When configured, it must identify
 an OTLP gRPC collector; route the collector's metric pipeline to the Prometheus datasource used by
 the checked-in dashboard and alerts.
@@ -214,6 +245,7 @@ configuration, logs, tickets, or shell history.
 | PostgreSQL | `maxConnections` is 1–65,536; `minConnections` cannot exceed it; acquisition and statement timeouts are 1 ms–5 minutes; tuple mutations are 1–5,000 |
 | MySQL | Same pool/timeout/mutation bounds as PostgreSQL; no replica URL; evaluator and enumeration concurrency must leave control-plane headroom |
 | SQLite | `maxConnections` must equal 1; `minConnections` is 0 or 1; the same timeout and mutation bounds apply |
+| DynamoDB | `maximumInFlight`, attempts, conflict retries and cleanup batch are nonzero; attempt timeout is no greater than operation timeout; tuple mutations are 1–49; custom endpoints require development and a loopback IP literal |
 | Model cache | source/compiled byte weights are positive and each at most 512 MiB; immutable TTL is at most 30 days; the mutable latest alias is at most 5 minutes and is bypassed by higher-consistency reads |
 | Mutable caches | decision/tuple byte weights are positive and each at most 512 MiB; TTL is at most 24 hours; tuple entries hold at most 100,000 rows; higher-consistency reads bypass and do not populate either cache |
 | Aggregate cache | configured source, compiled, decision, tuple, and estimated latest-alias capacity is at most 1 GiB per process |

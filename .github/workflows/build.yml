@@ -208,6 +208,23 @@ jobs:
       - name: Verify SQLite contracts, restore drill, and API compatibility
         run: make sqlite-storage phase5-sqlite-compatibility
 
+  dynamodb-rustack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: recursive
+      - name: Install pinned Rust
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2.9.2
+      - name: Verify DynamoDB storage and full API contracts with pinned Rustack
+        run: |
+          make dynamodb-storage-rustack
+          make dynamodb-api-rustack
+
   ga-release-gate:
     if: startsWith(github.ref, 'refs/tags/')
     needs: [rust, phase0-compatibility, postgres-storage, mysql-storage, sqlite-storage]

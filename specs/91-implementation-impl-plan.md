@@ -1,14 +1,15 @@
 # Engineering implementation plan
 
-Status: OpenFGA v1 GA and Phase 6 complete 2026-08-08 · Depends on: all preceding specs
+Status: OpenFGA v1 GA and Phase 6 complete 2026-08-08; Phases 7–8 planned · Depends on: all preceding specs
 
 ## Readiness assessment
 
-Phases 0–5 are complete: the exact protocol/CEL baseline, semantic engines, secure durable API,
-enumeration, consistency/scale controls, PostgreSQL/MySQL/SQLite matrix, upstream conversion, and GA
-release evidence are implemented and independently reviewed. Phase 6 now adds a separately pinned
-AuthZEN surface and one graduated Check-coalescing strategy without changing the OpenFGA v1 GA
-compatibility baseline.
+Phases 0–6 are complete: the exact protocol/CEL baseline, semantic engines, secure durable API,
+enumeration, consistency/scale controls, PostgreSQL/MySQL/SQLite matrix, upstream conversion, GA
+release evidence, separately pinned AuthZEN surface, and one graduated Check-coalescing strategy
+are implemented and independently reviewed. The source-pinned
+[`DynamoDB storage study`](../docs/research/study-dynamodb-storage.md) closes the design assumptions
+for Phases 7–8; the backend remains unadvertised until Phase 8 evidence is complete.
 
 Before each implementation phase, re-check dependency versions and security posture; research versions are dated evidence. Every phase is an end-to-end, independently reviewed change set with no incomplete code or temporary fallback.
 
@@ -18,10 +19,11 @@ Before each implementation phase, re-check dependency versions and security post
 - Stakeholders see the complete API in M2, but transport adapters land after service/domain errors so HTTP and gRPC cannot dictate engine semantics.
 - Stakeholders see caching as scale work in M4, but tuple/changelog atomicity lands in M1/M2 because retrofitting a consistency signal after caches exist is unsafe.
 - ListObjects is a user-visible API, yet it follows the Check oracle: residual candidate verification cannot be correct without that permanent reference implementation.
+- DynamoDB looks like one backend feature, but Phase 7 must land shared codec/key/transaction contracts before runtime wiring, and Phase 8 must run real-AWS operational/release evidence after local correctness is stable. Combining them would make emulator success indistinguishable from a production support claim.
 
 ## Effort and build graph
 
-One experienced engineer is estimated at 43–64 weeks through GA (M0–M5), including tests, docs, review, and 25% collaboration overhead. Two engineers can overlap transport/backends with conformance work after Phase 1, yielding an estimated 28–40 weeks; semantic dependencies below do not parallelize safely.
+One experienced engineer is estimated at 43–64 weeks through the existing GA (M0–M5), plus 8–12 weeks for DynamoDB preview and production graduation (M7–M8), including tests, docs, review, and 25% collaboration overhead. Two engineers can overlap real-AWS infrastructure/evidence with local backend work after Phase 7's contracts stabilize, but transaction, cursor, and manifest semantics do not parallelize safely.
 
 ```text
 Phase 0: protocol/CEL/list proofs
@@ -42,9 +44,12 @@ Phase 4: changelog cache controller + consistency + scale
                                 ▼
 Phase 5: MySQL/SQLite + migration + GA evidence
                                 │
-                   ┌────────────┴────────────┐
-                   ▼                         ▼
-          Phase 6a AuthZEN         Phase 6b proven fast paths
+             ┌──────────────────┼──────────────────────┐
+             ▼                  ▼                      ▼
+    Phase 6a AuthZEN   Phase 6b proven fast paths   Phase 7 DynamoDB preview
+                                                         │
+                                                         ▼
+                                             Phase 8 production graduation
 ```
 
 ## Phase 0 — De-risk compatibility foundations (M0, complete 2026-08-05)
@@ -147,6 +152,36 @@ Verification: all Rust gates; every backend contract/API/differential/fault/migr
 Exit gate: AuthZEN evidence names its pin. Each optimization has an independent zero-mismatch dossier, measurable win, observability, and instant rollback. Phase 6 is not required for OpenFGA v1 GA correctness.
 
 Completion evidence: the [Phase 6 AuthZEN and Check-coalescing report](../docs/research/phase6-authzen-coalescing-report.md), `make authzen-conformance`, `make authzen-differential`, real HTTP/gRPC transport tests, coalescing shadow/fault/cancellation/budget/mutation-race tests, and Criterion evidence showing a 23.0% reduction for 32 simultaneous identical cold checks while retaining enabled-mode oracle sampling.
+
+## Phase 7 — DynamoDB backend preview (M7, estimated 5–7 weeks)
+
+| # | Task | Spec/research | Effort |
+| --- | --- | --- | ---: |
+| 7.1 | Recheck current AWS SDK/Rustack versions and security posture; extract the byte-identical v1 persistence codec into `openfga-storage`; add the isolated `openfga-storage-dynamodb` crate with explicit Tokio/rustls-aws-lc features. | 17 § 2/7, storage study | 4–6 days |
+| 7.2 | Implement validated config, versioned binary key/shard codec, item families, exact size accounting, and cross-shard cursor/query planners with exhaustive property tests. | 17 § 2–5 | 1–1.5 weeks |
+| 7.3 | Implement all tuple reads plus conditional forward/reverse/changelog/HEAD transactions, idempotent unknown-result retry, conflict reclassification, typed errors, cancellation, metrics, and deterministic fault tests. | 13, 16, 17 § 4–6 | 1.5–2 weeks |
+| 7.4 | Implement store lifecycle, model staging/commit chunks, assertion generation replacement, schema metadata, health, and initial provision/status commands with state-machine fault tests. | 17 § 7–9 | 1–1.5 weeks |
+| 7.5 | Add YAML/runtime composition and Makefile-owned pinned Rustack lifecycle; run shared storage, official-SDK full API, differential, pagination, cancellation, and two-process invalidation preview gates. | 17 § 8–10, 21, 61, 72 | 1–1.5 weeks |
+| 7.6 | Run the isolated real-AWS storage contract in a dedicated account/Region, inspect the complete diff, and perform an independent review against specs/research; fix every valid finding. | 17 § 10, 70–72 | 4–6 days |
+
+Exit gate: every storage capability and full API path passes locally on pinned Rustack; deterministic fault/property suites cover every planner/state transition; the isolated real-AWS storage contract proves base-table strong reads and atomic transactions; 49 mutations succeed and 50 reject before dispatch; no DynamoDB support claim appears in GA compatibility/release artifacts.
+
+Verification: focused crate tests during development; then full Rust build/test/nightly-fmt/clippy-pedantic gates, `cargo audit`, `cargo deny check`, codec regression fixtures for SQL, `make dynamodb-storage-rustack`, the explicit opt-in real-AWS storage target, API differential, cancellation, and two-process invalidation tests. Record any unavailable AWS operational evidence as an M8 gate, never as a waived M7 assertion.
+
+## Phase 8 — DynamoDB production graduation (M8, estimated 3–5 weeks)
+
+| # | Task | Spec | Effort |
+| --- | --- | --- | ---: |
+| 8.1 | Complete real-AWS concurrency/failure matrix: HEAD races, tuple conflicts, rollback, identical-token timeout recovery, service size/page limits, throttling/retry/deadline/cancellation, interrupted durable garbage collection, corrupt data, and readiness errors. | 17 § 6/7/10, 72 | 1–1.5 weeks |
+| 8.2 | Run the complete OpenFGA/official-SDK/differential suite through two DynamoDB-backed server replicas, including higher consistency, packed-changelog cache invalidation, management, Check/BatchCheck, enumeration, and streaming disconnect cleanup. | 16, 17 § 10, 20, 72 | 4–6 days |
+| 8.3 | Land least-privilege runtime/provisioning IAM examples and DynamoDB configuration, capacity, failure, migration, backup/restore runbooks; prove KMS, PITR restore-to-new-table, schema validation, and denied Scan/control-plane actions. | 17 § 8–10, 21, 70 | 4–6 days |
+| 8.4 | Execute the declared real-AWS p50/p95/p99, RCU/WCU, 49-mutation, hot-store, 1/10/100-client, 30-minute soak, overload, drain, and cost evidence; tune only within fixed semantic/schema contracts. | 17 § 11, 71 | 1–1.5 weeks |
+| 8.5 | Update compatibility/dependency/release docs, normative traceability, dashboards/alerts, SBOM/provenance inputs, and backend matrix; run the exact release artifact gate. | 60–72 | 3–5 days |
+| 8.6 | Perform independent final spec/code/security/operations review and fix every valid finding before changing the backend status from preview to supported. | all DynamoDB-linked specs | 3–5 days |
+
+Exit gate: real AWS proves every [`17-dynamodb-storage-design.md` acceptance criterion](17-dynamodb-storage-design.md#13-acceptance-criteria); there are zero unexplained compatibility or authorization mismatches; IAM/KMS/PITR/restore/load/soak/cost evidence is checked in; release artifacts and compatibility matrix advertise the exact Region/topology/limit contract.
+
+Verification: full Rust and dependency gates; Rustack regression; complete real-AWS storage/fault/security/restore/performance suite; full API/differential/official-client matrix; two-process cache consistency; release artifact/SBOM/provenance gate; documentation/link/traceability checks.
 
 ## Per-phase completion discipline
 

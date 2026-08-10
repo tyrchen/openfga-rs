@@ -10,7 +10,7 @@ Correctness, cancellation, and finite resource use are prerequisites. Performanc
 
 Benchmarks include direct exact checks, userset recursion, TTU, wide union, intersection/difference with early decisive operands, conditioned tuples, contextual tuples, batch checks with repeated subproblems, ListObjects reverse/residual ratios, ListUsers set algebra, model compile/load, tuple write/changelog, and cache cold/warm/invalidated states.
 
-Datasets span shallow/wide/deep/recursive models; sparse and dense tuples; hot/cold stores; 1/10/100 concurrent clients; and PostgreSQL network latency. Each result records CPU/memory, Rust/tool versions, machine, backend/schema, pool and evaluator limits, model/tuple generator seed, and p50/p95/p99.
+Datasets span shallow/wide/deep/recursive models; sparse and dense tuples; hot/cold stores; 1/10/100 concurrent clients; PostgreSQL network latency; and DynamoDB exact/forward/reverse/sharded-page/49-mutation workloads. Each result records CPU/memory, Rust/tool versions, machine, backend/schema, pool or SDK-permit limits, DynamoDB Region/table mode/RCU/WCU/retries/throttles, model/tuple generator seed, and p50/p95/p99.
 
 ## Initial budgets
 
@@ -18,6 +18,7 @@ These are engineering targets, not current claims, measured on the Phase 1 decla
 
 - Direct in-memory Check, warm compiled model, no condition: p95 ≤ 1 ms and no datastore-equivalent heap allocation proportional to store size.
 - Direct PostgreSQL Check on local network: p95 ≤ 10 ms excluding deliberate queue overload.
+- Direct DynamoDB `HigherConsistency` Check with a warm model and one tuple read: p95 ≤ 35 ms in the declared same-Region AWS environment; this is an engineering gate, not a portable service SLO.
 - Warm decision-cache hit: p95 ≤ 250 µs.
 - Model compilation for maximum supported model: ≤ 250 ms and ≤ 64 MiB temporary memory.
 - Cancellation/disconnect stops new storage dispatch within 10 ms and joins within the endpoint shutdown budget.
@@ -28,6 +29,8 @@ Phase 1 may recalibrate numerical targets once hardware and upstream comparison 
 ## Allocation and concurrency policy
 
 Parse once and borrow where ownership permits. Root requests allocate contextual indexes once; child work shares immutable `Arc`s. Dense relation/node IDs and pre-sized vectors are preferred for compiled graphs. Tuple streams process bounded pages. Bytes payloads use `Bytes` where transport/storage ownership benefits; cloning raw contexts/tuples per branch is prohibited.
+
+DynamoDB measures read/write amplification and consumed capacity as first-class outcomes. Its query fan-out, transaction action count, packed-change bytes, blob chunk count, change-HEAD conflict rate, retry delay, and throttling are reported separately. Gaining latency by weakening `HigherConsistency`, omitting reverse copies/changelog, using `Scan`, or hiding rejected/throttled work is forbidden. Backend-specific budgets and the 49-tuple mutation target are in [`17-dynamodb-storage-design.md` § 11](17-dynamodb-storage-design.md#11-performance-budgets).
 
 Concurrency is controlled at server, request, storage, and residual-Check levels. Defaults derive from CPU count and pool size but validate against finite ceilings. Queue time is measured separately from execution. Semaphore fairness, head-of-line blocking, and overload rejection are benchmarked.
 
@@ -49,6 +52,7 @@ Weight-two joins, rewrite flattening, reverse worker pipelines, granular cache i
 - Flamegraphs/profiles identify actual bottlenecks before optimization work.
 - Load and soak tests prove queue/cache/task/memory bounds and graceful overload.
 - Performance reports always state compatibility result, because a faster incorrect deny/allow is a failure.
+- DynamoDB reports include a bounded cost estimate and real-AWS evidence; Rustack measurements are labeled local-emulator orientation only.
 
 ```mermaid
 flowchart LR

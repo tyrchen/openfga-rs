@@ -34,7 +34,9 @@ Continuation tokens are versioned and authenticated with a rotating key set. Sig
 - Endpoint and principal/IP rate limits protect unauthenticated, administrative, write, Check, and enumeration traffic separately.
 - All external I/O has timeouts. Decompression is streaming with a hard expanded-byte limit.
 
-SQL uses bound SQLx parameters only. No user input reaches a shell. File paths for configuration/certificates/migrations are operator-configured, canonicalized, and constrained where applicable. URL fetching follows the OIDC SSRF policy. Rust regex is allowed only with input/pattern size limits; user-supplied regex is not a product feature.
+SQL uses bound SQLx parameters only. DynamoDB uses only project-built key/condition expressions with SDK attribute placeholders; request data never becomes expression source or a table/index name. No user input reaches a shell. File paths for configuration/certificates/migrations are operator-configured, canonicalized, and constrained where applicable. URL fetching follows the OIDC SSRF policy. A DynamoDB endpoint override is development-only loopback HTTP; production relies on AWS endpoint resolution. Rust regex is allowed only with input/pattern size limits; user-supplied regex is not a product feature.
+
+The DynamoDB runtime uses workload identity/default credential providers and an exact-table least-privilege IAM policy. Long-lived AWS credentials are not YAML fields. A separate provisioning role owns create/migration/PITR/KMS/deletion-protection operations. Runtime IAM omits `Scan`, table deletion, backup/restore, and wildcard resources. Customer-managed KMS keys, table names, Regions, ARNs, account IDs, physical keys, transaction tokens, tuple payloads, and SDK errors follow the secret/redaction policy in [`17-dynamodb-storage-design.md` § 9](17-dynamodb-storage-design.md#9-security-and-operational-boundary).
 
 ## Supply chain and memory safety
 
@@ -44,7 +46,7 @@ No panic is reachable from hostile input. Checked/saturating arithmetic is expli
 
 ## Threat-driven verification
 
-Tests cover cross-store IDOR, authentication downgrade, algorithm confusion, key rotation, JWKS rebinding/oversize, timing-resistant preshared checks, token tamper/replay, SQL injection payloads, path traversal config, log forging/control characters, model bombs, CEL bombs, tuple/list floods, slowloris/slow consumer, cancellation storms, replica staleness, cache poisoning, and changelog loss.
+Tests cover cross-store IDOR, authentication downgrade, algorithm confusion, key rotation, JWKS rebinding/oversize, timing-resistant preshared checks, token tamper/replay, SQL and DynamoDB-expression injection payloads, AWS endpoint SSRF, IAM overgrant, credential/error leakage, path traversal config, log forging/control characters, model bombs, CEL bombs, tuple/list floods, slowloris/slow consumer, cancellation storms, replica/eventual-read staleness, cache poisoning, and changelog loss.
 
 ## Acceptance criteria
 

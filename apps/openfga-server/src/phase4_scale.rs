@@ -578,16 +578,19 @@ async fn seed_scale_dataset(client: &Client, target: &Target) -> Result<()> {
         .base_url
         .join(&format!("stores/{}/write", target.store_id))
         .context("failed to construct scale dataset URL")?;
-    let response = client
-        .post(url)
-        .json(&json!({
-            "writes": {"tuple_keys": tuples},
-            "authorization_model_id": target.model_id
-        }))
-        .send()
-        .await
-        .context("scale dataset write failed")?;
-    require_success(response, "scale dataset write").await
+    for batch in tuples.chunks(49) {
+        let response = client
+            .post(url.clone())
+            .json(&json!({
+                "writes": {"tuple_keys": batch},
+                "authorization_model_id": target.model_id
+            }))
+            .send()
+            .await
+            .context("scale dataset write failed")?;
+        require_success(response, "scale dataset write").await?;
+    }
+    Ok(())
 }
 
 const fn check_workload(

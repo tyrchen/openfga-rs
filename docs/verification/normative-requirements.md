@@ -1,6 +1,8 @@
 # Normative requirement traceability
 
-This matrix covers every literal RFC 2119 `MUST` in the specification set through Phase 6.
+This matrix covers every literal RFC 2119 `MUST` in the specification set through the DynamoDB
+design. Production-only DynamoDB controls remain release-blocking until their real-AWS report is
+checked in.
 The linked controls are automated tests or inspectable release gates; changing a normative
 requirement requires updating this matrix in the same change.
 
@@ -14,6 +16,8 @@ requirement requires updating this matrix in the same change.
 | CEL: match the pinned supported type/helper/error semantics and reject unsupported extensions at compile time | `make cel-spike`; pinned Go conformance cases and Rust condition conformance suite |
 | Model: hash iteration must not affect diagnostics, fingerprints, serialization or plans | deterministic compiler tests, model baseline, clean `check-corpus-differential` reproduction |
 | Storage: tuple deletes/writes and matching change events must be one transaction | reusable storage contract plus mutation-stage fault suites on memory and all SQL backends |
+| DynamoDB: preserve every storage capability without Scan, GSI, LSI, Streams, partial tuple peers, partial blobs, or backend-native cursors | `make dynamodb-storage-rustack`; key/cursor/item properties; official-SDK contract; transaction and generation state tests; schema metadata gate |
+| DynamoDB: production support requires real AWS rather than emulator inference | explicit `make dynamodb-storage-aws` opt-in; isolated allowlisted table; IAM/KMS/PITR/restore/failure/performance report required before compatibility promotion |
 | List queries: candidate generation must be conservative and independently bounded | generated-set/ListObjects properties, upstream enumeration differential, query-plan and cancellation suites |
 | Verification: every normative MUST maps to a test or inspectable release control | This document plus `make check-docs`; Phase 5 independent spec/code review |
 | Performance: an optimization must preserve the oracle contract and graduate through differential, fault, cancellation, shadow, performance, observability, and rollback gates | Coalescing evaluator tests and Criterion workload; automatic mismatch kill; `disabled`/`shadow`/`enabled` configuration; Phase 6 graduation report |

@@ -43,6 +43,7 @@ Dependabot tracks their release tags and the Cargo/npm ecosystems.
 | Authentication | jsonwebtoken 11.0.0, secrecy 0.10.3, subtle 2.6.1 | AWS-LC JWT verification, redacted secrets, constant-time key comparison |
 | Telemetry | tracing 0.1.44, OpenTelemetry 0.32 | Structured bounded-cardinality signals; exporter code stays in application composition |
 | Serialization/config | Serde 1.0.229, config 0.15.25 | Strongly typed YAML/env configuration and generated JSON compatibility |
+| DynamoDB | aws-sdk-dynamodb 1.120.0, aws-config 1.10.1, aws-smithy-http-client 1.2.0 | Optional single-table backend using Tokio, explicit aws-lc rustls, SDK credential providers, bounded standard retries, and no project-owned credentials |
 | Errors/CLI | thiserror 2.0.20, anyhow 1.0.104, clap 4.6.6 | Typed library errors; application-only context; bounded command surface |
 | Testing/benchmarks | proptest 1.11.0, Criterion 0.8.2, dhat 0.3.3 | Invariants, statistical latency/throughput, and release-only heap evidence |
 

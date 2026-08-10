@@ -82,6 +82,8 @@ flowchart LR
 
 Registration and tracked-store cardinality share the configured finite controller capacity. A store remains cache-ineligible until its first successful poll, and each successful poll grants eligibility only through an absolute maximum-lag deadline. This deadline is checked on the request path, so a blocked controller cannot extend the stale window. Changelog identifiers are ordered but not consecutive, so an absent identifier cannot be inferred from ULID arithmetic; detectable store/order/cursor faults flush, while TTL and the maximum-lag deadline cover retention or otherwise unobservable gaps.
 
+The DynamoDB backend preserves this logical interface while physically packing multiple changes into one item. A conditional per-store change HEAD commits with the packed batch and yields strictly increasing individual `ChangeId`s across writers; `ChangeReader` flattens batches and resumes after an individual ID. Cache code MUST remain unaware of batches, shards, AWS cursors, or backend retry state. See [`17-dynamodb-storage-design.md` § 6](17-dynamodb-storage-design.md#6-atomic-tuple-mutation-and-changelog-protocol).
+
 ## Consistency behavior
 
 - `HigherConsistency`: read mutable tuples from primary, bypass decision and tuple-read caches, and do not populate them from that request.
@@ -110,5 +112,6 @@ All repository `AGENTS.md` engineering sections bind cache/controller code. Acto
 
 - ← Depends on: [`12-model-compiler-design.md`](12-model-compiler-design.md), [`13-storage-design.md`](13-storage-design.md), [`14-check-engine-design.md`](14-check-engine-design.md)
 - → Consumed by: [`21-runtime-operations-design.md`](21-runtime-operations-design.md)
+- ↔ Backend realization: [`17-dynamodb-storage-design.md`](17-dynamodb-storage-design.md)
 - ↔ Research: [`../docs/research/study-openfga-implementation.md`](../docs/research/study-openfga-implementation.md), [`../docs/research/survey-rust-ecosystem.md`](../docs/research/survey-rust-ecosystem.md)
 - ↔ Prior art: cache identity/policy in `vendors/openfga/docs/caching.md:30` and changelog controller behavior in `vendors/openfga/internal/cachecontroller/cache_controller.go:143`

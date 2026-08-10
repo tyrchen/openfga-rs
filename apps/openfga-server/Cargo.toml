@@ -27,6 +27,7 @@ openfga-proto.workspace = true
 openfga-service.workspace = true
 openfga-storage.workspace = true
 openfga-storage-memory.workspace = true
+openfga-storage-dynamodb.workspace = true
 openfga-storage-sql.workspace = true
 openfga-transport.workspace = true
 opentelemetry.workspace = true

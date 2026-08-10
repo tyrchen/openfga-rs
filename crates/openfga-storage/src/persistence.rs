@@ -14,13 +14,17 @@ use openfga_model::{
     RelationSource, RestrictionKindSource, RestrictionKindSourceRef, RewriteSource,
     RewriteSourceRef, TypeDefinitionSource,
 };
-use openfga_storage::{Assertion, StorageError, StorageErrorKind, StoredAuthorizationModel};
 use serde::{Deserialize, Serialize};
 
+use crate::{Assertion, StorageError, StorageErrorKind, StoredAuthorizationModel};
+
 const CODEC_VERSION: u8 = 1;
-const MAXIMUM_MODEL_PAYLOAD_BYTES: usize = 16 * 1_024 * 1_024;
-const MAXIMUM_ASSERTION_PAYLOAD_BYTES: usize = 8 * 1_024 * 1_024;
-const MAXIMUM_TUPLE_PAYLOAD_BYTES: usize = 2 * 1_024 * 1_024;
+/// Maximum encoded authorization-model payload accepted by persistence backends.
+pub const MAXIMUM_MODEL_PAYLOAD_BYTES: usize = 16 * 1_024 * 1_024;
+/// Maximum encoded assertion payload accepted by persistence backends.
+pub const MAXIMUM_ASSERTION_PAYLOAD_BYTES: usize = 8 * 1_024 * 1_024;
+/// Maximum encoded relationship-tuple payload accepted by persistence backends.
+pub const MAXIMUM_TUPLE_PAYLOAD_BYTES: usize = 2 * 1_024 * 1_024;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -164,7 +168,12 @@ struct AssertionDto {
     condition_context: BTreeMap<String, ContextValueDto>,
 }
 
-pub(crate) fn encode_model(model: &StoredAuthorizationModel) -> Result<Vec<u8>, StorageError> {
+/// Encodes one validated authorization model using the stable v1 persistence envelope.
+///
+/// # Errors
+///
+/// Returns an internal storage error when the validated model cannot be serialized.
+pub fn encode_model(model: &StoredAuthorizationModel) -> Result<Vec<u8>, StorageError> {
     let source = model.source();
     let envelope = ModelEnvelope {
         version: CODEC_VERSION,
@@ -183,7 +192,12 @@ pub(crate) fn encode_model(model: &StoredAuthorizationModel) -> Result<Vec<u8>, 
     serde_json::to_vec(&envelope).map_err(codec_encode_error)
 }
 
-pub(crate) fn decode_model(
+/// Decodes and recompiles one stable v1 authorization-model payload.
+///
+/// # Errors
+///
+/// Returns an integrity error for an oversized, malformed, unsupported, or invalid model.
+pub fn decode_model(
     bytes: &[u8],
     store_id: StoreId,
     model_id: AuthorizationModelId,
@@ -230,13 +244,21 @@ pub(crate) fn decode_model(
         })
 }
 
-pub(crate) fn encode_tuple(tuple: &RelationshipTuple) -> Result<Vec<u8>, StorageError> {
+/// Encodes one validated relationship tuple using the stable v1 persistence envelope.
+///
+/// # Errors
+///
+/// Returns an internal storage error when the tuple cannot be serialized.
+pub fn encode_tuple(tuple: &RelationshipTuple) -> Result<Vec<u8>, StorageError> {
     serde_json::to_vec(&TupleEnvelope::from_tuple(tuple)?).map_err(codec_encode_error)
 }
 
-pub(crate) fn encode_condition_context(
-    context: &ConditionContext,
-) -> Result<Vec<u8>, StorageError> {
+/// Encodes a validated condition context using the stable v1 persistence envelope.
+///
+/// # Errors
+///
+/// Returns an internal or integrity error when the context cannot be represented.
+pub fn encode_condition_context(context: &ConditionContext) -> Result<Vec<u8>, StorageError> {
     let values = context
         .iter()
         .map(|(name, value)| {
@@ -250,7 +272,12 @@ pub(crate) fn encode_condition_context(
     .map_err(codec_encode_error)
 }
 
-pub(crate) fn decode_tuple(bytes: &[u8]) -> Result<RelationshipTuple, StorageError> {
+/// Decodes one stable v1 relationship-tuple payload.
+///
+/// # Errors
+///
+/// Returns an integrity error for an oversized, malformed, or unsupported payload.
+pub fn decode_tuple(bytes: &[u8]) -> Result<RelationshipTuple, StorageError> {
     require_payload_limit(
         bytes,
         MAXIMUM_TUPLE_PAYLOAD_BYTES,
@@ -260,7 +287,12 @@ pub(crate) fn decode_tuple(bytes: &[u8]) -> Result<RelationshipTuple, StorageErr
     envelope.into_tuple()
 }
 
-pub(crate) fn encode_assertions(assertions: &[Assertion]) -> Result<Vec<u8>, StorageError> {
+/// Encodes a bounded assertion set using the stable v1 persistence envelope.
+///
+/// # Errors
+///
+/// Returns an internal or integrity error when the assertions cannot be represented.
+pub fn encode_assertions(assertions: &[Assertion]) -> Result<Vec<u8>, StorageError> {
     let assertions = assertions
         .iter()
         .map(AssertionDto::from_assertion)
@@ -272,7 +304,12 @@ pub(crate) fn encode_assertions(assertions: &[Assertion]) -> Result<Vec<u8>, Sto
     .map_err(codec_encode_error)
 }
 
-pub(crate) fn decode_assertions(bytes: &[u8]) -> Result<Arc<[Assertion]>, StorageError> {
+/// Decodes one stable v1 assertion-set payload.
+///
+/// # Errors
+///
+/// Returns an integrity error for an oversized, malformed, unsupported, or invalid payload.
+pub fn decode_assertions(bytes: &[u8]) -> Result<Arc<[Assertion]>, StorageError> {
     require_payload_limit(
         bytes,
         MAXIMUM_ASSERTION_PAYLOAD_BYTES,
@@ -760,12 +797,12 @@ mod tests {
         ConditionBinding, ConditionContext, ConditionReference, ContextValue, InputLimits,
         ParameterName, RelationshipTuple, TupleKey,
     };
-    use openfga_storage::{Assertion, StorageErrorKind};
 
     use super::{
         MAXIMUM_TUPLE_PAYLOAD_BYTES, decode_assertions, decode_tuple, encode_assertions,
         encode_tuple,
     };
+    use crate::{Assertion, StorageErrorKind};
 
     #[test]
     fn test_should_round_trip_assertion_condition_context() -> Result<(), Box<dyn std::error::Error>>
