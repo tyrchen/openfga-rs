@@ -16,6 +16,8 @@ verified post-GA surface and does not change the OpenFGA v1 GA claim.
 | PostgreSQL CI | `18.4`, image index `sha256:a02db8cac496f15b094798a38254f14d6e00741f709360e5e00bb6668ea31636` |
 | MySQL CI | `8.4.10`, image index `sha256:8dbcf531a03aade657e181b9cf2f1d1803ce621a1d55610cb44cb531ab7d7db6` |
 | SQLite | bundled SQLite `3.51.3` from `libsqlite3-sys 0.37.0` |
+| DynamoDB SDK | `aws-sdk-dynamodb 1.120.0`, `aws-config 1.10.1`, `aws-smithy-http-client 1.2.0` |
+| DynamoDB local emulator | Rustack `ab8bc61a3e45058c7d42de8443f9d215cc110b18` (`v0.9.1`) |
 | JavaScript SDK smoke | `@openfga/sdk 0.9.6`, Node.js 24 |
 | Dependency security tools | `cargo-audit 0.22.2`, `cargo-deny 0.20.2` |
 | Release security tools | `gitleaks 8.30.1`, `syft 1.50.0` |
@@ -32,6 +34,12 @@ are recorded in `crates/openfga-proto/proto.lock.json` and reproduced by `make c
 | PostgreSQL 18.4 | Production, primary plus optional bounded-lag read replica | Contract, migration, transaction fault, query-plan, SDK/API, consistency and scale suites |
 | MySQL 8.4.10 | Production, writable primary; no replica routing | Shared portable contract, migration, transaction fault, query-plan and full SDK/API suite |
 | SQLite 3.51.3 | Embedded/single-process deployments | Shared portable contract, migration, transaction fault, backup/restore and full SDK/API suite |
+
+The `dynamodb` backend is implemented as a preview and is deliberately absent from the advertised
+production table above. `make dynamodb-storage-rustack` and `make dynamodb-api-rustack` cover the
+local storage/API/two-replica path. Production advertisement additionally requires the real-AWS
+IAM, KMS, PITR/restore, strong-consistency, transaction-idempotency, failure, load, soak, and cost
+evidence defined by `specs/17-dynamodb-storage-design.md`; emulator success cannot satisfy it.
 
 SQLite is intentionally configured with exactly one database connection. It is not an HA or
 multi-process writer profile. MySQL and SQLite use the same semantic storage traits as PostgreSQL;

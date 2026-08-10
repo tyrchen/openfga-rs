@@ -1,7 +1,7 @@
 //! Bounded YAML configuration loading and validation.
 
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     net::SocketAddr,
     num::{NonZeroU32, NonZeroU64, NonZeroUsize},
     path::{Component, Path, PathBuf},
@@ -18,6 +18,7 @@ use openfga_cache::{
 };
 use openfga_check::{CheckCoalescingConfig, CheckCoalescingMode};
 use openfga_domain::{Limit, PrincipalId, RequestTimeout, StoreId, TokenKeyId};
+use openfga_storage_dynamodb::KmsKeyIdentifier;
 use openfga_transport::{AdmissionPolicy, AuthZenConfig};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
@@ -36,6 +37,11 @@ const POSTGRES_CONTROL_PLANE_HEADROOM: u32 = 2;
 const POSTGRES_IN_FLIGHT_MULTIPLIER: u32 = 4;
 const ESTIMATED_MODEL_ALIAS_BYTES: u64 = 256;
 const MAXIMUM_AGGREGATE_CACHE_BYTES: u64 = 1024 * 1024 * 1024;
+#[allow(
+    clippy::duration_suboptimal_units,
+    reason = "Duration::from_days is not stable as a const constructor"
+)]
+const MAXIMUM_DYNAMODB_GC_GRACE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 pub(crate) const DEVELOPMENT_PRINCIPAL_ID: &str = "openfga-development-runtime";
 
 /// Fully validated server configuration. No secret values are retained here.
@@ -106,6 +112,8 @@ impl Default for TlsConfig {
 #[serde(rename_all = "camelCase")]
 pub(crate) enum StorageBackend {
     Memory,
+    #[serde(rename = "dynamodb")]
+    DynamoDb,
     Postgres,
     #[serde(rename = "mysql")]
     MySql,
@@ -119,11 +127,85 @@ pub(crate) struct StorageConfig {
     #[serde(default)]
     pub(crate) memory: MemoryConfig,
     #[serde(default)]
+    pub(crate) dynamodb: DynamoDbConfig,
+    #[serde(default)]
     pub(crate) postgres: PostgresConfig,
     #[serde(default = "default_mysql_config")]
     pub(crate) mysql: PortableDatabaseConfig,
     #[serde(default = "default_sqlite_config")]
     pub(crate) sqlite: PortableDatabaseConfig,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct DynamoDbConfig {
+    #[serde(default = "default_dynamodb_table_name")]
+    pub(crate) table_name: String,
+    #[serde(default = "default_dynamodb_region")]
+    pub(crate) region: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) endpoint: Option<String>,
+    #[serde(default = "default_dynamodb_in_flight")]
+    pub(crate) maximum_in_flight: u32,
+    #[serde(default = "default_dynamodb_attempt_timeout_ms")]
+    pub(crate) attempt_timeout_ms: u64,
+    #[serde(default = "default_database_timeout_ms")]
+    pub(crate) operation_timeout_ms: u64,
+    #[serde(default = "default_dynamodb_attempts")]
+    pub(crate) maximum_attempts: u32,
+    #[serde(default = "default_dynamodb_conflict_retries")]
+    pub(crate) maximum_conflict_retries: u32,
+    #[serde(default = "default_dynamodb_tuple_mutations")]
+    pub(crate) maximum_tuple_mutations: u32,
+    #[serde(default = "default_dynamodb_gc_batch")]
+    pub(crate) garbage_collection_batch_size: u32,
+    #[serde(default = "default_dynamodb_gc_interval_ms")]
+    pub(crate) garbage_collection_interval_ms: u64,
+    #[serde(default = "default_dynamodb_gc_grace_ms")]
+    pub(crate) garbage_collection_grace_period_ms: u64,
+    #[serde(default = "default_dynamodb_assertion_retention_ms")]
+    pub(crate) assertion_rollback_retention_ms: u64,
+    #[serde(default = "default_dynamodb_gc_maximum_work_lag_ms")]
+    pub(crate) garbage_collection_maximum_work_lag_ms: u64,
+    #[serde(default = "default_database_timeout_ms")]
+    pub(crate) garbage_collection_shutdown_timeout_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) kms_key_identifier: Option<String>,
+    #[serde(default = "default_true")]
+    pub(crate) point_in_time_recovery: bool,
+    #[serde(default)]
+    pub(crate) deletion_protection: bool,
+    #[serde(default = "default_dynamodb_tags")]
+    pub(crate) tags: BTreeMap<String, String>,
+    #[serde(default)]
+    pub(crate) provision_on_start: bool,
+}
+
+impl Default for DynamoDbConfig {
+    fn default() -> Self {
+        Self {
+            table_name: default_dynamodb_table_name(),
+            region: default_dynamodb_region(),
+            endpoint: None,
+            maximum_in_flight: default_dynamodb_in_flight(),
+            attempt_timeout_ms: default_dynamodb_attempt_timeout_ms(),
+            operation_timeout_ms: default_database_timeout_ms(),
+            maximum_attempts: default_dynamodb_attempts(),
+            maximum_conflict_retries: default_dynamodb_conflict_retries(),
+            maximum_tuple_mutations: default_dynamodb_tuple_mutations(),
+            garbage_collection_batch_size: default_dynamodb_gc_batch(),
+            garbage_collection_interval_ms: default_dynamodb_gc_interval_ms(),
+            garbage_collection_grace_period_ms: default_dynamodb_gc_grace_ms(),
+            assertion_rollback_retention_ms: default_dynamodb_assertion_retention_ms(),
+            garbage_collection_maximum_work_lag_ms: default_dynamodb_gc_maximum_work_lag_ms(),
+            garbage_collection_shutdown_timeout_ms: default_database_timeout_ms(),
+            kms_key_identifier: None,
+            point_in_time_recovery: true,
+            deletion_protection: false,
+            tags: default_dynamodb_tags(),
+            provision_on_start: false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1124,6 +1206,50 @@ impl ServerConfig {
         }
         validate_portable_database(&self.storage.mysql, "MySQL", false)?;
         validate_portable_database(&self.storage.sqlite, "SQLite", true)?;
+        if self.storage.dynamodb.endpoint.is_some() && self.profile != Profile::Development {
+            bail!("a DynamoDB endpoint override requires the development profile");
+        }
+        if !(1..=65_536).contains(&self.storage.dynamodb.maximum_in_flight)
+            || !(1..=10).contains(&self.storage.dynamodb.maximum_attempts)
+            || !(1..=100).contains(&self.storage.dynamodb.maximum_conflict_retries)
+            || !(1..=49).contains(&self.storage.dynamodb.maximum_tuple_mutations)
+            || !(1..=1_000).contains(&self.storage.dynamodb.garbage_collection_batch_size)
+            || self.storage.dynamodb.attempt_timeout_ms == 0
+            || self.storage.dynamodb.operation_timeout_ms == 0
+            || self.storage.dynamodb.attempt_timeout_ms > self.storage.dynamodb.operation_timeout_ms
+            || self.storage.dynamodb.operation_timeout_ms
+                > u64::try_from(MAXIMUM_REQUEST_TIMEOUT.as_millis()).unwrap_or(u64::MAX)
+            || self.storage.dynamodb.garbage_collection_interval_ms == 0
+            || self.storage.dynamodb.garbage_collection_interval_ms
+                > u64::try_from(MAXIMUM_REQUEST_TIMEOUT.as_millis()).unwrap_or(u64::MAX)
+            || self.storage.dynamodb.garbage_collection_grace_period_ms
+                <= self.storage.dynamodb.operation_timeout_ms
+            || self.storage.dynamodb.assertion_rollback_retention_ms
+                <= self.transport.request_timeout_ms
+            || self.storage.dynamodb.garbage_collection_maximum_work_lag_ms
+                <= self.storage.dynamodb.garbage_collection_interval_ms
+            || self.storage.dynamodb.garbage_collection_grace_period_ms
+                > u64::try_from(MAXIMUM_DYNAMODB_GC_GRACE.as_millis()).unwrap_or(u64::MAX)
+            || self.storage.dynamodb.assertion_rollback_retention_ms
+                > u64::try_from(MAXIMUM_DYNAMODB_GC_GRACE.as_millis()).unwrap_or(u64::MAX)
+            || self.storage.dynamodb.garbage_collection_maximum_work_lag_ms
+                > u64::try_from(MAXIMUM_DYNAMODB_GC_GRACE.as_millis()).unwrap_or(u64::MAX)
+            || self.storage.dynamodb.garbage_collection_shutdown_timeout_ms == 0
+            || self.storage.dynamodb.garbage_collection_shutdown_timeout_ms
+                > u64::try_from(MAXIMUM_REQUEST_TIMEOUT.as_millis()).unwrap_or(u64::MAX)
+            || self
+                .storage
+                .dynamodb
+                .kms_key_identifier
+                .as_ref()
+                .is_some_and(|value| value.parse::<KmsKeyIdentifier>().is_err())
+            || !valid_dynamodb_tags(&self.storage.dynamodb.tags)
+        {
+            bail!(
+                "DynamoDB concurrency, retry, mutation, and cleanup limits must be nonzero and \
+                 bounded"
+            );
+        }
         Ok(())
     }
 
@@ -1263,6 +1389,7 @@ impl ServerConfig {
     fn validate_database_concurrency(&self) -> Result<()> {
         let pool = match self.storage.backend {
             StorageBackend::Memory => return Ok(()),
+            StorageBackend::DynamoDb => self.storage.dynamodb.maximum_in_flight,
             StorageBackend::Postgres => self.storage.postgres.max_connections,
             StorageBackend::MySql => self.storage.mysql.max_connections,
             StorageBackend::Sqlite => self.storage.sqlite.max_connections,
@@ -1474,6 +1601,84 @@ const fn default_replica_lag_ms() -> u64 {
 
 const fn default_tuple_mutations() -> u32 {
     100
+}
+
+fn default_dynamodb_table_name() -> String {
+    "openfga".to_owned()
+}
+
+fn default_dynamodb_region() -> String {
+    "us-west-2".to_owned()
+}
+
+const fn default_dynamodb_in_flight() -> u32 {
+    64
+}
+
+const fn default_dynamodb_attempt_timeout_ms() -> u64 {
+    2_000
+}
+
+const fn default_dynamodb_attempts() -> u32 {
+    3
+}
+
+const fn default_dynamodb_conflict_retries() -> u32 {
+    5
+}
+
+const fn default_dynamodb_tuple_mutations() -> u32 {
+    49
+}
+
+const fn default_dynamodb_gc_batch() -> u32 {
+    16
+}
+
+const fn default_dynamodb_gc_interval_ms() -> u64 {
+    30_000
+}
+
+const fn default_dynamodb_gc_grace_ms() -> u64 {
+    300_000
+}
+
+const fn default_dynamodb_assertion_retention_ms() -> u64 {
+    300_000
+}
+
+const fn default_dynamodb_gc_maximum_work_lag_ms() -> u64 {
+    900_000
+}
+
+fn default_dynamodb_tags() -> BTreeMap<String, String> {
+    BTreeMap::from([
+        ("application".to_owned(), "openfga".to_owned()),
+        ("managed-by".to_owned(), "openfga-rs".to_owned()),
+    ])
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+fn valid_dynamodb_tags(tags: &BTreeMap<String, String>) -> bool {
+    !tags.is_empty()
+        && tags.len() <= 50
+        && tags.iter().all(|(key, value)| {
+            !key.is_empty()
+                && key.len() <= 128
+                && value.len() <= 256
+                && key.bytes().all(valid_dynamodb_tag_key_byte)
+                && value
+                    .bytes()
+                    .all(|byte| byte == b' ' || valid_dynamodb_tag_key_byte(byte))
+        })
+}
+
+fn valid_dynamodb_tag_key_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(byte, b'_' | b'-' | b'.' | b':' | b'/' | b'=' | b'+' | b'@')
 }
 
 const fn default_page_size() -> u32 {

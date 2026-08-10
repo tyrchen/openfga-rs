@@ -13,6 +13,7 @@ crates/
   openfga-storage         narrow traits, filters, pagination, contract suite
   openfga-storage-memory  actor-owned in-memory backend
   openfga-storage-sql     SQLx backends and migrations
+  openfga-storage-dynamodb AWS SDK backend, physical key/transaction/blob planners
   openfga-check           oracle and optimized Check strategies
   openfga-list            ListObjects/ListUsers/Expand engines
   openfga-cache           cache contracts, keys, controller actors
@@ -27,7 +28,7 @@ The existing placeholder `openfga-rs-core` is removed as responsibilities migrat
 
 ## Dependency direction
 
-`domain` depends only on foundational parsing/serialization/error crates. `proto` is independent generated wire code. `model` depends on domain and condition interfaces. `storage` depends on domain; backend crates depend on storage. `check` and `list` depend on domain/model/condition/storage traits, never concrete backends. `cache` depends on domain/model/storage changelog traits. `auth` depends on domain principals but not service/transport. `service` composes engine/storage/cache/auth capabilities. `transport` converts proto ↔ domain/service. Only the application chooses concrete implementations.
+`domain` depends only on foundational parsing/serialization/error crates. `proto` is independent generated wire code. `model` depends on domain and condition interfaces. `storage` depends on domain; backend crates depend on storage. The versioned persistence codec is owned once by `storage` so SQL and DynamoDB cannot drift. `check` and `list` depend on domain/model/condition/storage traits, never concrete backends. `cache` depends on domain/model/storage changelog traits. `auth` depends on domain principals but not service/transport. `service` composes engine/storage/cache/auth capabilities. `transport` converts proto ↔ domain/service. Only the application chooses concrete implementations.
 
 Cycles are forbidden and verified with workspace metadata. Lower crates cannot depend on Axum, Tonic, SQLx, Moka, or application configuration unless that framework is their explicit responsibility.
 
@@ -50,4 +51,4 @@ Backend, transport, and telemetry selection occurs through application dependenc
 - Dependency graph follows the direction above with no cycles or framework leakage.
 - Each crate has focused module docs, owner responsibilities, public error types, and relevant unit/contract tests.
 - `cargo doc` has no public-item/lint failures and cross-crate examples compile.
-- Removing a backend or transport crate does not change semantic engine compilation.
+- Removing a backend or transport crate does not change semantic engine compilation; removing AWS dependencies still permits all non-DynamoDB crates and server profiles to compile through an explicit application feature/profile boundary.

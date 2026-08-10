@@ -4,7 +4,7 @@ Status: Proposed · Audience: product, platform, security, and implementation te
 
 ## Product statement
 
-openfga-rs is a production-grade Rust implementation of the OpenFGA authorization server. Existing OpenFGA clients and models should work without application changes while operators gain a memory-safe, resource-bounded, observable service with first-class PostgreSQL, MySQL, SQLite, and in-memory deployments.
+openfga-rs is a production-grade Rust implementation of the OpenFGA authorization server. Existing OpenFGA clients and models should work without application changes while operators gain a memory-safe, resource-bounded, observable service with first-class PostgreSQL, MySQL, SQLite, and in-memory deployments. A separately gated DynamoDB extension becomes an advertised backend only after the M7–M8 delivery in [`17-dynamodb-storage-design.md`](17-dynamodb-storage-design.md).
 
 The compatibility baseline is the vendored OpenFGA commit recorded in [`../docs/research/study-openfga-implementation.md`](../docs/research/study-openfga-implementation.md). A release MUST name its upstream baseline and MUST NOT claim compatibility beyond tested behavior.
 
@@ -31,6 +31,8 @@ The GA product MUST provide:
 
 AuthZEN compatibility is a post-GA compatibility milestone. It MUST reuse the same service and policy core, but MUST NOT delay or weaken OpenFGA v1 compatibility.
 
+DynamoDB compatibility is a post-GA backend milestone. It MUST preserve the same logical storage and authorization semantics in one writable Region. It MAY advertise a lower write-batch limit where DynamoDB imposes a hard transaction ceiling, but MUST preserve all-or-nothing mutation/changelog behavior and cannot graduate on emulator-only evidence.
+
 ## Success criteria
 
 - All applicable upstream API and model test vectors pass for every supported backend.
@@ -39,6 +41,7 @@ AuthZEN compatibility is a post-GA compatibility milestone. It MUST reuse the sa
 - Security limits reject hostile inputs before business logic and production startup rejects unauthenticated configuration.
 - The documented performance budgets are met on the declared reference environment without semantic shortcuts.
 - Operators can migrate from a supported OpenFGA schema snapshot through a documented, tested procedure.
+- DynamoDB operators can provision, validate, back up, restore, capacity-test, and run the complete API with workload identity and least-privilege IAM; emulator-only evidence is insufficient.
 
 ## Compatibility policy
 
@@ -50,6 +53,7 @@ Upstream changes enter through a deliberate baseline update: update the submodul
 
 - A new authorization language or a wire-incompatible ergonomic API.
 - A distributed SQL database, globally coherent cache, policy editor, control-plane UI, or client SDK suite.
+- Cross-Region strongly consistent DynamoDB/global-table semantics, DAX, or DynamoDB Streams as an application changelog.
 - Reproducing Go implementation details that are not observable contracts.
 - Shipping experimental weighted/adaptive algorithms on the authoritative path before differential and shadow gates pass.
 - Allowing user-provided CEL programs, tuple sets, or requests to consume unbounded CPU, memory, storage reads, or tasks.

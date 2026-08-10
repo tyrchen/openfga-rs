@@ -3,7 +3,6 @@
 #![forbid(unsafe_code)]
 
 mod backend;
-mod codec;
 mod config;
 mod error;
 mod fault;

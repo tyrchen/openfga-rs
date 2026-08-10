@@ -7,7 +7,7 @@ Status: Proposed · Verifies: all component specs
 1. **Domain unit/property/fuzz:** parsers, newtypes, tokens, limits, redaction, and canonical round trips over arbitrary bytes.
 2. **Compiler/condition fixtures:** valid/invalid upstream models, graph metadata, CEL types/functions/cost/unknown/error behavior, deterministic fingerprints.
 3. **Engine unit/model:** exhaustive reducer truth/error tables, direct/computed/TTU/wildcard/condition/cycle/depth behavior, set algebra, cancellation, and budgets.
-4. **Storage contract:** one reusable suite against memory, PostgreSQL, MySQL, and SQLite; transactions, conflicts, ordering, pagination, consistency routing, stream cleanup, and migrations.
+4. **Storage contract:** one reusable suite against memory, PostgreSQL, MySQL, SQLite, and DynamoDB; transactions, conflicts, ordering, pagination, consistency routing, stream cleanup, and migrations/provisioning. DynamoDB runs both a pinned Rustack local profile and an authoritative real-AWS profile.
 5. **Service/transport golden:** protobuf/JSON, routes, defaults, validation, status/error bodies, middleware order, pagination, BatchCheck correlation, and streaming.
 6. **Differential:** send the same normalized corpus to the vendored Go binary and Rust server; compare decisions, result sets, error classifications, metadata where public, pagination behavior, and terminal stream behavior.
 7. **Official-client/end-to-end:** supported OpenFGA SDK smoke and scenario suites over gRPC and HTTP for every backend profile.
@@ -40,10 +40,12 @@ Inject failure before/during/after each storage read, iterator page, condition e
 
 Use Tokio paused time for deadlines/backoff, Loom for small reducer/actor state machines where valuable, and real runtime stress for stream/database behavior. Tests do not rely on arbitrary sleeps.
 
+For DynamoDB, a private API fault fake covers every SDK boundary deterministically; Rustack covers official-SDK protocol/query/condition/transaction integration on loopback; real DynamoDB alone proves strong consistency, AWS transaction rollback/idempotency, service size/page behavior, throttling, IAM, KMS, PITR, restore, and interrupted durable garbage collection. Rustack gaps are recorded in [`../docs/research/study-dynamodb-storage.md`](../docs/research/study-dynamodb-storage.md) and MUST NOT be waived as “emulator differences.” Real-AWS tests use OIDC, a dedicated account/Region, unique allowlisted table names, cost/concurrency ceilings, and exact-target cleanup.
+
 ## Phase/release gates
 
 - A phase passes only its linked spec acceptance criteria plus relevant regression suites.
-- A backend cannot be advertised until the shared contract, migrations, differential suite, and fault suite pass.
+- A backend cannot be advertised until the shared contract, migrations/provisioning, differential suite, and fault suite pass. DynamoDB additionally requires Rustack and real-AWS gates, two-process invalidation, load/soak, PITR restore, and least-privilege IAM evidence.
 - An optimization cannot default on until the graduation gate passes with zero unexplained mismatches.
 - GA requires all applicable upstream, differential, official-client, security, migration, shutdown, and performance gates on the exact release artifacts.
 - Any unexplained authorization mismatch is release-blocking. Quarantined tests require an owner, written root cause, and non-GA status; flaky retries do not constitute a pass.

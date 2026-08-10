@@ -190,6 +190,13 @@ struct MigrationReport {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct DynamoDbMigrationReport {
+    target: u32,
+    state: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct HealthResponse {
     status: &'static str,
 }
@@ -220,7 +227,7 @@ struct DifferentialReport {
 #[tokio::main]
 async fn main() -> Result<()> {
     match Arguments::parse().command {
-        Command::Run { config } => run(config.as_path()).await,
+        Command::Run { config } => Box::pin(run(config.as_path())).await,
         Command::ValidateConfig { config } => {
             config::ServerConfig::load(config.as_path()).await?;
             Ok(())
@@ -229,7 +236,7 @@ async fn main() -> Result<()> {
             let config = config::ServerConfig::load(config.as_path()).await?;
             write_value(&config)
         }
-        Command::Migrate { config, command } => migrate(config.as_path(), command).await,
+        Command::Migrate { config, command } => Box::pin(migrate(config.as_path(), command)).await,
         Command::ProbeServer { address } => serve_probe(address).await,
         Command::CheckProbeServer { address } => check_probe::serve(address).await,
         Command::DifferentialSmoke { go_url, rust_url } => {
@@ -284,7 +291,7 @@ async fn run(path: &Path) -> Result<()> {
     let config = config::ServerConfig::load(path).await?;
     runtime::install_crypto_provider()?;
     let telemetry = telemetry::TelemetryGuard::install(&config.telemetry)?;
-    let result = runtime::run(config).await;
+    let result = Box::pin(runtime::run(config)).await;
     let shutdown = telemetry.shutdown();
     match result {
         Ok(()) => shutdown,
@@ -300,6 +307,37 @@ async fn run(path: &Path) -> Result<()> {
 async fn migrate(path: &Path, command: MigrationCommand) -> Result<()> {
     let config = config::ServerConfig::load(path).await?;
     runtime::install_crypto_provider()?;
+    if config.storage.backend == config::StorageBackend::DynamoDb {
+        let dynamodb = runtime::dynamodb_config(&config)?;
+        let context = runtime::startup_operation_context(&config)?;
+        let status = match command {
+            MigrationCommand::Up => Box::pin(openfga_storage_dynamodb::DynamoDbStorage::provision(
+                &dynamodb, &context,
+            ))
+            .await
+            .context("failed to provision DynamoDB storage")?,
+            MigrationCommand::Status => Box::pin(
+                openfga_storage_dynamodb::DynamoDbStorage::provisioning_status(&dynamodb, &context),
+            )
+            .await
+            .context("failed to read DynamoDB schema status")?,
+        };
+        let state = match status {
+            openfga_storage_dynamodb::DynamoDbProvisioningStatus::Missing => "missing",
+            openfga_storage_dynamodb::DynamoDbProvisioningStatus::Transitioning => "transitioning",
+            openfga_storage_dynamodb::DynamoDbProvisioningStatus::Ready => "current",
+            openfga_storage_dynamodb::DynamoDbProvisioningStatus::Incompatible => "incompatible",
+            _ => "unknown",
+        };
+        write_value(&DynamoDbMigrationReport {
+            target: openfga_storage_dynamodb::DYNAMODB_SCHEMA_VERSION,
+            state,
+        })?;
+        if matches!(command, MigrationCommand::Status) && state != "current" {
+            bail!("DynamoDB schema is not current");
+        }
+        return Ok(());
+    }
     let status = match config.storage.backend {
         config::StorageBackend::Postgres => {
             let postgres = runtime::postgres_config(&config, false)?;
@@ -325,7 +363,7 @@ async fn migrate(path: &Path, command: MigrationCommand) -> Result<()> {
                 }
             }
         }
-        config::StorageBackend::Memory => {
+        config::StorageBackend::Memory | config::StorageBackend::DynamoDb => {
             bail!("migration commands require a SQL storage backend")
         }
     };

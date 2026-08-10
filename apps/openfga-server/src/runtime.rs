@@ -41,6 +41,11 @@ use openfga_storage::{
     AssertionReader, AssertionWriter, ChangeReader, HealthCheck, ModelReader, ModelWriter,
     OperationContext, StorageCancellationToken, StoreReader, StoreWriter, TupleReader, TupleWriter,
 };
+use openfga_storage_dynamodb::{
+    DevelopmentEndpoint, DynamoDbGarbageCollectionConfig, DynamoDbMutationLimit,
+    DynamoDbProvisioningConfig, DynamoDbRuntime, DynamoDbStorage, DynamoDbStorageConfig,
+    DynamoDbTableName, KmsKeyIdentifier, RegionName,
+};
 use openfga_storage_memory::{MemoryStorage, MemoryStorageConfig};
 use openfga_storage_sql::{
     PortableSqlDialect, PortableSqlStorage, PortableSqlStorageConfig, PostgresStorage,
@@ -139,6 +144,7 @@ impl fmt::Debug for TlsMaterial {
 #[derive(Clone)]
 enum StorageOwner {
     Memory(Arc<MemoryStorage>),
+    DynamoDb(Arc<DynamoDbStorage>),
     Postgres(Arc<PostgresStorage>),
     PortableSql(Arc<PortableSqlStorage>),
 }
@@ -156,6 +162,7 @@ impl fmt::Debug for StorageOwner {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Memory(_) => formatter.write_str("StorageOwner::Memory"),
+            Self::DynamoDb(_) => formatter.write_str("StorageOwner::DynamoDb"),
             Self::Postgres(_) => formatter.write_str("StorageOwner::Postgres"),
             Self::PortableSql(_) => formatter.write_str("StorageOwner::PortableSql"),
         }
@@ -170,6 +177,7 @@ struct RuntimeAssembly {
     health: Arc<dyn HealthCheck>,
     identifiers: Arc<SystemIdentifierSource>,
     cache_controller: InvalidationController,
+    dynamodb_runtime: Option<DynamoDbRuntime>,
 }
 
 struct StorageAssembly {
@@ -177,6 +185,7 @@ struct StorageAssembly {
     storage: StorageOwner,
     health: Arc<dyn HealthCheck>,
     cache_controller: InvalidationController,
+    dynamodb_runtime: Option<DynamoDbRuntime>,
 }
 
 #[derive(Clone, Debug)]
@@ -232,14 +241,19 @@ impl fmt::Debug for RuntimeAssembly {
             .field("health", &"dyn HealthCheck")
             .field("identifiers_running", &self.identifiers.is_running())
             .field("cache_controller", &self.cache_controller)
+            .field("dynamodb_runtime", &self.dynamodb_runtime)
             .finish()
     }
 }
 
 /// Runs the fully assembled HTTP/gRPC server until signal or supervised failure.
+#[allow(
+    clippy::too_many_lines,
+    reason = "server startup and ordered shutdown remain visible in one lifecycle function"
+)]
 pub(crate) async fn run(config: ServerConfig) -> Result<()> {
     let tls = load_tls(&config).await?;
-    let assembly = assemble(&config).await?;
+    let assembly = Box::pin(assemble(&config)).await?;
     let RuntimeAssembly {
         api,
         authentication,
@@ -248,6 +262,7 @@ pub(crate) async fn run(config: ServerConfig) -> Result<()> {
         health,
         identifiers,
         mut cache_controller,
+        mut dynamodb_runtime,
     } = assembly;
     let http_listener = bind(config.listeners.http, "HTTP").await?;
     let grpc_listener = bind(config.listeners.grpc, "gRPC").await?;
@@ -335,7 +350,13 @@ pub(crate) async fn run(config: ServerConfig) -> Result<()> {
     let drain_result = drain_tasks(&mut tasks, config.drain_timeout()).await;
     health_state.live.store(false, Ordering::Release);
     drop(health);
-    shutdown_resources(storage, identifiers, &mut cache_controller).await?;
+    shutdown_resources(
+        storage,
+        identifiers,
+        &mut cache_controller,
+        dynamodb_runtime.as_mut(),
+    )
+    .await?;
     first_failure?;
     drain_result
 }
@@ -343,6 +364,7 @@ pub(crate) async fn run(config: ServerConfig) -> Result<()> {
 fn storage_capacities(config: &ServerConfig) -> Result<(Option<usize>, Option<u32>)> {
     let pool = match config.storage.backend {
         StorageBackend::Memory => None,
+        StorageBackend::DynamoDb => Some(config.storage.dynamodb.maximum_in_flight),
         StorageBackend::Postgres => Some(config.storage.postgres.max_connections),
         StorageBackend::MySql => Some(config.storage.mysql.max_connections),
         StorageBackend::Sqlite => Some(config.storage.sqlite.max_connections),
@@ -418,9 +440,102 @@ pub(crate) fn portable_sql_config(
     Ok(built)
 }
 
+pub(crate) fn dynamodb_config(config: &ServerConfig) -> Result<DynamoDbStorageConfig> {
+    if config.storage.backend != StorageBackend::DynamoDb {
+        bail!("DynamoDB configuration requires storage.backend: dynamodb");
+    }
+    let raw = &config.storage.dynamodb;
+    let endpoint = raw
+        .endpoint
+        .as_deref()
+        .map(str::parse::<DevelopmentEndpoint>)
+        .transpose()
+        .context("DynamoDB development endpoint is invalid")?;
+    let garbage_collection = DynamoDbGarbageCollectionConfig::builder()
+        .batch_size(
+            NonZeroU32::new(raw.garbage_collection_batch_size)
+                .context("DynamoDB cleanup batch size must be nonzero")?,
+        )
+        .interval(Duration::from_millis(raw.garbage_collection_interval_ms))
+        .grace_period(Duration::from_millis(
+            raw.garbage_collection_grace_period_ms,
+        ))
+        .assertion_retention(Duration::from_millis(raw.assertion_rollback_retention_ms))
+        .maximum_work_lag(Duration::from_millis(
+            raw.garbage_collection_maximum_work_lag_ms,
+        ))
+        .shutdown_timeout(Duration::from_millis(
+            raw.garbage_collection_shutdown_timeout_ms,
+        ))
+        .build();
+    let provisioning = DynamoDbProvisioningConfig::builder()
+        .kms_key_identifier(
+            raw.kms_key_identifier
+                .as_deref()
+                .map(str::parse::<KmsKeyIdentifier>)
+                .transpose()
+                .context("DynamoDB KMS key identifier is invalid")?,
+        )
+        .point_in_time_recovery(raw.point_in_time_recovery)
+        .deletion_protection(raw.deletion_protection)
+        .tags(raw.tags.clone())
+        .build();
+    let built = DynamoDbStorageConfig::builder()
+        .table_name(
+            raw.table_name
+                .parse::<DynamoDbTableName>()
+                .context("DynamoDB table name is invalid")?,
+        )
+        .region(
+            raw.region
+                .parse::<RegionName>()
+                .context("DynamoDB Region is invalid")?,
+        )
+        .endpoint(endpoint)
+        .maximum_in_flight(
+            NonZeroU32::new(raw.maximum_in_flight)
+                .context("DynamoDB in-flight limit must be nonzero")?,
+        )
+        .attempt_timeout(Duration::from_millis(raw.attempt_timeout_ms))
+        .operation_timeout(Duration::from_millis(raw.operation_timeout_ms))
+        .maximum_caller_deadline(Duration::from_millis(config.transport.request_timeout_ms))
+        .maximum_attempts(
+            NonZeroU32::new(raw.maximum_attempts).context("DynamoDB attempts must be nonzero")?,
+        )
+        .maximum_conflict_retries(
+            NonZeroU32::new(raw.maximum_conflict_retries)
+                .context("DynamoDB conflict retries must be nonzero")?,
+        )
+        .maximum_tuple_mutations(
+            DynamoDbMutationLimit::new(
+                NonZeroU32::new(raw.maximum_tuple_mutations)
+                    .context("DynamoDB tuple mutation limit must be nonzero")?,
+            )
+            .context("DynamoDB tuple mutation limit is invalid")?,
+        )
+        .garbage_collection(garbage_collection)
+        .provisioning(provisioning)
+        .build();
+    built
+        .validate()
+        .context("DynamoDB configuration is invalid")?;
+    Ok(built)
+}
+
+pub(crate) fn startup_operation_context(config: &ServerConfig) -> Result<OperationContext> {
+    let timeout = config.request_timeout()?;
+    let deadline = Deadline::from_timeout(Instant::now(), timeout)
+        .context("startup storage deadline is invalid")?;
+    Ok(OperationContext::new(
+        ConsistencyPreference::HigherConsistency,
+        deadline,
+        StorageCancellationToken::new(),
+    ))
+}
+
 async fn assemble(config: &ServerConfig) -> Result<RuntimeAssembly> {
     let (authentication, jwks_actor) = authentication(config).await?;
-    let limits = InputLimits::default();
+    let limits = input_limits(config)?;
     let identifiers = Arc::new(
         SystemIdentifierSource::start(SystemIdentifierSourceConfig::default())
             .context("failed to start identifier actor")?,
@@ -432,7 +547,15 @@ async fn assemble(config: &ServerConfig) -> Result<RuntimeAssembly> {
         storage,
         health,
         cache_controller,
-    } = assemble_storage(config, &limits, identifier_service, budgets, cache_policy).await?;
+        dynamodb_runtime,
+    } = Box::pin(assemble_storage(
+        config,
+        &limits,
+        identifier_service,
+        budgets,
+        cache_policy,
+    ))
+    .await?;
     let (token_key, verification_keys) = load_token_keys(config)?;
     let token_codec = Arc::new(
         TokenCodec::new(token_key, verification_keys, &limits)
@@ -468,9 +591,34 @@ async fn assemble(config: &ServerConfig) -> Result<RuntimeAssembly> {
         health,
         identifiers,
         cache_controller,
+        dynamodb_runtime,
     })
 }
 
+fn input_limits(config: &ServerConfig) -> Result<InputLimits> {
+    input_limits_for_storage(
+        config.storage.backend,
+        config.storage.dynamodb.maximum_tuple_mutations,
+    )
+}
+
+fn input_limits_for_storage(
+    backend: StorageBackend,
+    dynamodb_maximum_tuple_mutations: u32,
+) -> Result<InputLimits> {
+    if backend == StorageBackend::DynamoDb {
+        let write_tuples = Limit::<5_000>::new(dynamodb_maximum_tuple_mutations)
+            .context("DynamoDB tuple mutation limit is invalid")?;
+        Ok(InputLimits::builder().write_tuples(write_tuples).build())
+    } else {
+        Ok(InputLimits::default())
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "all backend ownership variants are assembled in one exhaustive match"
+)]
 async fn assemble_storage(
     config: &ServerConfig,
     limits: &InputLimits,
@@ -503,6 +651,35 @@ async fn assemble_storage(
                 storage: StorageOwner::Memory(storage),
                 health,
                 cache_controller,
+                dynamodb_runtime: None,
+            }
+        }
+        StorageBackend::DynamoDb => {
+            let dynamodb = dynamodb_config(config)?;
+            let context = startup_operation_context(config)?;
+            if config.storage.dynamodb.provision_on_start {
+                Box::pin(DynamoDbStorage::provision(&dynamodb, &context))
+                    .await
+                    .context("failed to provision DynamoDB storage")?;
+            }
+            let (backend, runtime) = Box::pin(DynamoDbStorage::connect(dynamodb, &context))
+                .await
+                .context("failed to connect DynamoDB storage")?;
+            let storage = Arc::new(backend);
+            let health: Arc<dyn HealthCheck> = storage.clone();
+            let (services, cache_controller) = services(
+                &storage,
+                identifier_service,
+                limits.clone(),
+                budgets,
+                cache_policy,
+            )?;
+            StorageAssembly {
+                services,
+                storage: StorageOwner::DynamoDb(storage),
+                health,
+                cache_controller,
+                dynamodb_runtime: Some(runtime),
             }
         }
         StorageBackend::Postgres => {
@@ -525,13 +702,16 @@ async fn assemble_storage(
                 storage: StorageOwner::Postgres(storage),
                 health,
                 cache_controller,
+                dynamodb_runtime: None,
             }
         }
         StorageBackend::MySql | StorageBackend::Sqlite => {
             let migrate_on_start = match config.storage.backend {
                 StorageBackend::MySql => config.storage.mysql.migrate_on_start,
                 StorageBackend::Sqlite => config.storage.sqlite.migrate_on_start,
-                StorageBackend::Memory | StorageBackend::Postgres => false,
+                StorageBackend::Memory | StorageBackend::DynamoDb | StorageBackend::Postgres => {
+                    false
+                }
             };
             let portable = portable_sql_config(config, migrate_on_start)?;
             let storage = Arc::new(
@@ -552,6 +732,7 @@ async fn assemble_storage(
                 storage: StorageOwner::PortableSql(storage),
                 health,
                 cache_controller,
+                dynamodb_runtime: None,
             }
         }
     };
@@ -1023,6 +1204,7 @@ async fn capacity(
     let (storage_work_permits_available, primary_pool_open, primary_pool_idle) =
         match &state.storage {
             StorageOwner::Memory(_) => (None, None, None),
+            StorageOwner::DynamoDb(_) => (state.storage_work_capacity, None, None),
             StorageOwner::Postgres(storage) => (
                 Some(storage.available_work_permits()),
                 Some(storage.primary_pool().size()),
@@ -1343,6 +1525,7 @@ async fn shutdown_resources(
     storage: StorageOwner,
     identifiers: Arc<SystemIdentifierSource>,
     cache_controller: &mut InvalidationController,
+    dynamodb_runtime: Option<&mut DynamoDbRuntime>,
 ) -> Result<()> {
     cache_controller
         .stop()
@@ -1354,6 +1537,12 @@ async fn shutdown_resources(
         .stop()
         .await
         .context("failed to stop identifier actor")?;
+    if let Some(runtime) = dynamodb_runtime {
+        runtime
+            .stop()
+            .await
+            .context("failed to stop DynamoDB cleanup actor")?;
+    }
     match storage {
         StorageOwner::Memory(storage) => {
             let mut storage = Arc::try_unwrap(storage)
@@ -1362,6 +1551,11 @@ async fn shutdown_resources(
                 .stop()
                 .await
                 .context("failed to stop memory storage actor")
+        }
+        StorageOwner::DynamoDb(storage) => {
+            Arc::try_unwrap(storage)
+                .map_err(|_| anyhow::anyhow!("DynamoDB storage references remain after drain"))?;
+            Ok(())
         }
         StorageOwner::Postgres(storage) => {
             let storage = Arc::try_unwrap(storage)
@@ -1440,9 +1634,9 @@ mod tests {
 
     use super::{
         HealthState, TlsMaterial, TransportRuntime, drain_tasks, health_response,
-        should_expose_capacity, spawn_grpc, spawn_http,
+        input_limits_for_storage, should_expose_capacity, spawn_grpc, spawn_http,
     };
-    use crate::config::Profile;
+    use crate::config::{Profile, StorageBackend};
 
     const STORE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
     const MODEL_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAW";
@@ -1456,6 +1650,19 @@ mod tests {
         assert!(should_expose_capacity(Profile::Development, loopback));
         assert!(!should_expose_capacity(Profile::Development, public));
         assert!(!should_expose_capacity(Profile::Production, loopback));
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_align_api_write_limit_with_dynamodb_transaction_limit() -> anyhow::Result<()> {
+        assert_eq!(
+            input_limits_for_storage(StorageBackend::DynamoDb, 37)?.write_tuples(),
+            37
+        );
+        assert_eq!(
+            input_limits_for_storage(StorageBackend::Memory, 37)?.write_tuples(),
+            InputLimits::default().write_tuples()
+        );
         Ok(())
     }
 

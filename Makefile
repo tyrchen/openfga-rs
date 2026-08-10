@@ -622,6 +622,7 @@ phase4-scale: $(GO_BASELINE) build-release
 	OPENFGA__LISTENERS__GRPC=$(RUST_GRPC_ADDR) \
 	OPENFGA__STORAGE__BACKEND=$(PHASE4_STORAGE_BACKEND) \
 	OPENFGA__STORAGE__POSTGRES__MIGRATE_ON_START=$(PHASE4_POSTGRES_MIGRATE) \
+	OPENFGA__STORAGE__DYNAMODB__PROVISION_ON_START=true \
 	OPENFGA__TRANSPORT__ADMISSION__AUTHENTICATION_ATTEMPTS=1000000 \
 	OPENFGA__TRANSPORT__ADMISSION__GLOBAL_AUTHENTICATION_ATTEMPTS=1000000 \
 	OPENFGA__TRANSPORT__ADMISSION__ADMINISTRATION=1000000 \
@@ -648,11 +649,12 @@ phase4-scale: $(GO_BASELINE) build-release
 		done; \
 	done; \
 	writer_arg=""; \
-	if test "$(PHASE4_STORAGE_BACKEND)" = postgres; then \
+	if test "$(PHASE4_STORAGE_BACKEND)" = postgres || test "$(PHASE4_STORAGE_BACKEND)" = dynamodb; then \
 		OPENFGA__LISTENERS__HTTP=$(RUST_WRITER_HTTP_ADDR) \
 		OPENFGA__LISTENERS__GRPC=$(RUST_WRITER_GRPC_ADDR) \
-		OPENFGA__STORAGE__BACKEND=postgres \
+		OPENFGA__STORAGE__BACKEND=$(PHASE4_STORAGE_BACKEND) \
 		OPENFGA__STORAGE__POSTGRES__MIGRATE_ON_START=false \
+		OPENFGA__STORAGE__DYNAMODB__PROVISION_ON_START=false \
 		OPENFGA__TRANSPORT__ADMISSION__AUTHENTICATION_ATTEMPTS=1000000 \
 		OPENFGA__TRANSPORT__ADMISSION__GLOBAL_AUTHENTICATION_ATTEMPTS=1000000 \
 		OPENFGA__TRANSPORT__ADMISSION__ADMINISTRATION=1000000 \
@@ -987,3 +989,59 @@ update-submodule:
 	phase5-ga-evidence phase5-release-gate phase5-sqlite-compatibility postgres-storage proto release release-artifacts \
 	sbom secret-scan security sqlite-storage sqlx-prepare-check storage-contract test \
 	update-submodule upstream-migration upstream-migration-drill verify-go-pin verify-go-tool
+.PHONY: dynamodb-storage-rustack dynamodb-api-rustack dynamodb-storage-aws
+
+DYNAMODB_RUSTACK_PORT ?= 4567
+DYNAMODB_RUSTACK_TABLE ?= openfga-rustack-api
+RUSTACK_TARGET_DIR ?= $(shell cargo metadata --manifest-path vendors/rustack/Cargo.toml --no-deps --format-version 1 | jq -r .target_directory)
+
+# Builds the pinned Rustack submodule, owns its lifecycle, and runs the DynamoDB contract.
+dynamodb-storage-rustack:
+	cargo build --manifest-path vendors/rustack/Cargo.toml -p rustack-cli --no-default-features --features dynamodb
+	@set -eu; \
+	log_file="$$(mktemp -t openfga-rustack.XXXXXX)"; \
+	SERVICES=dynamodb GATEWAY_LISTEN=127.0.0.1:$(DYNAMODB_RUSTACK_PORT) "$(RUSTACK_TARGET_DIR)/debug/rustack" >"$$log_file" 2>&1 & \
+	rustack_pid=$$!; \
+	cleanup() { kill "$$rustack_pid" 2>/dev/null || true; wait "$$rustack_pid" 2>/dev/null || true; rm -f "$$log_file"; }; \
+	trap cleanup EXIT INT TERM; \
+	ready=0; \
+	for attempt in 1 2 3 4 5 6 7 8 9 10; do \
+		if curl -sS -o /dev/null "http://127.0.0.1:$(DYNAMODB_RUSTACK_PORT)/"; then ready=1; break; fi; \
+		sleep 1; \
+	done; \
+	if [ "$$ready" -ne 1 ]; then sed -n '1,160p' "$$log_file"; exit 1; fi; \
+	AWS_ACCESS_KEY_ID=test \
+	AWS_SECRET_ACCESS_KEY=test \
+	AWS_REGION=us-west-2 \
+	OPENFGA_DYNAMODB_TEST_ENDPOINT=http://127.0.0.1:$(DYNAMODB_RUSTACK_PORT) \
+	OPENFGA_DYNAMODB_TEST_TABLE=openfga-rustack-contract \
+	cargo test -p openfga-storage-dynamodb --test rustack -- --ignored --test-threads=1
+
+# Runs differential, two-replica consistency, load, and drain smoke through DynamoDB.
+dynamodb-api-rustack: $(GO_BASELINE) build-release
+	cargo build --manifest-path vendors/rustack/Cargo.toml -p rustack-cli --no-default-features --features dynamodb
+	@set -eu; \
+	log_file="$$(mktemp -t openfga-rustack-api.XXXXXX)"; \
+	SERVICES=dynamodb GATEWAY_LISTEN=127.0.0.1:$(DYNAMODB_RUSTACK_PORT) "$(RUSTACK_TARGET_DIR)/debug/rustack" >"$$log_file" 2>&1 & \
+	rustack_pid=$$!; \
+	cleanup() { kill "$$rustack_pid" 2>/dev/null || true; wait "$$rustack_pid" 2>/dev/null || true; rm -f "$$log_file"; }; \
+	trap cleanup EXIT INT TERM; \
+	ready=0; \
+	for attempt in 1 2 3 4 5 6 7 8 9 10; do \
+		if curl -sS -o /dev/null "http://127.0.0.1:$(DYNAMODB_RUSTACK_PORT)/"; then ready=1; break; fi; \
+		sleep 1; \
+	done; \
+	if [ "$$ready" -ne 1 ]; then sed -n '1,160p' "$$log_file"; exit 1; fi; \
+	AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_REGION=us-west-2 \
+	OPENFGA__STORAGE__DYNAMODB__ENDPOINT=http://127.0.0.1:$(DYNAMODB_RUSTACK_PORT) \
+	OPENFGA__STORAGE__DYNAMODB__TABLE_NAME=$(DYNAMODB_RUSTACK_TABLE) \
+	OPENFGA__STORAGE__DYNAMODB__MAXIMUM_IN_FLIGHT=256 \
+	OPENFGA__STORAGE__DYNAMODB__MAXIMUM_CONFLICT_RETRIES=100 \
+	$(MAKE) phase4-scale-smoke PHASE4_STORAGE_BACKEND=dynamodb
+
+# Runs the authoritative contract only after an explicit opt-in and scoped table are supplied.
+dynamodb-storage-aws:
+	@test "$${OPENFGA_DYNAMODB_AWS_TEST:-}" = "1" || { echo "set OPENFGA_DYNAMODB_AWS_TEST=1 to opt in" >&2; exit 2; }
+	@test -n "$${OPENFGA_DYNAMODB_TEST_TABLE:-}" || { echo "set OPENFGA_DYNAMODB_TEST_TABLE to an isolated table" >&2; exit 2; }
+	@test -n "$${AWS_REGION:-}" || { echo "set AWS_REGION" >&2; exit 2; }
+	cargo test -p openfga-storage-dynamodb --test aws -- --ignored --test-threads=1
