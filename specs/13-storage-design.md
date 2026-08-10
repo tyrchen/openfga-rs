@@ -49,6 +49,7 @@ Query-plan fixtures verify hot queries use intended indexes at representative ca
 - **Memory:** one supervised actor owns all maps, forward/reverse indexes, models, assertions, and changelog. Commands use bounded channels; snapshot reads are returned as owned bounded batches. A mutation updates all indexes and changelog in one actor turn.
 - **PostgreSQL:** primary GA backend with optional read replica. Higher consistency always selects primary. Pool size, statement timeouts, and server semaphores are coordinated.
 - **MySQL and SQLite:** compatibility backends with backend-specific SQL/migrations; SQLite writes are serialized and documented for embedded scale.
+- **DynamoDB:** optional regional backend with transactionally duplicated forward/reverse base-table records, packed ordered changelog batches, strongly consistent higher-consistency reads, and chunked model/assertion manifests. Its complete physical, retry, provisioning, and verification contract is [`17-dynamodb-storage-design.md`](17-dynamodb-storage-design.md). The backend advertises a maximum of 49 tuple mutations because it never splits an atomic request around DynamoDB's 100-action transaction ceiling.
 
 No backend returns database-specific errors across the storage boundary. `StorageError` distinguishes not found, already exists, conflict, invalid continuation, timeout, unavailable, integrity, and internal failures, preserving a redacted source.
 
@@ -66,7 +67,7 @@ Pagination uses stable canonical sort keys plus versioned integrity-protected to
 
 ## Acceptance criteria
 
-- Shared contract tests pass unchanged against all four backends.
+- Shared contract tests pass unchanged against all five backends; DynamoDB additionally passes its byte/action, sharded-pagination, manifest, Rustack, and real-AWS gates.
 - Fault injection proves tuple/changelog atomicity and resource release on every failure/cancellation point.
 - Pagination has no duplicates/omissions across static datasets and rejects token replay across scopes.
 - Concurrent mutation tests prove deterministic conflict/ignore semantics and absence of deadlocks.
@@ -79,6 +80,6 @@ All repository `AGENTS.md` engineering sections bind storage crates. The object-
 ## Cross-references
 
 - ← Depends on: [`10-domain-model-design.md`](10-domain-model-design.md)
-- → Consumed by: [`14-check-engine-design.md`](14-check-engine-design.md), [`15-list-queries-design.md`](15-list-queries-design.md), [`16-cache-consistency-design.md`](16-cache-consistency-design.md), [`21-runtime-operations-design.md`](21-runtime-operations-design.md)
+- → Consumed by: [`14-check-engine-design.md`](14-check-engine-design.md), [`15-list-queries-design.md`](15-list-queries-design.md), [`16-cache-consistency-design.md`](16-cache-consistency-design.md), [`17-dynamodb-storage-design.md`](17-dynamodb-storage-design.md), [`21-runtime-operations-design.md`](21-runtime-operations-design.md)
 - ↔ Research: [`../docs/research/study-openfga-implementation.md`](../docs/research/study-openfga-implementation.md), [`../docs/research/survey-rust-ecosystem.md`](../docs/research/survey-rust-ecosystem.md)
 - ↔ Prior art: capability interfaces in `vendors/openfga/pkg/storage/storage.go:144` and PostgreSQL atomic write path in `vendors/openfga/pkg/storage/postgres/postgres.go:584`

@@ -24,6 +24,7 @@
 
 mod context;
 mod error;
+pub mod persistence;
 mod stream;
 mod traits;
 mod types;

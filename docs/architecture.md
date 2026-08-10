@@ -52,6 +52,7 @@ flowchart LR
     Storage --> Postgres
     Storage --> MySQL
     Storage --> SQLite
+    Storage --> DynamoDB
 ```
 
 HTTP and gRPC share one `OpenFgaApi`, so authentication order, validation, authorization, admission,
@@ -67,7 +68,7 @@ crates.
 | Domain | `openfga-domain` | Validated newtypes, commands, limits, fingerprints, cancellation/deadline values | Proto, SQL, HTTP, gRPC |
 | Compilation | `openfga-condition`, `openfga-model` | CEL parsing/type checking/evaluation and deterministic model graph/IR | Storage and transport |
 | Storage contract | `openfga-storage` | Narrow capabilities, operation context, streams, shared contract suite | Concrete SQL or server policy |
-| Storage implementations | `openfga-storage-memory`, `openfga-storage-sql` | Actor state; SQL codecs, queries, migrations, transactions, fault classification | HTTP/gRPC behavior |
+| Storage implementations | `openfga-storage-memory`, `openfga-storage-sql`, `openfga-storage-dynamodb` | Actor state; shared persistence codec; SQL and DynamoDB queries, migrations/schema checks, transactions, cleanup and fault classification | HTTP/gRPC behavior |
 | Decision engines | `openfga-check`, `openfga-list` | Check/BatchCheck traversal, set algebra, candidate and residual evaluation | Concrete backends and transport statuses |
 | Caching | `openfga-cache` | Model/decision/tuple keys, weights, coalescing, changelog controller | Authentication and HTTP concerns |
 | Policy | `openfga-auth` | Disabled/preshared/OIDC authentication and store/action authorization | Business use cases |
@@ -133,6 +134,9 @@ tuples and changelog entries; model publication persists only a successfully com
 - MySQL implements the same capability contracts with backend-specific locking, upsert, and error
   classification.
 - SQLite uses exactly one connection and targets embedded, single-process operation.
+- DynamoDB uses one regional base table, fixed forward/reverse/change/directory shards, conditional
+  transactions, staged immutable chunks, and a supervised durable-generation cleanup actor. It is
+  preview-only until the real-AWS graduation evidence is complete.
 
 `HIGHER_CONSISTENCY` bypasses mutable tuple/decision/latest-model aliases and reads authoritative
 storage. `MINIMIZE_LATENCY` may use bounded caches only after the per-store changelog controller is

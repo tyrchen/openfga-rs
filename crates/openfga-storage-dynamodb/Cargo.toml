@@ -1,6 +1,6 @@
 [package]
-name = "openfga-storage-sql"
-description = "SQL storage backends and migrations for OpenFGA"
+name = "openfga-storage-dynamodb"
+description = "Amazon DynamoDB storage backend for OpenFGA"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
@@ -14,17 +14,23 @@ workspace = true
 
 [dependencies]
 async-trait.workspace = true
+aws-config.workspace = true
+aws-sdk-dynamodb.workspace = true
+aws-smithy-http-client.workspace = true
+getrandom.workspace = true
 openfga-domain.workspace = true
 openfga-model.workspace = true
 openfga-storage.workspace = true
 opentelemetry.workspace = true
-secrecy.workspace = true
-sqlx.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 typed-builder.workspace = true
 ulid.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 openfga-storage = { workspace = true, features = ["test-support"] }
+proptest.workspace = true
+ulid.workspace = true

@@ -21,6 +21,10 @@ use openfga_storage::{
     StorageError, StorageErrorKind, StoreFilter, StoreName, StoreReader, StoreRecord, StoreWriter,
     StoredAuthorizationModel, StoredTuple, TupleChange, TupleReadFilter, TupleReader, TupleStream,
     TupleWriteOptions, TupleWriter, UsersetTupleFilter, WriteConflictPolicy,
+    persistence::{
+        decode_assertions, decode_model, decode_tuple, encode_assertions, encode_condition_context,
+        encode_model, encode_tuple,
+    },
 };
 use opentelemetry::{
     KeyValue,
@@ -41,10 +45,6 @@ use ulid::Ulid;
 use crate::{
     PortableSqlDialect, PortableSqlStorageConfig, PostgresMutationFaultInjector,
     PostgresMutationStage,
-    codec::{
-        decode_assertions, decode_model, decode_tuple, encode_assertions, encode_condition_context,
-        encode_model, encode_tuple,
-    },
     error::{cancelled, map_sqlx, timed_out},
     fault::NoSqlMutationFaults,
 };
