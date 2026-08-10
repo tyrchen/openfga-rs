@@ -6,6 +6,7 @@ description = "Generated manifests, build output, and checksum-verified develope
 paths = [
   '''^crates/openfga-proto/proto\.lock\.json$''',
   '''^vendors/openfga/telemetry/grafana/dashboards/openfga\.json$''',
+  '''^vendors/rustack/''',
   '''^target/''',
   '''^\.tools/''',
   '''(^|/)node_modules/''',

@@ -219,6 +219,11 @@ jobs:
           submodules: recursive
       - name: Install pinned Rust
         run: rustup show
+      - name: Install pinned Protocol Buffers compiler
+        uses: arduino/setup-protoc@v3.0.0
+        with:
+          version: '35.1'
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
       - uses: Swatinem/rust-cache@v2.9.2
       - name: Verify DynamoDB storage and full API contracts with pinned Rustack
         run: |
